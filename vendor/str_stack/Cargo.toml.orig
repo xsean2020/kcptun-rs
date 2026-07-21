@@ -1,0 +1,15 @@
+[package]
+name = "str_stack"
+edition = "2015"
+description = """A string allocator for allocating many write-once strings.
+
+This library is primarily useful for parsing where you need to repeatedly build
+many strings, use them, and then throw them away. Instead of allocating many independent strings, this library will put them all in the same buffer.
+"""
+
+version = "0.1.1"
+authors = ["Steven Allen <steven@stebalien.com>"]
+license = "MIT/Apache-2.0"
+keywords = ["string", "dst", "stack"]
+repository = "https://github.com/Stebalien/str_stack"
+documentation = "https://docs.rs/str_stack/latest/str_stack/"

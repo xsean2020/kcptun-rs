@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "kcp-rs",
+    "kcrypt-rs",
+    "smux-rs",
+    "qpp-rs",
+    "kio-rs",
+    "kcptun-client",
+    "kcptun-server",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# For flamegraphs / samply: keep symbols, frame pointers, no LTO so stacks are human-readable.
+# Usage: cargo build --profile profiling -p kcptun-server -p kcptun-client
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = 2
+# Keep panic=abort from release for similar codegen shape; symbols still present.

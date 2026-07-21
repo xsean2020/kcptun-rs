@@ -1,0 +1,13 @@
+[package]
+name = "kcp-rs"
+version = "0.1.0"
+edition = "2021"
+description = "KCP protocol implementation in Rust - reliable UDP transport"
+
+[dependencies]
+bytes = "1"
+parking_lot = "0.12"
+crossbeam = "0.8"
+kcrypt-rs = { path = "../kcrypt-rs" }
+reed-solomon-erasure = "6"
+crc32fast = "1"

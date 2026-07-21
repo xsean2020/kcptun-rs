@@ -1,0 +1,32 @@
+[package]
+name = "kio-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Async runtime + network I/O abstraction for kcptun (tokio / smol)"
+
+[lib]
+name = "kio"
+
+[dependencies]
+# Shared (runtime-agnostic) — always present
+async-lock = "3"
+async-channel = "2"
+socket2 = "0.5"
+log = "0.4"
+libc = "0.2"
+
+# Tokio backend (default)
+tokio = { version = "1", default-features = false, features = ["net", "time", "macros", "rt", "rt-multi-thread", "io-util", "sync"], optional = true }
+
+# Smol backend
+smol = { version = "2", default-features = false, optional = true }
+async-io = { version = "2", default-features = false, optional = true }
+async-executor = { version = "1", default-features = false, optional = true }
+futures-lite = { version = "2", default-features = false, features = ["std"], optional = true }
+num_cpus = { version = "1", optional = true }
+event-listener = { version = "5", default-features = false, optional = true }
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+smol = ["dep:smol", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:num_cpus", "dep:event-listener"]

@@ -1,0 +1,16 @@
+[package]
+name = "smux-rs"
+version = "0.1.0"
+edition = "2021"
+description = "SMUX stream multiplexer for kcptun"
+
+[dependencies]
+bytes = "1"
+log = "0.4"
+parking_lot = "0.12"
+kio-rs = { path = "../kio-rs", default-features = false }
+
+[features]
+default = ["tokio"]
+tokio = ["kio-rs/tokio"]
+smol = ["kio-rs/smol"]

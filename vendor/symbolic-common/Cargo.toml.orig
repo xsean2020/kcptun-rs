@@ -1,0 +1,36 @@
+[package]
+name = "symbolic-common"
+version = "12.18.3"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic-common"
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+readme = "README.md"
+description = """
+Common types and utilities for symbolic, a library to symbolicate and process
+stack traces from native applications, minidumps or minified JavaScript.
+"""
+edition.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+serde = ["dep:serde", "debugid/serde"]
+
+[dependencies]
+debugid = { workspace = true }
+memmap2 = { workspace = true }
+stable_deref_trait = { workspace = true }
+serde = { workspace = true, optional = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+symbolic-testutils = { path = "../symbolic-testutils" }
+tempfile = { workspace = true }
+similar-asserts = { workspace = true }

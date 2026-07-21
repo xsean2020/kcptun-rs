@@ -1,0 +1,12 @@
+[package]
+name = "qpp-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Quantum Permutation Pads encryption"
+
+[dependencies]
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+pbkdf2 = "0.12"
