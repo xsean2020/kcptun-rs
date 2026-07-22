@@ -72,21 +72,21 @@ const S_BOXES: [[[u8; 16]; 4]; 8] = [
 
 /// P permutation table (permutationFunction in Go)
 const PERMUTATION_FUNCTION: [u8; 32] = [
-    16, 25, 12, 11, 3, 20, 4, 15, 31, 17, 9, 6, 27, 14, 1, 22, 30, 24, 8, 18, 0, 5, 29, 23, 13,
-    19, 2, 26, 10, 21, 28, 7,
+    16, 25, 12, 11, 3, 20, 4, 15, 31, 17, 9, 6, 27, 14, 1, 22, 30, 24, 8, 18, 0, 5, 29, 23, 13, 19,
+    2, 26, 10, 21, 28, 7,
 ];
 
 /// PC-1 table (permutedChoice1 in Go)
 const PERMUTED_CHOICE_1: [u8; 56] = [
-    7, 15, 23, 31, 39, 47, 55, 63, 6, 14, 22, 30, 38, 46, 54, 62, 5, 13, 21, 29, 37, 45, 53, 61,
-    4, 12, 20, 28, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27,
-    35, 43, 51, 59, 36, 44, 52, 60,
+    7, 15, 23, 31, 39, 47, 55, 63, 6, 14, 22, 30, 38, 46, 54, 62, 5, 13, 21, 29, 37, 45, 53, 61, 4,
+    12, 20, 28, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43,
+    51, 59, 36, 44, 52, 60,
 ];
 
 /// PC-2 table (permutedChoice2 in Go)
 const PERMUTED_CHOICE_2: [u8; 48] = [
-    42, 39, 45, 32, 55, 51, 53, 28, 41, 50, 35, 46, 33, 37, 44, 52, 30, 48, 40, 49, 29, 36, 43,
-    54, 15, 4, 25, 19, 9, 1, 26, 16, 5, 11, 23, 8, 12, 7, 17, 0, 22, 3, 10, 14, 6, 20, 27, 24,
+    42, 39, 45, 32, 55, 51, 53, 28, 41, 50, 35, 46, 33, 37, 44, 52, 30, 48, 40, 49, 29, 36, 43, 54,
+    15, 4, 25, 19, 9, 1, 26, 16, 5, 11, 23, 8, 12, 7, 17, 0, 22, 3, 10, 14, 6, 20, 27, 24,
 ];
 
 /// Key schedule left rotations per round
@@ -221,7 +221,7 @@ static FEISTEL_BOX: [[u32; 64]; 8] = {
 
 /// DES Feistel function — processes 2 rounds per call (feistel in Go).
 /// Returns updated (left, right).
-#[inline]
+#[inline(always)]
 fn feistel(l: u32, r: u32, k0: u64, k1: u64) -> (u32, u32) {
     let mut left = l;
     let mut right = r;
@@ -367,7 +367,7 @@ impl TripleDesCipher {
     }
 
     /// Encrypt a single 8-byte block (src → dst).
-    #[inline]
+    #[inline(always)]
     pub fn encrypt_block(&self, dst: &mut [u8; 8], src: &[u8; 8]) {
         let b = u64::from_be_bytes(*src);
         let b = permute_initial_block(b);
@@ -379,7 +379,12 @@ impl TripleDesCipher {
 
         // c1: encrypt (forward)
         for i in 0..8 {
-            (left, right) = feistel(left, right, self.c1.subkeys[2 * i], self.c1.subkeys[2 * i + 1]);
+            (left, right) = feistel(
+                left,
+                right,
+                self.c1.subkeys[2 * i],
+                self.c1.subkeys[2 * i + 1],
+            );
         }
         // c2: decrypt (backward, with l/r swap)
         for i in 0..8 {
@@ -392,7 +397,12 @@ impl TripleDesCipher {
         }
         // c3: encrypt (forward)
         for i in 0..8 {
-            (left, right) = feistel(left, right, self.c3.subkeys[2 * i], self.c3.subkeys[2 * i + 1]);
+            (left, right) = feistel(
+                left,
+                right,
+                self.c3.subkeys[2 * i],
+                self.c3.subkeys[2 * i + 1],
+            );
         }
 
         left = left.rotate_right(1);
@@ -403,7 +413,7 @@ impl TripleDesCipher {
     }
 
     /// Decrypt a single 8-byte block (src → dst).
-    #[inline]
+    #[inline(always)]
     pub fn decrypt_block(&self, dst: &mut [u8; 8], src: &[u8; 8]) {
         let b = u64::from_be_bytes(*src);
         let b = permute_initial_block(b);
@@ -424,7 +434,12 @@ impl TripleDesCipher {
         }
         // c2: encrypt (forward, with l/r swap)
         for i in 0..8 {
-            (right, left) = feistel(right, left, self.c2.subkeys[2 * i], self.c2.subkeys[2 * i + 1]);
+            (right, left) = feistel(
+                right,
+                left,
+                self.c2.subkeys[2 * i],
+                self.c2.subkeys[2 * i + 1],
+            );
         }
         // c1: decrypt (backward)
         for i in 0..8 {

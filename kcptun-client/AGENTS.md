@@ -1,59 +1,56 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 (inbound CFB/null less-copy) -->
 
 # kcptun-client
 
 ## Purpose
 
-Client binary: listens for local TCP, tunnels over KCP/UDP to a remote kcptun-server. Single large `src/main.rs` (~2040 LOC) owns CLI, KCP connection pool (`KcpConn`), Snappy session framing, SMUX open, optional QPP, and bidirectional pipe.
-
-Default listen `:12948`; requires `--remoteaddr`.
+kcptun client binary: local TCP listen → SMUX over KCP/UDP to remote server. Single-file `src/main.rs` owns CLI, key derive, `KcpConn` flush loop, Snappy session codec, optional QPP, SNMP log, optional pprof.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Features tokio/smol; optional `pprof` (off by default); `mimalloc`; path deps |
-| `src/main.rs` | Entire client: `Cli`, `KcpConn`, flush loop, `handle_client`, SNMP, pprof helper |
+| `Cargo.toml` | Features `tokio` (default) / `smol`; optional `pprof`; deps kcp/kcrypt/smux/qpp/kio, clap, snap, mimalloc |
+| `build.rs` | Build-time glue |
+| `src/main.rs` | Entire binary: `Cli`, `KcpConn`, `SmuxStreamAsync`, `QPPPort`, `handle_client`, `snmp_logger`, `run_pprof` |
 
 ## Subdirectories
 
-None (binary crate).
+None (flat binary crate).
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- Keep wire/behavior parity with `kcptun-server` and Go client for shared helpers: `SALT = b"kcp-go"`, `derive_key`, `apply_mode`, Snappy CRC32C framing, `PIPE_BUF_SIZE=65536`.
-- **KCP update interval: 2 ms** (`KCP_UPDATE_INTERVAL_MS`) — tighter than server's 10 ms.
-- `KcpConn` flush loop: 4-phase design (Snappy/`cpu_block`/parallel encrypt outside lock; KCP under lock briefly).
-- Multi-port remote: `IP:min-max` → `parse_multi_port`.
-- Cipher storage: `Arc<dyn BlockCrypt>` (no Mutex).
-- `null` vs `none` header behavior must match Go.
-- When fixing a bug also present in server, update **both** mains unless intentional asymmetry.
+- Stack: local TCP → (optional QPP) → SMUX stream → Snappy session → KCP → BlockCrypt → UDP.
+- Flush loop is **4-phase** to minimize KCP mutex hold; keep crypto/snappy outside the lock.
+- PBKDF2 salt `b"kcp-go"`, 4096 iters, 32-byte key — must match server.
+- Modes (`fast3` etc.) map to KCP nodelay/interval/resend/nc via `apply_mode`.
+- Global allocator: `mimalloc`.
+- Prefer `kio::*` for async; dual impl blocks for tokio/smol on AsyncRead/Write wrappers.
+- SNMP logger only meaningful when SNMP collection is enabled in kcp-rs.
+- UDP reader: CFB decrypts **in place** on the recv buffer (`decrypt_cfb_in_place`, no inbound `CryptoBuf` lock); null uses the recv slice; FEC/KCP `input` takes `&[u8]` without intermediate `Bytes` copies.
 
 ### Testing Requirements
 
-```bash
-cargo build -p kcptun-client --release
-bash test_e2e.sh
-make stress   # client is started by stress_test
-make bench
-```
+- `cargo test -p kcptun-client`
+- `make e2e` / `bash test_e2e.sh` after client path changes
+- `make stress` (server-side) still validates client interop under load when used together
 
 ### Common Patterns
 
-- CLI via clap + optional JSON `-c`
-- `SmuxStreamAsync` bridges smux `Stream` to kio AsyncRead/Write (cfg dual impl)
-- `QPPPort` optional wrapper when `--QPP`
-- `snmp_logger` background task
+- Config: CLI + optional JSON (`deny_unknown_fields`)
+- Multi-port remote parse: `host:min-max` / `host:port`
 
 ## Dependencies
 
 ### Internal
-`kcp-rs`, `kcrypt-rs`, `smux-rs`, `qpp-rs`, `kio-rs`
+
+- `kcp-rs`, `kcrypt-rs`, `smux-rs`, `qpp-rs`, `kio-rs`
 
 ### External
-`clap`, `serde`/`serde_json`, `snap`, `pbkdf2`, `sha1`, `parking_lot`, `crc32fast`, `socket2`, `mimalloc`, `anyhow`, `log`/`env_logger`, `bytes`; optional `pprof`
+
+- `clap`, `serde`/`serde_json`, `snap`, `pbkdf2`/`sha1`, `parking_lot`, `socket2`, `mimalloc`, optional `pprof`
 
 <!-- MANUAL: pprof feature is optional and off by default (keeps ARM release bins small). Enable with --features pprof. -->

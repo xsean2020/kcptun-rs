@@ -20,11 +20,7 @@ pub fn sendmmsg_connected(fd: RawFd, bufs: &[&[u8]]) -> io::Result<usize> {
     sendmmsg_inner(fd, bufs, None)
 }
 
-pub fn sendmmsg_to(
-    fd: RawFd,
-    bufs: &[&[u8]],
-    addr: &std::net::SocketAddr,
-) -> io::Result<usize> {
+pub fn sendmmsg_to(fd: RawFd, bufs: &[&[u8]], addr: &std::net::SocketAddr) -> io::Result<usize> {
     let (storage, len) = socket_addr_to_storage(addr);
     sendmmsg_inner(fd, bufs, Some((&storage, len)))
 }
@@ -63,14 +59,7 @@ fn sendmmsg_inner(
         msgs.push(hdr);
     }
 
-    let ret = unsafe {
-        libc::sendmmsg(
-            fd,
-            msgs.as_mut_ptr(),
-            n as libc::c_uint,
-            0,
-        )
-    };
+    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), n as libc::c_uint, 0) };
     if ret < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::WouldBlock {
@@ -81,7 +70,9 @@ fn sendmmsg_inner(
     Ok(ret as usize)
 }
 
-fn socket_addr_to_storage(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+fn socket_addr_to_storage(
+    addr: &std::net::SocketAddr,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
     let len = match addr {
         std::net::SocketAddr::V4(a) => {
@@ -168,15 +159,8 @@ pub fn recvmmsg_from(
         msgs.push(hdr);
     }
 
-    let ret = unsafe {
-        libc::recvmmsg(
-            fd,
-            msgs.as_mut_ptr(),
-            n as libc::c_uint,
-            0,
-            ptr::null_mut(),
-        )
-    };
+    let ret =
+        unsafe { libc::recvmmsg(fd, msgs.as_mut_ptr(), n as libc::c_uint, 0, ptr::null_mut()) };
     if ret < 0 {
         for b in bufs.iter_mut().take(n) {
             unsafe {

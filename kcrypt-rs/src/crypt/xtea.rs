@@ -2,8 +2,11 @@
 //!
 //! Ported from Go's `golang.org/x/crypto/xtea`. Uses CFB-8 mode.
 //! Requires a 16-byte key (padded if shorter). Runs 64 rounds.
+//!
+//! Hot path: monomorphized CFB (no `Fn` closure) + two-round loop matching
+//! Go `encryptBlock` for better ILP.
 
-use super::{cfb8_dec, cfb8_enc, BlockCrypt};
+use super::{BlockCrypt, GO_CFB_IV};
 
 #[derive(Debug)]
 pub struct XteaCrypt {
@@ -35,30 +38,124 @@ impl XteaCrypt {
         XteaCrypt { table: t }
     }
 
-    fn xtea_enc(&self, inp: &[u8; 8], out: &mut [u8; 8]) {
-        let (mut a, mut b) = (
-            u32::from_be_bytes([inp[0], inp[1], inp[2], inp[3]]),
-            u32::from_be_bytes([inp[4], inp[5], inp[6], inp[7]]),
-        );
-        for i in 0..64 {
-            if i % 2 == 0 {
-                a = a.wrapping_add(((b << 4 ^ b >> 5).wrapping_add(b)) ^ self.table[i]);
-            } else {
-                b = b.wrapping_add(((a << 4 ^ a >> 5).wrapping_add(a)) ^ self.table[i]);
+    /// Single 8-byte block encrypt (matches Go `encryptBlock`).
+    #[inline(always)]
+    fn encrypt_block(&self, dst: &mut [u8; 8], src: &[u8; 8]) {
+        let mut v0 = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+        let mut v1 = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
+        // Two rounds of XTEA applied per loop (Go xtea/block.go)
+        let mut i = 0;
+        while i < 64 {
+            v0 = v0.wrapping_add(((v1 << 4 ^ v1 >> 5).wrapping_add(v1)) ^ self.table[i]);
+            i += 1;
+            v1 = v1.wrapping_add(((v0 << 4 ^ v0 >> 5).wrapping_add(v0)) ^ self.table[i]);
+            i += 1;
+        }
+        dst[..4].copy_from_slice(&v0.to_be_bytes());
+        dst[4..].copy_from_slice(&v1.to_be_bytes());
+    }
+
+    /// Specialized CFB-8 encrypt monomorphized on XTEA (no closure).
+    #[inline(always)]
+    fn cfb_enc_specialized(&self, data: &mut [u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let mut tbl = [
+            GO_CFB_IV[0],
+            GO_CFB_IV[1],
+            GO_CFB_IV[2],
+            GO_CFB_IV[3],
+            GO_CFB_IV[4],
+            GO_CFB_IV[5],
+            GO_CFB_IV[6],
+            GO_CFB_IV[7],
+        ];
+        let mut i = 0;
+        while i + 64 <= data.len() {
+            for _ in 0..8 {
+                let chunk = &mut data[i..i + 8];
+                let mut b = [0u8; 8];
+                self.encrypt_block(&mut b, &tbl);
+                let y = u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]) ^ u64::from_le_bytes(b);
+                let out = y.to_le_bytes();
+                chunk.copy_from_slice(&out);
+                tbl = out;
+                i += 8;
             }
         }
-        out[..4].copy_from_slice(&a.to_be_bytes());
-        out[4..].copy_from_slice(&b.to_be_bytes());
+        while i + 8 <= data.len() {
+            let chunk = &mut data[i..i + 8];
+            let mut b = [0u8; 8];
+            self.encrypt_block(&mut b, &tbl);
+            let y = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]) ^ u64::from_le_bytes(b);
+            let out = y.to_le_bytes();
+            chunk.copy_from_slice(&out);
+            tbl = out;
+            i += 8;
+        }
+        if i < data.len() {
+            let chunk = &mut data[i..];
+            let len = chunk.len();
+            let mut b = [0u8; 8];
+            self.encrypt_block(&mut b, &tbl);
+            for j in 0..len {
+                chunk[j] ^= b[j];
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn cfb_dec_specialized(&self, data: &mut [u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let mut tbl = [
+            GO_CFB_IV[0],
+            GO_CFB_IV[1],
+            GO_CFB_IV[2],
+            GO_CFB_IV[3],
+            GO_CFB_IV[4],
+            GO_CFB_IV[5],
+            GO_CFB_IV[6],
+            GO_CFB_IV[7],
+        ];
+        let mut i = 0;
+        while i + 8 <= data.len() {
+            let chunk = &mut data[i..i + 8];
+            let src = [
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ];
+            let mut b = [0u8; 8];
+            self.encrypt_block(&mut b, &tbl);
+            let y = u64::from_le_bytes(src) ^ u64::from_le_bytes(b);
+            chunk.copy_from_slice(&y.to_le_bytes());
+            tbl = src;
+            i += 8;
+        }
+        if i < data.len() {
+            let chunk = &mut data[i..];
+            let len = chunk.len();
+            let mut b = [0u8; 8];
+            self.encrypt_block(&mut b, &tbl);
+            for j in 0..len {
+                chunk[j] ^= b[j];
+            }
+        }
     }
 }
 
 impl BlockCrypt for XteaCrypt {
     fn encrypt(&self, data: &mut [u8]) {
-        cfb8_enc(data, &|i, o| self.xtea_enc(i, o));
+        self.cfb_enc_specialized(data);
     }
     fn decrypt(&self, data: &mut [u8]) {
         // CFB uses forward cipher for both encrypt and decrypt
-        cfb8_dec(data, &|i, o| self.xtea_enc(i, o));
+        self.cfb_dec_specialized(data);
     }
     fn name(&self) -> &'static str {
         "xtea"

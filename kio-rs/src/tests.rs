@@ -136,6 +136,261 @@ fn test_cpu_block() {
     assert_eq!(r, 499500);
 }
 
+// ─── JoinHandle detach (starvation / fire-and-forget guard) ───────────────────
+// Dropping JoinHandle must NOT cancel the task on either backend. Without this,
+// smol would kill flush loops / stream handlers when the spawn handle is dropped.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn test_join_handle_detach_on_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let done = done.clone();
+        let _h = spawn_task(async move {
+            sleep_ms(30).await;
+            done.store(true, Ordering::SeqCst);
+        });
+        // Drop handle immediately (fire-and-forget).
+    }
+    for _ in 0..40 {
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        sleep_ms(10).await;
+    }
+    panic!("detached task did not complete after JoinHandle drop");
+}
+
+#[cfg(feature = "smol")]
+#[test]
+fn test_join_handle_detach_on_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let done = Arc::new(AtomicBool::new(false));
+    block_on(async {
+        {
+            let done = done.clone();
+            let _h = spawn_task(async move {
+                sleep_ms(30).await;
+                done.store(true, Ordering::SeqCst);
+            });
+            // Drop handle immediately (fire-and-forget).
+        }
+        for _ in 0..40 {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            sleep_ms(10).await;
+        }
+        panic!("detached task did not complete after JoinHandle drop");
+    });
+}
+
+// ─── copy_bidirectional_idle: true idle (reset on data), not total timeout ────
+// A busy pipe that keeps transferring past `idle_secs` wall time must complete.
+// The old smol path wrapped the whole copy in `timeout(idle_secs)`, which would
+// kill long-lived sessions (Go closeWait is idle-based).
+//
+// Topology: paced writer ──► A ◄copy► B ──► drain reader
+// (A/B are two ends of a second loopback TCP pair; writer feeds A via first pair.)
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn test_copy_bidirectional_idle_resets_on_data() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    // Pair 1: paced client → accepted as left side of the copy (via bridge).
+    let l1 = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let a1 = l1.local_addr().unwrap();
+    // Pair 2: right side of the copy → drain.
+    let l2 = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let a2 = l2.local_addr().unwrap();
+
+    let writer = spawn_task(async move {
+        let mut s = TcpStream::connect(a1.to_string()).await.unwrap();
+        for i in 0u8..4 {
+            sleep_ms(400).await;
+            use crate::AsyncWriteExt;
+            s.write_all(&[b'x' + i]).await.unwrap();
+        }
+        use crate::AsyncWriteExt;
+        let _ = s.shutdown().await;
+    });
+
+    let (mut from_writer, _) = l1.accept().await.unwrap();
+    let mut to_drain = TcpStream::connect(a2.to_string()).await.unwrap();
+    let (mut from_copy, _) = l2.accept().await.unwrap();
+
+    let drain = spawn_task(async move {
+        use crate::AsyncReadExt;
+        let mut buf = [0u8; 64];
+        let mut n = 0u64;
+        loop {
+            match from_copy.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(k) => n += k as u64,
+            }
+        }
+        n
+    });
+
+    let start = Instant::now();
+    // copy from_writer → to_drain; reverse direction idle (no data).
+    let (ab, _ba) = copy_bidirectional_idle(&mut from_writer, &mut to_drain, 1)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    let drained = drain.await.unwrap();
+    let _ = writer.await;
+
+    assert_eq!(ab, 4);
+    assert_eq!(drained, 4);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1200),
+        "pipe must live longer than idle_secs wall clock when data keeps flowing; got {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "smol")]
+#[test]
+fn test_copy_bidirectional_idle_resets_on_data() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    // smol poll_fn copy state is large in debug; use a roomy stack for the test thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| block_on(async {
+        let l1 = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let a1 = l1.local_addr().unwrap();
+        let l2 = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let a2 = l2.local_addr().unwrap();
+
+        let writer = spawn_task(async move {
+            let mut s = TcpStream::connect(a1.to_string()).await.unwrap();
+            for i in 0u8..4 {
+                sleep_ms(400).await;
+                use crate::AsyncWriteExt;
+                s.write_all(&[b'x' + i]).await.unwrap();
+            }
+            use crate::AsyncWriteExt;
+            let _ = s.close().await;
+        });
+
+        let (mut from_writer, _) = l1.accept().await.unwrap();
+        let mut to_drain = TcpStream::connect(a2.to_string()).await.unwrap();
+        let (mut from_copy, _) = l2.accept().await.unwrap();
+
+        let drain = spawn_task(async move {
+            use crate::AsyncReadExt;
+            let mut buf = [0u8; 64];
+            let mut n = 0u64;
+            loop {
+                match from_copy.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => n += k as u64,
+                }
+            }
+            n
+        });
+
+        let start = Instant::now();
+        let (ab, _ba) = copy_bidirectional_idle(&mut from_writer, &mut to_drain, 1)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        let drained = drain.await;
+        let _ = writer.await;
+
+        assert_eq!(ab, 4);
+        assert_eq!(drained, 4);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1200),
+            "pipe must live longer than idle_secs wall clock when data keeps flowing; got {elapsed:?}"
+        );
+    }))
+    .unwrap()
+    .join()
+    .unwrap();
+}
+
+/// Idle timer must fire when no data flows for `idle_secs`.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn test_copy_bidirectional_idle_fires_when_quiet() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+
+    let start = Instant::now();
+    let (ab, ba) = copy_bidirectional_idle(&mut client, &mut server, 1)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!((ab, ba), (0, 0));
+    assert!(
+        elapsed >= std::time::Duration::from_millis(800)
+            && elapsed < std::time::Duration::from_secs(3),
+        "idle exit expected ~1s, got {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "smol")]
+#[test]
+fn test_copy_bidirectional_idle_fires_when_quiet() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                    .await
+                    .unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+
+                let start = Instant::now();
+                let (ab, ba) = copy_bidirectional_idle(&mut client, &mut server, 1)
+                    .await
+                    .unwrap();
+                let elapsed = start.elapsed();
+                assert_eq!((ab, ba), (0, 0));
+                assert!(
+                    elapsed >= std::time::Duration::from_millis(800)
+                        && elapsed < std::time::Duration::from_secs(3),
+                    "idle exit expected ~1s, got {elapsed:?}"
+                );
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 // ─── spawn_task throughput micro-benchmark ──────────────────────────────────
 // Measures fire-and-forget `spawn_task` overhead. The `#[inline(always)]`
 // attribute guarantees the thin delegation is erased at compile time, so this

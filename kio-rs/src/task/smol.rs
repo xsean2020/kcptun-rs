@@ -17,7 +17,6 @@
 
 use super::JoinHandle;
 use std::future::Future;
-use std::sync::mpsc;
 use std::sync::OnceLock;
 
 use async_executor::Executor;
@@ -37,11 +36,7 @@ fn pin_to_core(core_id: usize) {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(core_id, &mut set);
-        let _ = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set,
-        );
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
 }
 
@@ -81,20 +76,21 @@ where
 //
 // A dedicated pool of N worker threads (N = CPU count, clamped to [2, 8])
 // that live for the entire process lifetime. Jobs are type-erased closures
-// sent via a std::sync::mpsc channel; results are returned via an
-// async_channel bounded(1) so the caller can `.await` without blocking the
+// sent via an **unbounded async_channel** (MPMC: each Receiver is Clone, so
+// workers do not share a Mutex around recv). Results return via a per-job
+// bounded(1) async_channel so the caller can `.await` without blocking the
 // async executor.
 //
-// This eliminates the ~10–50µs per-call thread creation overhead that
-// `smol::unblock` incurs (its backing `blocking` crate kills idle threads
-// after 500ms, but kcptun calls `cpu_block` every 10–100ms).
+// This eliminates:
+// - `smol::unblock` thread create/destroy (~10–50µs) on every 10–100ms flush
+// - `Mutex<mpsc::Receiver>` contention when many sessions offload encrypt
 
 /// A type-erased, boxed, sendable one-shot closure.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// Handle to the persistent blocking pool (initialized lazily on first use).
 struct BlockingPool {
-    sender: mpsc::Sender<Job>,
+    sender: async_channel::Sender<Job>,
 }
 
 /// Global singleton pool — workers are spawned once and never exit.
@@ -104,30 +100,20 @@ static BLOCKING_POOL: OnceLock<BlockingPool> = OnceLock::new();
 fn blocking_pool() -> &'static BlockingPool {
     BLOCKING_POOL.get_or_init(|| {
         let ncpus = num_cpus::get().clamp(2, 8);
-        let (sender, receiver) = mpsc::channel::<Job>();
-        // std::sync::mpsc::Receiver is not Clone, so wrap in Arc<Mutex<_>>.
-        // Workers contend on the lock briefly; for kcptun's 10–100ms flush
-        // cadence the contention is negligible vs. smol::unblock's thread
-        // creation overhead.
-        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        // Unbounded: submit path never blocks the async worker. Capacity is
+        // naturally limited by how many flush loops await a result at once.
+        let (sender, receiver) = async_channel::unbounded::<Job>();
         for i in 0..ncpus {
             let receiver = receiver.clone();
             std::thread::Builder::new()
                 .name(format!("smol-cpu-{i}"))
+                .stack_size(2 * 1024 * 1024)
                 .spawn(move || {
                     pin_to_core(i);
-                    loop {
-                        // Lock → recv → unlock quickly so other workers can
-                        // pick up the next job.
-                        let job = {
-                            let guard = receiver.lock().unwrap();
-                            guard.recv()
-                        };
-                        match job {
-                            Ok(f) => f(),
-                            // All senders dropped → pool shutting down.
-                            Err(_) => break,
-                        }
+                    // Blocking multi-consumer recv — no mutex among workers.
+                    // Channel close (all senders dropped) ends the loop.
+                    while let Ok(f) = receiver.recv_blocking() {
+                        f();
                     }
                 })
                 .expect("failed to spawn smol-cpu blocking worker");
@@ -154,10 +140,10 @@ where
         // item, and the receiver is the only consumer.
         let _ = tx.try_send(r);
     });
-    // Unbounded mpsc::Sender::send never blocks (unless OOM).
+    // Unbounded sender: never blocks (unless OOM).
     blocking_pool()
         .sender
-        .send(job)
+        .try_send(job)
         .expect("smol-cpu blocking pool workers died");
     rx.recv()
         .await
@@ -202,6 +188,7 @@ where
                 let stop_rx = stop_rx.clone();
                 std::thread::Builder::new()
                     .name(format!("smol-worker-{i}"))
+                    .stack_size(2 * 1024 * 1024)
                     .spawn_scoped(s, move || {
                         // Pin this worker to core `i` on Linux to reduce
                         // cache-line bouncing and context-switch overhead.

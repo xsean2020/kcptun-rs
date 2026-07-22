@@ -14,7 +14,6 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::Ordering;
 
 use bytes::{Bytes, BytesMut};
 
@@ -22,7 +21,7 @@ use crate::segment::SegmentPool;
 use crate::segment::{
     Command, Segment, KCP_ASK_SEND, KCP_ASK_TELL, KCP_DEFAULT_WND, KCP_MAX_FRAG, KCP_OVERHEAD, MTU,
 };
-use crate::snmp::DEFAULT_SNMP;
+use crate::snmp::{self as snmp, DEFAULT_SNMP};
 
 // ─── Constants (matching Go kcp-go v5) ─────────────────────────────────────
 
@@ -314,12 +313,6 @@ impl KCP {
         self.stream = if enable { 1 } else { 0 };
     }
 
-    /// Enable FEC (stub - FEC is handled by session layer).
-    #[inline]
-    pub fn set_fec(&mut self, _data_shards: u32, _parity_shards: u32) {
-        // FEC encoding/decoding is handled at the session layer.
-    }
-
     // ── User API ──────────────────────────────────────────────────────────
 
     /// Send data through the KCP connection.
@@ -331,6 +324,8 @@ impl KCP {
             return Err(KcpError::NoData);
         }
 
+        let original_len = data.len() as u64;
+
         // Stream mode: append to previous segment in snd_queue if possible
         let data = if self.stream != 0 {
             if let Some(last) = self.snd_queue.back_mut() {
@@ -340,6 +335,7 @@ impl KCP {
                     last.data.extend_from_slice(&data[..extend]);
                     last.len = last.data.len() as u32;
                     if extend >= data.len() {
+                        snmp::add(&DEFAULT_SNMP.bytes_sent, original_len);
                         return Ok(());
                     }
                     // Advance past appended bytes (matching Go: buffer = buffer[extend:])
@@ -382,6 +378,9 @@ impl KCP {
             offset += size;
         }
 
+        // Upper-level bytes accepted for send (Go UDPSession.WriteBuffers).
+        snmp::add(&DEFAULT_SNMP.bytes_sent, original_len);
+
         Ok(())
     }
 
@@ -421,6 +420,8 @@ impl KCP {
             self.probe |= KCP_ASK_TELL;
         }
 
+        snmp::add(&DEFAULT_SNMP.bytes_received, data.len() as u64);
+
         Ok(data)
     }
 
@@ -458,6 +459,8 @@ impl KCP {
                     self.probe |= KCP_ASK_TELL;
                 }
 
+                snmp::add(&DEFAULT_SNMP.bytes_received, data.len() as u64);
+
                 return Ok(data);
             }
         }
@@ -488,7 +491,9 @@ impl KCP {
             self.probe |= KCP_ASK_TELL;
         }
 
-        Ok(data.freeze())
+        let out = data.freeze();
+        snmp::add(&DEFAULT_SNMP.bytes_received, out.len() as u64);
+        Ok(out)
     }
 
     /// Check the size of the next message in the receive queue.
@@ -681,8 +686,11 @@ impl KCP {
                                 );
                             }
 
-                            // Insert into receive buffer (matching Go parse_data)
-                            self.parse_data(seg);
+                            // Insert into receive buffer (matching Go parse_data).
+                            // Go increments RepeatSegs when parse_data reports a duplicate.
+                            if self.parse_data(seg) {
+                                snmp::add(&DEFAULT_SNMP.repeat_segs, 1);
+                            }
                         }
                     }
                 }
@@ -702,7 +710,7 @@ impl KCP {
 
         // Update SNMP
         if in_segs > 0 {
-            DEFAULT_SNMP.in_segs.fetch_add(in_segs, Ordering::Relaxed);
+            snmp::add(&DEFAULT_SNMP.in_segs, in_segs);
         }
 
         // Update RTT with the latest ts (matching Go: only for regular packets)
@@ -757,12 +765,15 @@ impl KCP {
 
     /// Insert a segment into the receive buffer and try to move data to the
     /// receive queue. Matches Go's `parse_data`.
-    fn parse_data(&mut self, newseg: Segment) {
+    ///
+    /// Returns `true` if the segment was a duplicate (or outside window after
+    /// already being acked), matching Go's `repeat` flag for SNMP.RepeatSegs.
+    fn parse_data(&mut self, newseg: Segment) -> bool {
         let sn = newseg.sn;
 
         // Check if outside receive window
         if _itimediff(sn, self.rcv_nxt + self.rcv_wnd) >= 0 || _itimediff(sn, self.rcv_nxt) < 0 {
-            return;
+            return true;
         }
 
         // Check for duplicate by looking through rcv_buf
@@ -778,6 +789,7 @@ impl KCP {
 
         // Move available data from rcv_buf → rcv_queue
         self.move_receive_buffer();
+        is_dup
     }
 
     /// Move segments from the receive buffer into the receive queue when
@@ -1076,7 +1088,7 @@ impl KCP {
                 seg.encode(&mut self.buffer);
 
                 // Update SNMP
-                DEFAULT_SNMP.out_segs.fetch_add(1, Ordering::Relaxed);
+                snmp::add(&DEFAULT_SNMP.out_segs, 1);
 
                 // Dead link check (matching Go)
                 if seg.xmit >= self.dead_link {
@@ -1096,19 +1108,16 @@ impl KCP {
         // Update retransmission stats (matching Go)
         let retrans_sum = lost_segs + fast_retrans_segs + early_retrans_segs;
         if retrans_sum > 0 {
-            DEFAULT_SNMP
-                .retrans_segs
-                .fetch_add(retrans_sum, Ordering::Relaxed);
+            snmp::add(&DEFAULT_SNMP.retrans_segs, retrans_sum);
         }
         if lost_segs > 0 {
-            DEFAULT_SNMP
-                .lost_segs
-                .fetch_add(lost_segs, Ordering::Relaxed);
+            snmp::add(&DEFAULT_SNMP.lost_segs, lost_segs);
         }
         if fast_retrans_segs > 0 {
-            DEFAULT_SNMP
-                .fast_retrans
-                .fetch_add(fast_retrans_segs, Ordering::Relaxed);
+            snmp::add(&DEFAULT_SNMP.fast_retrans, fast_retrans_segs);
+        }
+        if early_retrans_segs > 0 {
+            snmp::add(&DEFAULT_SNMP.early_retrans, early_retrans_segs);
         }
 
         // ── Congestion control (matching Go) ──
@@ -1138,15 +1147,18 @@ impl KCP {
         flush_buf(&mut self.buffer, &mut self.output);
 
         // Update SNMP queue stats (matching Go)
-        DEFAULT_SNMP
-            .ring_buffer_snd_queue
-            .store(self.snd_queue.len() as u64, Ordering::Relaxed);
-        DEFAULT_SNMP
-            .ring_buffer_rcv_queue
-            .store(self.rcv_queue.len() as u64, Ordering::Relaxed);
-        DEFAULT_SNMP
-            .ring_buffer_snd_buffer
-            .store(self.snd_buf.len() as u64, Ordering::Relaxed);
+        snmp::store(
+            &DEFAULT_SNMP.ring_buffer_snd_queue,
+            self.snd_queue.len() as u64,
+        );
+        snmp::store(
+            &DEFAULT_SNMP.ring_buffer_rcv_queue,
+            self.rcv_queue.len() as u64,
+        );
+        snmp::store(
+            &DEFAULT_SNMP.ring_buffer_snd_buffer,
+            self.snd_buf.len() as u64,
+        );
 
         self.pool.release(ack_seg);
 
@@ -1429,5 +1441,51 @@ mod tests {
         let result = kcp.send(&large_data);
         // Go would return -2 for count > 255
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn snmp_send_recv_counts_upper_bytes() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+
+        crate::snmp::enable();
+        let before_s = crate::snmp::DEFAULT_SNMP.bytes_sent.load(Ordering::SeqCst);
+        let before_r = crate::snmp::DEFAULT_SNMP
+            .bytes_received
+            .load(Ordering::SeqCst);
+
+        let mut kcp = create_kcp(7);
+        kcp.set_stream_mode(true);
+        kcp.send(b"hello-snmp").unwrap();
+        let after_s = crate::snmp::DEFAULT_SNMP.bytes_sent.load(Ordering::SeqCst);
+        assert_eq!(after_s - before_s, 10);
+
+        let store: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let store2 = store.clone();
+        let mut a = KCP::new(
+            8,
+            0,
+            Box::new(move |data: bytes::Bytes| {
+                store2.lock().unwrap().push(data.to_vec());
+            }),
+        );
+        let mut b = KCP::new(8, 0, Box::new(|_| {}));
+        a.set_nodelay(1, 10, 2, 1);
+        b.set_nodelay(1, 10, 2, 1);
+        a.send(b"abcdef").unwrap();
+        a.update(10);
+        a.flush();
+        let pkts = store.lock().unwrap().clone();
+        assert!(!pkts.is_empty());
+        for p in &pkts {
+            b.input(p, true).unwrap();
+        }
+        b.update(20);
+        let got = b.recv().unwrap();
+        assert_eq!(&got[..], b"abcdef");
+        let after_r = crate::snmp::DEFAULT_SNMP
+            .bytes_received
+            .load(Ordering::SeqCst);
+        assert!(after_r - before_r >= 6);
     }
 }

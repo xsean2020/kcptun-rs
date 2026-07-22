@@ -166,9 +166,10 @@ where
     use std::pin::Pin;
     use std::task::Poll;
 
+    // Heap buffers avoid ~128KiB async-state stack frames on smol workers.
     const BUF: usize = 65536;
-    let mut ab_buf = [0u8; BUF]; // read-from-A buffer
-    let mut ba_buf = [0u8; BUF]; // read-from-B buffer
+    let mut ab_buf = vec![0u8; BUF]; // read-from-A buffer
+    let mut ba_buf = vec![0u8; BUF]; // read-from-B buffer
     let mut ab_start = 0usize; // pending A→B data: [ab_start, ab_end) in ab_buf
     let mut ab_end = 0usize;
     let mut ba_start = 0usize; // pending B→A data: [ba_start, ba_end) in ba_buf
@@ -368,18 +369,143 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    // smol backend: use total timeout as fallback. smol is typically used for
-    // ARM cross-builds where high concurrency is rare. The idle-timeout
-    // semantics (timer resets on each transfer) are only needed under
-    // sustained high concurrency on the tokio backend.
-    if idle_secs > 0 {
-        match timeout(Duration::from_secs(idle_secs), cfg_copy_bidirectional(a, b)).await {
-            Ok(result) => result,
-            Err(_) => Ok((0, 0)),
-        }
-    } else {
-        cfg_copy_bidirectional(a, b).await
+    // True idle timeout (matches tokio + Go closeWait): the timer resets on
+    // every successful data transfer. A total-duration `timeout()` wrapper
+    // would kill long-lived pipes that stay busy — wrong for closeWait.
+    if idle_secs == 0 {
+        return cfg_copy_bidirectional(a, b).await;
     }
+
+    use futures_lite::future::poll_fn;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    // Heap-allocate 64KiB buffers. Stack arrays of 128KiB plus the async
+    // state machine overflow smol worker stacks in debug builds.
+    const BUF: usize = 65536;
+    let mut ab_buf = vec![0u8; BUF];
+    let mut ba_buf = vec![0u8; BUF];
+    let mut ab_start = 0usize;
+    let mut ab_end = 0usize;
+    let mut ba_start = 0usize;
+    let mut ba_end = 0usize;
+    let mut ab_bytes: u64 = 0;
+    let mut ba_bytes: u64 = 0;
+    let mut a_eof = false;
+    let mut b_eof = false;
+    let idle_duration = Duration::from_secs(idle_secs);
+    let mut idle = async_io::Timer::after(idle_duration);
+
+    while !(a_eof && b_eof) {
+        // Reset idle deadline after every progress step (or on first wait).
+        idle.set_after(idle_duration);
+
+        let made_progress = poll_fn(|cx| {
+            let mut progress = false;
+
+            while ab_start < ab_end {
+                match Pin::new(&mut *b).poll_write(cx, &ab_buf[ab_start..ab_end]) {
+                    Poll::Ready(Ok(n)) if n > 0 => {
+                        ab_bytes += n as u64;
+                        ab_start += n;
+                        progress = true;
+                    }
+                    Poll::Ready(Ok(_)) => break,
+                    Poll::Ready(Err(_)) => {
+                        a_eof = true;
+                        progress = true;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+
+            if ab_start >= ab_end && !a_eof {
+                ab_start = 0;
+                ab_end = 0;
+                match Pin::new(&mut *a).poll_read(cx, &mut ab_buf[..]) {
+                    Poll::Ready(Ok(0)) => {
+                        a_eof = true;
+                        progress = true;
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        ab_end = n;
+                        progress = true;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        a_eof = true;
+                        progress = true;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            while ba_start < ba_end {
+                match Pin::new(&mut *a).poll_write(cx, &ba_buf[ba_start..ba_end]) {
+                    Poll::Ready(Ok(n)) if n > 0 => {
+                        ba_bytes += n as u64;
+                        ba_start += n;
+                        progress = true;
+                    }
+                    Poll::Ready(Ok(_)) => break,
+                    Poll::Ready(Err(_)) => {
+                        b_eof = true;
+                        progress = true;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+
+            if ba_start >= ba_end && !b_eof {
+                ba_start = 0;
+                ba_end = 0;
+                match Pin::new(&mut *b).poll_read(cx, &mut ba_buf[..]) {
+                    Poll::Ready(Ok(0)) => {
+                        b_eof = true;
+                        progress = true;
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        ba_end = n;
+                        progress = true;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        b_eof = true;
+                        progress = true;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            // Do not busy-poll poll_close: only attempt once per progress step
+            // when the peer has EOF'd. Repeated Ready(close) would not set
+            // progress, so it is safe here only when progress is already true
+            // or we are about to wait.
+            if a_eof {
+                let _ = Pin::new(&mut *b).poll_close(cx);
+            }
+            if b_eof {
+                let _ = Pin::new(&mut *a).poll_close(cx);
+            }
+
+            if progress {
+                return Poll::Ready(true);
+            }
+
+            match Pin::new(&mut idle).poll(cx) {
+                Poll::Ready(_) => Poll::Ready(false),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+
+        if !made_progress {
+            break;
+        }
+    }
+
+    Ok((ab_bytes, ba_bytes))
 }
 
 /// Wait for Ctrl-C (SIGINT). Uses a dedicated blocking thread with a libc

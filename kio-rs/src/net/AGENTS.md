@@ -1,39 +1,49 @@
 <!-- Parent: ../../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # net
 
 ## Purpose
 
-Runtime-agnostic TCP/UDP types: `TcpListener`, `TcpStream`, `UdpSocket`. Thin wrappers selecting tokio or smol backends.
+TCP/UDP socket wrappers. All sockets created via **socket2** (2 MB buffers, SO_REUSEADDR, non-blocking), then handed to tokio or smol async wrappers.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `mod.rs` | Public type aliases / re-exports and shared helpers |
-| `tokio.rs` | Tokio-backed sockets (`send_batch` / try_send; Linux sendmmsg) |
-| `smol.rs` | Smol/async-io-backed sockets (`send_batch`; Linux sendmmsg) |
-| `mmsg.rs` | Linux-only `sendmmsg` / `recvmmsg` helpers (cfg `target_os = "linux"`) |
+| `mod.rs` | Shared `raw_udp` / TCP setup; re-exports backend types |
+| `tokio.rs` | Tokio `TcpListener` / `TcpStream` / `UdpSocket` |
+| `smol.rs` | Smol backend equivalents |
+| `mmsg.rs` | Optional multi-message / batch UDP helpers if present |
+
+## Subdirectories
+
+None.
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- Keep tokio and smol APIs **surface-identical** for callers in binaries.
-- Prefer `socket2` for options (reuseaddr, buffers) when both backends need the same knob.
-- UDP paths are latency-critical for KCP — avoid extra copies.
+- Keep socket options identical across backends (`SOCK_BUF = 2MB`).
+- Bidirectional copy lives in **crate root** (`copy_bidirectional*`), not here.
+- Client mode may `connect()` UDP when remote is known.
 
 ### Testing Requirements
 
-Covered by `kio-rs` tests and e2e.
+- Covered by `kio-rs` tests and binary e2e
+
+### Common Patterns
+
+- `UdpSocket` / `TcpStream` types re-exported as `kio::{UdpSocket, TcpStream, TcpListener}`
 
 ## Dependencies
 
 ### Internal
-Parent `kio` crate features.
+
+- Parent `kio` facade
 
 ### External
-`tokio` or `smol`/`async-io`/`socket2`
+
+- `socket2`, runtime crates
 
 <!-- MANUAL: -->

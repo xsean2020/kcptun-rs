@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -70,6 +71,8 @@ pub struct Stream {
     local_closed: AtomicBool,
     /// Whether a FIN frame has been sent for this stream.
     fin_sent: AtomicBool,
+    /// When local side was closed (`None` = not yet). Used for linger reaping.
+    local_closed_at: Mutex<Option<Instant>>,
 
     // ── V2 flow control ──
     /// Incremental bytes consumed by reader (triggers UPD at threshold).
@@ -109,6 +112,7 @@ impl Stream {
             remote_closed: AtomicBool::new(false),
             local_closed: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
+            local_closed_at: Mutex::new(None),
             incr: AtomicU32::new(0),
             upd_consumed: AtomicU32::new(0),
             pending_upd: AtomicBool::new(false),
@@ -120,11 +124,16 @@ impl Stream {
     }
 
     /// Create a new stream with custom buffer capacity.
+    ///
+    /// `recv_capacity` is the **max** receive window, not a pre-allocation size.
+    /// Buffers grow on demand so short-lived proxy streams do not reserve multi-MB
+    /// RSS up front (see bugs/BUGREPORT_PROXY_MEMORY_GROWTH.md).
     pub fn with_buffer(id: u32, recv_capacity: usize) -> Self {
         Stream {
             id,
             state: Arc::new(Mutex::new(StreamState::Init)),
-            recv_buf: Arc::new(Mutex::new(BytesMut::with_capacity(recv_capacity))),
+            // Lazy: do not with_capacity(recv_capacity) — that was the RSS amplifier.
+            recv_buf: Arc::new(Mutex::new(BytesMut::new())),
             recv_buf_bytes: Arc::new(Mutex::new(VecDeque::new())),
             max_recv_buf: recv_capacity,
             send_buf: Arc::new(Mutex::new(VecDeque::new())),
@@ -134,6 +143,7 @@ impl Stream {
             remote_closed: AtomicBool::new(false),
             local_closed: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
+            local_closed_at: Mutex::new(None),
             incr: AtomicU32::new(0),
             upd_consumed: AtomicU32::new(0),
             pending_upd: AtomicBool::new(false),
@@ -142,6 +152,12 @@ impl Stream {
             ch_reader_wakeup: kio::Notify::new(),
             read_waker: Mutex::new(None),
         }
+    }
+
+    /// Current capacity of the legacy contiguous recv buffer (for tests / diagnostics).
+    #[inline]
+    pub fn recv_buf_capacity(&self) -> usize {
+        self.recv_buf.lock().capacity()
     }
 
     /// Get the stream ID.
@@ -153,10 +169,7 @@ impl Stream {
     /// Check if the stream is closed.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        matches!(
-            *self.state.lock(),
-            StreamState::Closed | StreamState::Reset
-        )
+        matches!(*self.state.lock(), StreamState::Closed | StreamState::Reset)
     }
 
     /// Check if the stream is ready for data transfer.
@@ -436,6 +449,10 @@ impl Stream {
     #[inline]
     pub fn mark_local_closed(&self) {
         self.local_closed.store(true, Ordering::Release);
+        let mut at = self.local_closed_at.lock();
+        if at.is_none() {
+            *at = Some(Instant::now());
+        }
     }
 
     /// Check if the local side has been closed.
@@ -451,6 +468,9 @@ impl Stream {
     }
 
     /// Mark that a FIN frame has been sent for this stream.
+    ///
+    /// Call only after the FIN is encoded into the outbound path (and preferably
+    /// after `kcp.send` succeeds). Never call from business `handle_*` alone.
     #[inline]
     pub fn mark_fin_sent(&self) {
         self.fin_sent.store(true, Ordering::Release);
@@ -460,6 +480,35 @@ impl Stream {
     #[inline]
     pub fn is_fin_sent(&self) -> bool {
         self.fin_sent.load(Ordering::Acquire)
+    }
+
+    /// Time since `mark_local_closed` / `force_local_closed_at`, if local is closed.
+    pub fn local_closed_elapsed(&self) -> Option<Duration> {
+        self.local_closed_at.lock().map(|t| t.elapsed())
+    }
+
+    /// Test/diagnostic helper: mark local closed as-of a past instant (linger tests).
+    pub fn force_local_closed_at(&self, at: Instant) {
+        self.local_closed.store(true, Ordering::Release);
+        *self.local_closed_at.lock() = Some(at);
+    }
+
+    /// Drop send/recv buffers without forging `remote_closed` or `fin_sent`.
+    ///
+    /// Use when the local pipe ends so RSS can drop while flush still sends FIN
+    /// and waits for (or times out) the peer.
+    pub fn clear_buffers(&self) {
+        self.recv_buf.lock().clear();
+        self.recv_buf_bytes.lock().clear();
+        self.send_buf.lock().clear();
+        // Shrink legacy contiguous buffer capacity if it grew large.
+        {
+            let mut rb = self.recv_buf.lock();
+            rb.truncate(0);
+            // BytesMut has no shrink_to_fit in older bytes; clear is enough for VecDeque path.
+            // Replacing empty buffer resets capacity cheaply.
+            *rb = BytesMut::new();
+        }
     }
 
     /// Apply a peer UPD frame (consumed + window) — matching Go `stream.update`.
@@ -513,14 +562,18 @@ impl Stream {
         }
     }
 
-    /// Close the stream fully.
+    /// Close the stream fully (both sides + clear buffers).
     pub fn close(&self) {
         self.local_closed.store(true, Ordering::Release);
+        {
+            let mut at = self.local_closed_at.lock();
+            if at.is_none() {
+                *at = Some(Instant::now());
+            }
+        }
         self.remote_closed.store(true, Ordering::Release);
         *self.state.lock() = StreamState::Closed;
-        self.recv_buf.lock().clear();
-        self.recv_buf_bytes.lock().clear();
-        self.send_buf.lock().clear();
+        self.clear_buffers();
         // Wake up any waiting readers
         self.fin_event();
     }
@@ -551,6 +604,61 @@ mod tests {
         assert!(!stream.is_closed());
         stream.close();
         assert!(stream.is_closed());
+    }
+
+    #[test]
+    fn clear_buffers_drops_send_and_recv_without_forging_remote_closed() {
+        let stream = Stream::with_buffer(1, 2 * 1024 * 1024);
+        stream.write(b"pending").unwrap();
+        stream.push_data(b"inbound").unwrap();
+        assert!(stream.pending_send() > 0);
+        assert!(stream.available() > 0);
+
+        stream.mark_local_closed();
+        stream.clear_buffers();
+
+        assert_eq!(stream.pending_send(), 0);
+        assert_eq!(stream.available(), 0);
+        assert!(stream.is_local_closed());
+        assert!(
+            !stream.is_remote_closed(),
+            "clear_buffers must not forge remote_closed"
+        );
+        assert!(!stream.is_fin_sent());
+    }
+
+    #[test]
+    fn with_buffer_does_not_preallocate_full_streambuf_capacity() {
+        // Historical leak amplifier: BytesMut::with_capacity(streambuf) reserved ~2MB
+        // per stream even when empty. Capacity must stay small until data arrives.
+        let stream = Stream::with_buffer(9, 2 * 1024 * 1024);
+        let cap = stream.recv_buf_capacity();
+        assert!(
+            cap < 64 * 1024,
+            "recv_buf capacity should be lazy, got {}",
+            cap
+        );
+    }
+
+    #[test]
+    fn mark_local_closed_stamps_elapsed() {
+        let stream = Stream::new(1);
+        assert!(stream.local_closed_elapsed().is_none());
+        stream.mark_local_closed();
+        let e = stream
+            .local_closed_elapsed()
+            .expect("elapsed after local close");
+        assert!(e < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn force_local_closed_at_allows_aged_reap_tests() {
+        let stream = Stream::new(1);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        stream.force_local_closed_at(past);
+        assert!(stream.is_local_closed());
+        let e = stream.local_closed_elapsed().unwrap();
+        assert!(e >= std::time::Duration::from_secs(59));
     }
 
     #[test]
@@ -594,7 +702,6 @@ mod tests {
         assert_eq!(&out[..], b" world");
         assert_eq!(s.pending_send(), 0);
     }
-
 
     #[test]
     fn stream_state_transitions() {

@@ -1,34 +1,50 @@
 <!-- Parent: ../../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # time
 
 ## Purpose
 
-Timers and timeouts: `sleep`, `sleep_ms`, `timeout`, `Elapsed` error type. Used by KCP update loops, keepalive, idle pipe timeout.
+Sleep and timeout primitives unified across runtimes: `sleep`, `sleep_ms`, `timeout`, `Elapsed`.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `mod.rs` | Re-exports |
-| `tokio.rs` | `tokio::time` |
-| `smol.rs` | `smol::Timer` / futures-lite timing |
+| `mod.rs` | `sleep_ms`, `Elapsed`; re-exports backend `sleep`/`timeout` |
+| `tokio.rs` | `tokio::time` wrappers |
+| `smol.rs` | `smol::Timer` wrappers |
+
+## Subdirectories
+
+None.
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- `timeout` should map cleanly to `Elapsed` on both backends.
-- Idle-timeout logic for pipes lives in `lib.rs` (`copy_bidirectional_idle`), not only here — coordinate changes.
+- Prefer `kio::sleep_ms` / `kio::timeout` in shared code.
+- `Elapsed` is the unified timeout error type.
 
 ### Testing Requirements
 
-Covered by kio tests and e2e idle behavior.
+- kio tests; binary idle/closewait paths use these timers
+
+### Common Patterns
+
+```rust
+kio::sleep_ms(2).await;
+kio::timeout(dur, fut).await
+```
 
 ## Dependencies
 
+### Internal
+
+- Parent `kio`
+
 ### External
-tokio time **or** smol Timer
+
+- tokio time or smol Timer
 
 <!-- MANUAL: -->

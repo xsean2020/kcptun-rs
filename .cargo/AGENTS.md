@@ -1,28 +1,46 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # .cargo
 
 ## Purpose
 
-Cargo configuration for **vendored** third-party dependencies. Generated/maintained by `make vendor`.
+Cargo configuration for vendored dependencies and target-specific rustflags. Regenerated/rewritten in part by `make vendor`.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `config.toml` | Redirects crates-io to `../vendor`; also sets `aes_armv8` rustflags for aarch64 |
+| `config.toml` | `crates-io` → `vendor/`; aarch64 `rustflags = ["--cfg", "aes_armv8"]` for Apple Darwin + Linux GNU |
+
+## Subdirectories
+
+None.
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- Do not hand-edit unless you know you need offline registry overrides.
-- After dependency changes: `make vendor` (rewrites this file and `vendor/`).
-- **Preserve `aes_armv8` rustflags** for `aarch64-apple-darwin` / `aarch64-unknown-linux-gnu` — without them RustCrypto `aes` 0.8 uses soft AES on Apple Silicon (large CFB throughput regression). `make vendor` regenerates these flags.
+- Do not hand-edit the source replacement block without also running/understanding `make vendor`.
+- **Keep** aarch64 `aes_armv8` cfg — without it AES falls back to soft fixslice (major perf cliff).
+- Vendor dir is repo-root `vendor/` (not under `.cargo/`).
 
 ### Testing Requirements
 
-`cargo build --workspace` offline should still resolve via vendor.
+- After vendor refresh: `cargo build --workspace` / `make build`
+
+### Common Patterns
+
+- Offline builds rely on `vendor/` + this config
+
+## Dependencies
+
+### Internal
+
+- `Makefile` `vendor` / `vendor-force` targets
+
+### External
+
+- Cargo / rustc
 
 <!-- MANUAL: -->

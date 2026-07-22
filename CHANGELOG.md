@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — session-layer FEC encode/decode (Go-compatible)
+
+- **FecEncoder** wired on client/server send path (flush + ACK):
+  `KCP → FEC([seq|type|size|payload] + parity) → encrypt → UDP`, matching Go
+  `postProcess` / `maxFECEncodeLatency=500`.
+- **FecDecoder** on client receive (server already had it); recovered shards
+  use Go `r[2:sz]` SIZE trim (`fec_kcp_from_recovered`) so RS pad is not
+  fed into KCP.
+- **FecDecoder reconstruct**: `(shard, present)` bool polarity fixed
+  (`true` = present per reed-solomon-erasure); recovery was inverted before.
+- Encoder fixes: SIZE field = `len(frame[payloadOffset:])` (no extra +2);
+  RS encodes payload region only; parity headers at `header_offset`.
+- Defaults remain **datashard=10 / parityshard=3** (same as Go); disable with
+  `--datashard 0 --parityshard 0`.
+- SNMP: `FECParityShards` / `FECFullShards` increment under load (verified).
+
+### Perf — XTEA / Blowfish CFB monomorphize (catch up to Go)
+
+- **XTEA**: specialized CFB-8 (no `Fn` closure); block encrypt uses Go-style
+  two-round loop (`golang.org/x/crypto/xtea`).
+- **Blowfish**: specialized CFB-8; in-place `encrypt_block` without per-block
+  `GenericArray` clone.
+- **AES-GCM**: re-bench after rebuild; no algorithm change (already counter
+  nonce + `seal_into`).
+
+Fresh median thr (2MB×4, 3 rounds) vs Go:
+| crypt | mode | Go | tokio | smol |
+|-------|------|---:|------:|-----:|
+| xtea | comp | 22.0 | **34.9 (1.58×)** | 22.1 (1.00×) |
+| xtea | nocomp | 22.4 | **30.9 (1.38×)** | **31.0 (1.38×)** |
+| blowfish | comp | 30.3 | **46.0 (1.52×)** | **52.0 (1.72×)** |
+| blowfish | nocomp | 39.1 | **44.8 (1.15×)** | **48.4 (1.24×)** |
+| aes-128-gcm | comp | 49.8 | **52.3 (1.05×)** | **56.8 (1.14×)** |
+| aes-128-gcm | nocomp | 56.0 | **57.9 (1.03×)** | 54.9 (0.98×) |
+
+### Perf — 3DES CFB monomorphize + avoid snappy/encrypt double offload
+
+- **`TripleDesCrypt`**: specialized CFB-8 loops call `encrypt_block` directly
+  (no `Fn` closure), with `#[inline(always)]` on Feistel / block encrypt —
+  same algorithm as Go `crypto/des` (feistel boxes + single IP/FP for 48 rounds).
+- **Snappy `cpu_block`**: only when crypt is null/none (no concurrent encrypt
+  offload). Heavy ciphers keep Snappy inline so plaintext stays warm for
+  `encrypt_batch` and smol avoids double pool hops (fixes 3des+comp regression).
+
+Measured (median of 3, 2MB×4 conn, this host):
+- 3des+comp: Go ~9.0, **tokio ~15.2 (1.7×)**, smol ~10.7 (1.2× Go)
+- 3des nocomp: Go ~10.7, **tokio ~12.2 (1.1×)**, **smol ~15.4 (1.4×)**
+
+### Perf — conditional Snappy `cpu_block` offload
+
+- Client/server flush: when Snappy is enabled and the uncompressed SMUX
+  drain is ≥4 KiB, compress via `kio::cpu_block` (persistent pool on smol /
+  `spawn_blocking` on tokio). Smaller flushes stay inline.
+- New helper: `kcp_rs::should_cpu_block_compress` (shared threshold).
+
+### Fixed — SNMP stats aligned with Go kcp-go + opt-in collection
+
+- Rebuilt `kcp-rs` SNMP to match **Go kcp-go v5** `Header()`/`ToSlice()` field
+  set and order (29 columns): BytesSent/Received, MaxConn, Active/PassiveOpens,
+  CurrEstab, InErrs, InCsumErrors, KCPInErrors, In/OutPkts, In/OutSegs,
+  In/OutBytes, retransmit counters, RepeatSegs, FEC*, ring buffers.
+- Instrumented KCP send/recv, input (repeat segs), flush retrans, FEC decode,
+  UDP in/out on client/server, session open, CRC/AEAD failures.
+- **Performance:** SNMP collection is **disabled by default**. Hot-path updates
+  are gated behind `kcp_rs::snmp_enable()`, which runs only when `--snmplog`
+  is set and `--snmpperiod > 0`. No snmplog → no counter atomics on the data plane.
+- Logger reads `DEFAULT_SNMP` (not a fresh zeroed `SNMP::new()`).
+
+### Fixed — SNMP logger always printed zeros
+
+- Client/server `snmp_logger` created a fresh `SNMP::new()` each period
+  (all counters 0) instead of reading process-wide `kcp_rs::DEFAULT_SNMP`
+  updated by `KCP::input` / `flush` / empty_flush paths.
+- After fix, logs show live `InSegs` / `OutSegs` / retransmit / ring /
+  `EmptyFlush` values. Other header columns (BytesSent, Ack*, FEC*, …)
+  remain 0 until those counters are instrumented in the data plane.
+
+### Perf — smol `cpu_block` pool + no nested encrypt parallelism
+
+- **smol blocking pool**: job queue is now `async_channel::unbounded` (true
+  MPMC). Workers `recv_blocking` without sharing a `Mutex` around
+  `mpsc::Receiver` — lower dispatch latency under multi-session encrypt
+  offload.
+- **`encrypt_batch(..., allow_parallel)`**: when the batch is already running
+  on a `cpu_block` worker (`allow_parallel=false`), skip `thread::scope`
+  fan-out so CFB encrypt does not thrash cores / inflate latency (smol heavy
+  cipher + multi-conn). Inline (non-offload) path still parallelizes ≥4 pkts.
+
+### Fixed — smol `copy_bidirectional_idle` true idle (Go closeWait)
+
+- **smol backend** previously wrapped the whole pipe in `timeout(idle_secs)`,
+  which is a **total duration** limit and would kill long-lived busy sessions.
+  It now matches tokio / Go `closeWait`: a resettable `async_io::Timer` fires
+  only after **no data transfer** for `idle_secs`.
+- 64 KiB copy buffers on the smol path are **heap-allocated** (avoids ~128 KiB
+  async frames overflowing small worker stacks in debug).
+- smol executor / `cpu_block` worker threads use a **2 MiB** stack
+  (`kio-rs/src/task/smol.rs`).
+- **`TcpListener::local_addr`** added on both backends (needed for tests / bind `:0`).
+- Regression tests: idle resets on paced data; idle fires when quiet;
+  `JoinHandle` detach-on-drop (fire-and-forget must not cancel tasks on smol).
+
 ### Added — Rust `--pprof` emits Go-compatible protobuf
 
 - Replaced placeholder `--pprof` HTTP banner with real CPU profiling via

@@ -140,7 +140,6 @@ impl UdpSocket {
         }
     }
 
-
     #[inline(always)]
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.try_recv(buf)
@@ -219,6 +218,11 @@ impl TcpListener {
         let std_listener = raw_tcp_listener(addr)?;
         let l = tokio::net::TcpListener::from_std(std_listener)?;
         Ok(Self { inner: l })
+    }
+
+    #[inline(always)]
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
     }
 
     #[inline(always)]

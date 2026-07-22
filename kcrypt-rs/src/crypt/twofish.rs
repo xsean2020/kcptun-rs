@@ -259,10 +259,38 @@ impl TwofishCrypt {
                 // (only 4 sbox layers, missing ^S[12..15] and the innermost sbox),
                 // which broke Go↔Rust interop for 256-bit keys.
                 for i in 0..256 {
-                    s[0][i] = mds_column_mult(SBOX[1][SBOX[0][SBOX[0][SBOX[1][SBOX[1][i] as usize ^ s_key[0] as usize] as usize ^ s_key[4] as usize] as usize ^ s_key[8] as usize] as usize ^ s_key[12] as usize], 0);
-                    s[1][i] = mds_column_mult(SBOX[0][SBOX[0][SBOX[1][SBOX[1][SBOX[0][i] as usize ^ s_key[1] as usize] as usize ^ s_key[5] as usize] as usize ^ s_key[9] as usize] as usize ^ s_key[13] as usize], 1);
-                    s[2][i] = mds_column_mult(SBOX[1][SBOX[1][SBOX[0][SBOX[0][SBOX[0][i] as usize ^ s_key[2] as usize] as usize ^ s_key[6] as usize] as usize ^ s_key[10] as usize] as usize ^ s_key[14] as usize], 2);
-                    s[3][i] = mds_column_mult(SBOX[0][SBOX[1][SBOX[1][SBOX[0][SBOX[1][i] as usize ^ s_key[3] as usize] as usize ^ s_key[7] as usize] as usize ^ s_key[11] as usize] as usize ^ s_key[15] as usize], 3);
+                    s[0][i] = mds_column_mult(
+                        SBOX[1][SBOX[0][SBOX[0][SBOX[1][SBOX[1][i] as usize ^ s_key[0] as usize]
+                            as usize
+                            ^ s_key[4] as usize] as usize
+                            ^ s_key[8] as usize] as usize
+                            ^ s_key[12] as usize],
+                        0,
+                    );
+                    s[1][i] = mds_column_mult(
+                        SBOX[0][SBOX[0][SBOX[1][SBOX[1][SBOX[0][i] as usize ^ s_key[1] as usize]
+                            as usize
+                            ^ s_key[5] as usize] as usize
+                            ^ s_key[9] as usize] as usize
+                            ^ s_key[13] as usize],
+                        1,
+                    );
+                    s[2][i] = mds_column_mult(
+                        SBOX[1][SBOX[1][SBOX[0][SBOX[0][SBOX[0][i] as usize ^ s_key[2] as usize]
+                            as usize
+                            ^ s_key[6] as usize] as usize
+                            ^ s_key[10] as usize] as usize
+                            ^ s_key[14] as usize],
+                        2,
+                    );
+                    s[3][i] = mds_column_mult(
+                        SBOX[0][SBOX[1][SBOX[1][SBOX[0][SBOX[1][i] as usize ^ s_key[3] as usize]
+                            as usize
+                            ^ s_key[7] as usize] as usize
+                            ^ s_key[11] as usize] as usize
+                            ^ s_key[15] as usize],
+                        3,
+                    );
                 }
             }
         }

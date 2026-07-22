@@ -347,77 +347,111 @@ Rust samples are encoded as Google pprof protobuf so the **Go toolchain** UI sho
 Two benchmark scripts measure different aspects of performance:
 
 - **`bench/run_bench.sh`** — bulk throughput (200 MB, single connection, AES-128-CFB,
-  `--nocomp`). Measures sustained data transfer rate and RTT latency.
+  `--nocomp`, `mode=fast`, `sndwnd/rcvwnd=1024`, `smuxver=2`). Measures sustained
+  transfer rate and RTT latency.
 - **`bench_rust_vs_go.py`** — comprehensive cipher × compression matrix (10 concurrent
   connections × 1 MB per connection, `--mode fast --sndwnd 2048 --rcvwnd 2048`).
   Uses concurrent send+receive with 256 KB warmup. Results saved to `bench_results.json`.
 
-### 3-Way Bulk Throughput (50 MB, AES-128, `--nocomp`)
+### Test machine
 
-| Path                     | Throughput (MB/s) | Latency (ms RTT) | vs Go   |
-|--------------------------|-------------------|-------------------|---------|
-| Go → Go                  | 48.10             | 0.22              | 1.00x   |
-| **Rust-Tokio → Rust-Tokio** | **68.81**     | 0.17              | **1.43x** |
-| **Rust-Smol → Rust-Smol**   | **75.01**     | 0.23              | **1.56x** |
-| Go → Rust-Tokio          | 46.79             | 0.18              | 0.97x   |
-| Rust-Tokio → Go          | 19.92             | 0.22              | 0.41x   |
+| Item | Value |
+|------|-------|
+| Host | Mac mini (Macmini9,1) |
+| Chip | Apple M1 (8 cores: 4P + 4E) |
+| Memory | 8 GB |
+| OS | macOS 26.3.1 (Build 25D771280a), Darwin 25.3.0 arm64 |
+| Rust | rustc / cargo 1.92.0-nightly (2025-10-13) |
+| Go | go1.25.5 darwin/arm64 |
+| Go kcptun | `SELFBUILD` (`tests/kcptun-go/{client,server}`) |
+| Rust kcptun-rs | `0.1.0` @ `99803fe` (release LTO+strip; default features **without** `pprof`) |
+| AES on this host | RustCrypto `aes_armv8` enabled via `.cargo/config.toml` |
+| Date | 2026-07-21 |
 
-> Rust-Tokio and Rust-Smol both outperform Go-to-Go on bulk throughput (1.43x and
-> 1.56x respectively) with lower latency. Cross-implementation paths (Go→Rust,
-> Rust→Go) are bottlenecked by the slower side.
+> Numbers below were collected on this machine only. Cross-host comparison is not
+> meaningful without matching CPU/AES/memory/OS conditions.
+
+### 3-Way Bulk Throughput (200 MB, AES-128-CFB, `--nocomp`)
+
+Command: `BENCH_DATA_MB=200 BENCH_LATENCY_ITERS=50 bash bench/run_bench.sh`
+
+| Path | Throughput (MB/s) | Latency (ms median RTT) | vs Go→Go |
+|------|------------------:|------------------------:|---------:|
+| Go → Go | 51.15 | 0.31 | 1.00× |
+| **Rust-Tokio → Rust-Tokio** | **85.60** | **0.12** | **1.67×** |
+| **Rust-Smol → Rust-Smol** | **108.06** | **0.13** | **2.11×** |
+| Go → Rust-Tokio | 76.48 | 0.11 | 1.50× |
+| Rust-Tokio → Go | 30.28 | 0.15 | 0.59× |
+
+> Same-stack Rust paths are clearly faster than Go→Go on this M1 host. Cross-stack
+> paths are limited by the slower peer (Rust→Go is the weak direction here).
 
 ### Comprehensive Cipher × Compression Matrix (10 conn × 1 MB)
 
+Command: `python3 bench_rust_vs_go.py` (defaults: 10 connections, 1 MB each).
+
+Tokio `null/no-comp` failed once at server start in this run (marked —); remaining
+cells completed with 0 failed connections.
+
 #### Without compression (`--nocomp`)
 
-| Cipher       | Tokio MB/s | Smol MB/s | Go MB/s | T/Go   | S/Go   |
-|--------------|-----------|-----------|---------|--------|--------|
-| null         | 27.3      | 25.0      | 23.5    | 1.16x  | 1.06x  |
-| none         | 20.7      | 20.5      | 20.4    | 1.01x  | 1.00x  |
-| xor          | 20.1      | 18.1      | 16.4    | 1.23x  | 1.11x  |
-| aes-128      | 19.7      | 19.7      | 20.7    | 0.95x  | 0.95x  |
-| aes-128-gcm  | 22.5      | 23.5      | 19.5    | 1.15x  | 1.20x  |
-| salsa20      | 22.5      | 17.3      | 21.3    | 1.06x  | 0.81x  |
-| blowfish     | 20.9      | 19.9      | 15.6    | 1.33x  | 1.27x  |
-| twofish      | 19.7      | 19.9      | 14.9    | 1.32x  | 1.33x  |
-| cast5        | 21.1      | 16.1      | 14.9    | 1.42x  | 1.08x  |
-| 3des         | 11.6      | 11.7      | 10.1    | 1.14x  | 1.16x  |
-| tea          | 22.4      | 21.7      | 14.0    | 1.60x  | 1.55x  |
-| xtea         | 20.4      | 17.4      | 14.7    | 1.39x  | 1.19x  |
-| **sm4**      | **13.2**  | **16.0**  | **3.9** | **3.34x** | **4.05x** |
+| Cipher | Tokio MB/s | Smol MB/s | Go MB/s | T/Go | S/Go |
+|--------|-----------:|----------:|--------:|-----:|-----:|
+| null | — | 37.6 | 40.8 | — | 0.92× |
+| none | 47.7 | 35.3 | 36.0 | 1.33× | 0.98× |
+| xor | 31.1 | 30.8 | 34.2 | 0.91× | 0.90× |
+| aes-128 | 35.2 | 38.1 | 30.9 | 1.14× | 1.23× |
+| aes-128-gcm | 37.8 | 40.7 | 33.6 | 1.12× | 1.21× |
+| salsa20 | 33.7 | 27.8 | 33.5 | 1.00× | 0.83× |
+| blowfish | 32.8 | 34.1 | 27.4 | 1.20× | 1.24× |
+| twofish | 31.2 | 34.6 | 20.6 | 1.51× | 1.68× |
+| cast5 | 29.7 | 31.1 | 30.3 | 0.98× | 1.03× |
+| 3des | 13.7 | 14.0 | 12.2 | 1.12× | 1.15× |
+| tea | 30.3 | 35.0 | 40.1 | 0.76× | 0.87× |
+| xtea | 18.7 | 16.7 | 17.4 | 1.07× | 0.96× |
+| **sm4** | **17.4** | **9.4** | **3.9** | **4.41×** | **2.40×** |
 
 #### With compression (Snappy)
 
-| Cipher       | Tokio MB/s | Smol MB/s | Go MB/s | T/Go   | S/Go   |
-|--------------|-----------|-----------|---------|--------|--------|
-| null         | 26.3      | 15.2      | 22.3    | 1.18x  | 0.68x  |
-| none         | 20.0      | 22.0      | 19.4    | 1.03x  | 1.14x  |
-| xor          | 17.2      | 16.6      | 20.4    | 0.84x  | 0.81x  |
-| aes-128      | 21.0      | 16.0      | 20.6    | 1.02x  | 0.78x  |
-| aes-128-gcm  | 25.0      | 23.8      | 22.5    | 1.11x  | 1.06x  |
-| salsa20      | 24.3      | 21.6      | 18.9    | 1.28x  | 1.14x  |
-| blowfish     | 15.4      | 11.8      | 15.4    | 1.00x  | 0.76x  |
-| twofish      | 22.3      | 19.3      | 14.4    | 1.54x  | 1.34x  |
-| cast5        | 21.3      | 19.3      | 15.4    | 1.39x  | 1.26x  |
-| 3des         | 12.3      | 7.8       | 9.6     | 1.29x  | 0.82x  |
-| tea          | 18.7      | 18.3      | 21.1    | 0.89x  | 0.86x  |
-| xtea         | 19.3      | 13.1      | 7.6     | 2.53x  | 1.71x  |
-| **sm4**      | **19.7**  | **16.0**  | **3.1** | **6.30x** | **5.12x** |
+| Cipher | Tokio MB/s | Smol MB/s | Go MB/s | T/Go | S/Go |
+|--------|-----------:|----------:|--------:|-----:|-----:|
+| null | 32.9 | 36.2 | 35.8 | 0.92× | 1.01× |
+| none | 34.7 | 34.5 | 30.9 | 1.12× | 1.12× |
+| xor | 39.8 | 38.2 | 39.3 | 1.01× | 0.97× |
+| aes-128 | 38.2 | 43.1 | 39.6 | 0.96× | 1.09× |
+| aes-128-gcm | 34.0 | 43.6 | 37.5 | 0.91× | 1.16× |
+| salsa20 | 34.7 | 37.9 | 27.3 | 1.27× | 1.39× |
+| blowfish | 32.7 | 40.2 | 28.2 | 1.16× | 1.42× |
+| twofish | 30.8 | 17.1 | 23.5 | 1.31× | 0.73× |
+| cast5 | 32.3 | 28.7 | 32.1 | 1.00× | 0.89× |
+| 3des | 15.7 | 13.6 | 12.0 | 1.31× | 1.13× |
+| tea | 33.6 | 36.9 | 29.8 | 1.13× | 1.24× |
+| xtea | 10.5 | 14.7 | 16.5 | 0.63× | 0.89× |
+| **sm4** | **17.2** | **16.5** | **3.6** | **4.84×** | **4.64×** |
 
-> **sm4** is Rust's strongest cipher — **3.3–6.3× faster** than Go's implementation
-> (Go's SM4 is ~5× slower than its other ciphers). Rust-SM4 matches Rust's other
-> cipher throughput, while Go-SM4 is a severe outlier.
->
-> With the optimized 1 MB payload (concurrent send+receive + warmup), Rust-Tokio and
-> Rust-Smol outperform Go for most ciphers (1.1x–1.6x). Notable wins include
-> **3des** (1.14× no-comp, was 0.61× before feistel box optimization),
-> **xor** (1.23× no-comp, was 0.80× before u64 chunk XOR),
-> **tea** (1.60× no-comp), **xtea** (2.53× comp), and **twofish** (1.54× comp).
->
-> **twofish** improved from 0.10x to 1.32× after pre-computed lookup table optimization.
-> **3des** improved from 0.61x to 1.14x after custom feistel box DES implementation.
+> On this M1 host, multi-conn matrix numbers are closer across stacks than the bulk
+> single-stream path (window/scheduling noise is higher at 10×1 MB). **sm4** remains
+> Rust’s largest relative win vs Go. Raw JSON: `bench_results.json`.
+
+### Stress tests (data integrity)
+
+Command: `cargo test --release -p kcptun-server --test stress_test -- --nocapture --test-threads=1`
+
+**Result (2026-07-21, same machine): 8 passed, 0 failed in 51.97s**
+
+| Test | Connections | Payload | Result |
+|------|-------------|---------|--------|
+| `test_single_connection_mixed_sizes` | 1 | 1B…64KB | ✅ byte-for-byte |
+| `test_single_connection_1mb` | 1 | 1 MB | ✅ |
+| `test_multithread_10_connections` | 10 | 256B | ✅ |
+| `test_multithread_50_connections` | 50 | 255B | ✅ |
+| `test_multithread_100_connections` | 100 | 1B + 4KB | ✅ |
+| `test_multithread_large_data` | 100 | 64KB + 128KB | ✅ |
+| `test_page_refresh_simulation` | 80 (3 waves) | 512B…128KB | ✅ |
+| `test_snappy_compressible_data` | 1 | compressible patterns | ✅ |
 
 ### Optimization History
+
 
 | Version                        | Throughput | Latency (avg) | vs Go   |
 |--------------------------------|------------|---------------|---------|

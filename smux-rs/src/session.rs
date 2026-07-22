@@ -409,6 +409,66 @@ impl Session {
         }
     }
 
+    /// Remove one stream from the session map and fully close it.
+    ///
+    /// Returns `true` if the id was present. Used for SYN-send failures and
+    /// force-reap paths so map entries cannot leak.
+    pub fn remove_stream(&self, id: u32) -> bool {
+        let mut streams = self.streams.lock();
+        if let Some(stream) = streams.remove(&id) {
+            stream.close();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reap streams that are fully closed, or local-closed past `linger` without
+    /// a peer FIN (zombie half-open streams under proxy short-connect load).
+    ///
+    /// Returns stream ids that still need a wire FIN before/while being removed
+    /// (`!fin_sent`). Callers should encode FIN for those ids, then treat them as
+    /// gone from the map (this method already `remove`s + `close`s).
+    ///
+    /// Fully closed (`local && remote && fin_sent`) streams are removed with an
+    /// empty contribution to the returned vec.
+    pub fn reap_stale_streams(&self, linger: Duration) -> Vec<u32> {
+        let mut streams = self.streams.lock();
+        let mut need_fin = Vec::new();
+        let mut to_remove = Vec::new();
+
+        for (&id, s) in streams.iter() {
+            let local = s.is_local_closed();
+            let remote = s.is_remote_closed();
+            let fin = s.is_fin_sent();
+
+            if local && remote && fin {
+                to_remove.push((id, false));
+                continue;
+            }
+
+            if local {
+                if let Some(elapsed) = s.local_closed_elapsed() {
+                    if elapsed >= linger {
+                        // Timed out waiting for peer FIN — force remove.
+                        to_remove.push((id, !fin));
+                    }
+                }
+            }
+        }
+
+        for (id, wants_fin) in to_remove {
+            if let Some(stream) = streams.remove(&id) {
+                if wants_fin {
+                    need_fin.push(id);
+                }
+                stream.close();
+            }
+        }
+
+        need_fin
+    }
+
     /// Get the number of active streams.
     #[inline]
     pub fn stream_count(&self) -> usize {
@@ -447,6 +507,53 @@ mod tests {
         let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
         let stream = session.open_stream().unwrap();
         assert_eq!(stream.id(), 1);
+        assert_eq!(session.stream_count(), 1);
+    }
+
+    #[test]
+    fn remove_stream_drops_map_entry_and_closes() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let stream = session.open_stream().unwrap();
+        let id = stream.id();
+        assert!(session.remove_stream(id));
+        assert_eq!(session.stream_count(), 0);
+        assert!(stream.is_closed());
+        assert!(!session.remove_stream(id));
+    }
+
+    #[test]
+    fn reap_stale_streams_removes_fully_closed() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        s.mark_local_closed();
+        s.mark_remote_closed();
+        s.mark_fin_sent();
+        let need_fin = session.reap_stale_streams(Duration::from_secs(30));
+        assert!(need_fin.is_empty());
+        assert_eq!(session.stream_count(), 0);
+    }
+
+    #[test]
+    fn reap_stale_streams_removes_local_closed_past_linger() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        let id = s.id();
+        // Local closed long ago, peer never FINed → zombie that must be reaped.
+        s.force_local_closed_at(Instant::now() - Duration::from_secs(120));
+        assert!(!s.is_remote_closed());
+        let need_fin = session.reap_stale_streams(Duration::from_secs(30));
+        assert_eq!(need_fin, vec![id], "stale stream still needs wire FIN");
+        assert_eq!(session.stream_count(), 0);
+    }
+
+    #[test]
+    fn reap_stale_streams_keeps_fresh_local_closed() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        s.mark_local_closed();
+        // Just closed — within linger, wait for remote FIN.
+        let need_fin = session.reap_stale_streams(Duration::from_secs(30));
+        assert!(need_fin.is_empty());
         assert_eq!(session.stream_count(), 1);
     }
 

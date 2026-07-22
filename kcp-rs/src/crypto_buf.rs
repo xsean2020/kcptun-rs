@@ -32,6 +32,86 @@ pub const CRYPT_HDR: usize = 20;
 /// Nonce size.
 pub const NONCE_SZ: usize = 16;
 
+/// Inbound CFB decrypt / header-strip failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundCryptError {
+    /// Packet shorter than crypto header (or empty after probe).
+    Short,
+    /// CRC32 of payload does not match the header field.
+    CrcMismatch,
+}
+
+/// Decrypt a CFB wire packet **in place** and return a slice of the plaintext body.
+///
+/// Layout after decrypt: `[nonce 16B][CRC32 4B][payload…]`. On success the
+/// returned slice is `&buf[CRYPT_HDR..]` — **no** heap alloc and **no** copy
+/// into `CryptoBuf.enc_buf`.
+///
+/// `probe_header`: when `true` (server historical/compat path), if byte 4 is a
+/// KCP cmd (`0x51..=0x54`) the whole buffer is treated as already-plaintext
+/// with **no** crypto header. When `false` (client / normal Go CFB), always
+/// require and strip the 20B header after CRC check.
+///
+/// Callers must finish using the returned slice (e.g. `KCP::input`) before
+/// overwriting `buf` again.
+#[inline]
+pub fn decrypt_cfb_in_place<'a>(
+    buf: &'a mut [u8],
+    crypt: &dyn BlockCrypt,
+    probe_header: bool,
+) -> Result<&'a [u8], InboundCryptError> {
+    if buf.is_empty() {
+        return Err(InboundCryptError::Short);
+    }
+    crypt.decrypt(buf);
+    strip_cfb_header_if_present(buf, probe_header)
+}
+
+/// After CFB decrypt (or for an already-plaintext buffer), optionally detect
+/// and strip the 20B crypto header. See [`decrypt_cfb_in_place`].
+#[inline]
+pub fn strip_cfb_header_if_present(
+    buf: &[u8],
+    probe_header: bool,
+) -> Result<&[u8], InboundCryptError> {
+    if probe_header {
+        if buf.len() > CRYPT_HDR {
+            let cmd = buf[4];
+            let has_header = cmd != 0x51 && cmd != 0x52 && cmd != 0x53 && cmd != 0x54;
+            if !has_header {
+                return Ok(buf);
+            }
+        } else if buf.len() >= 5 {
+            let cmd = buf[4];
+            if cmd == 0x51 || cmd == 0x52 || cmd == 0x53 || cmd == 0x54 {
+                return Ok(buf);
+            }
+            return Err(InboundCryptError::Short);
+        } else {
+            return Err(InboundCryptError::Short);
+        }
+    } else if buf.len() <= CRYPT_HDR {
+        return Err(InboundCryptError::Short);
+    }
+
+    let stored_crc = u32::from_le_bytes(
+        buf[NONCE_SZ..CRYPT_HDR]
+            .try_into()
+            .map_err(|_| InboundCryptError::Short)?,
+    );
+    let computed_crc = crc32fast::hash(&buf[CRYPT_HDR..]);
+    if stored_crc != computed_crc {
+        return Err(InboundCryptError::CrcMismatch);
+    }
+    Ok(&buf[CRYPT_HDR..])
+}
+
+/// null cipher inbound view — identity slice (no crypto header).
+#[inline]
+pub fn inbound_null(buf: &[u8]) -> &[u8] {
+    buf
+}
+
 /// A reusable encryption buffer with a monotonic nonce counter.
 ///
 /// Designed to be held inside a `Mutex` or `parking_lot::Mutex` and called
@@ -128,45 +208,25 @@ impl CryptoBuf {
         prepared
     }
 
-    /// Decrypt `data` in place and verify the CRC32 checksum.
+    /// Decrypt `data` in place, verify CRC32, and **copy** the payload into
+    /// this buffer's reusable `enc_buf`, returning it as `Bytes`.
     ///
-    /// On success, returns a `Bytes` slice pointing into the decrypted
-    /// payload (zero-copy — no `to_vec()` allocation).
+    /// Prefer [`decrypt_cfb_in_place`] on the hot inbound path when the
+    /// plaintext is only needed for a synchronous `KCP::input` — that path
+    /// avoids this second payload copy. Keep this method when the caller
+    /// needs an owned `Bytes` that outlives the receive buffer.
     ///
     /// On CRC mismatch or short data, returns `None`.
-    ///
-    /// `data` is modified in place: after decryption, `data[CRYPT_HDR..]`
-    /// is the plaintext payload. The returned `Bytes` is a slice of the
-    /// first `data.len() - CRYPT_HDR` bytes.
     #[inline]
     pub fn decrypt_cfb(&mut self, data: &mut [u8], crypt: &dyn BlockCrypt) -> Option<Bytes> {
-        if data.len() <= CRYPT_HDR {
-            return None;
-        }
-
-        // Decrypt in place
-        crypt.decrypt(data);
-
-        // Verify CRC32
-        let stored_crc = u32::from_le_bytes(data[NONCE_SZ..CRYPT_HDR].try_into().ok()?);
-        let computed_crc = crc32fast::hash(&data[CRYPT_HDR..]);
-        if stored_crc != computed_crc {
-            return None;
-        }
-
-        // Return zero-copy slice of the payload
-        let payload_len = data.len() - CRYPT_HDR;
-        // Copy the decrypted payload into our reusable buffer so the caller
-        // can release the original receive buffer back to the pool.
-        // This is one copy, but it eliminates the double-copy pattern
-        // (to_vec + to_vec) in the original code.
+        let body = decrypt_cfb_in_place(data, crypt, false).ok()?;
+        let payload_len = body.len();
         self.enc_buf.clear();
         self.enc_buf.resize(payload_len, 0);
-        self.enc_buf.copy_from_slice(&data[CRYPT_HDR..]);
+        self.enc_buf.copy_from_slice(body);
         Some(self.enc_buf.split_to(payload_len).freeze())
     }
 }
-
 
 /// Decide whether a batch encrypt should be offloaded to `cpu_block` (P0.2).
 ///
@@ -189,6 +249,16 @@ pub fn should_cpu_block_encrypt(
     }
 }
 
+/// Size threshold for session-level Snappy offload (≥4 KiB).
+///
+/// Callers should **also** require null/none crypto: when encrypt is itself
+/// offloaded to `cpu_block`, keeping Snappy inline avoids a double pool hop
+/// and keeps the plaintext warm for the subsequent encrypt_batch.
+#[inline]
+pub fn should_cpu_block_compress(uncompressed_bytes: usize) -> bool {
+    uncompressed_bytes >= 4096
+}
+
 /// Encrypt a batch of raw KCP segments for the wire (P0.1 / P0.5).
 ///
 /// Input packets are `Bytes` (reference-counted) — the KCP output callback
@@ -197,6 +267,7 @@ pub fn should_cpu_block_encrypt(
 ///
 /// - AEAD: `seal_into` each packet
 /// - CFB: serial `prepare_encrypt` then parallel `crypt.encrypt` when ≥4
+///   and `allow_parallel` (disable when already on a `cpu_block` worker)
 /// - null: move `Bytes` straight through (no crypto header, no copy)
 pub fn encrypt_batch(
     packets: Vec<Bytes>,
@@ -204,6 +275,9 @@ pub fn encrypt_batch(
     crypto_buf: &parking_lot::Mutex<CryptoBuf>,
     aead: Option<&dyn AeadCrypt>,
     has_encryption: bool,
+    // When false, never spawn thread::scope workers (already on a cpu_block
+    // pool thread — nested parallelism thrashes cores under multi-session load).
+    allow_parallel: bool,
 ) -> Vec<Bytes> {
     let mut results = Vec::with_capacity(packets.len());
     if let Some(aead) = aead {
@@ -215,11 +289,15 @@ pub fn encrypt_batch(
     } else if has_encryption {
         // Small batches: encrypt_cfb reuses CryptoBuf's internal buffer (no
         // per-packet BytesMut from prepare_encrypt). Large batches: prepare
-        // then parallel encrypt (P1.1).
-        let nthreads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(packets.len());
+        // then parallel encrypt (P1.1) only when `allow_parallel`.
+        let nthreads = if allow_parallel {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(packets.len())
+        } else {
+            1
+        };
         if nthreads <= 1 || packets.len() < 4 {
             let mut cb = crypto_buf.lock();
             for data in &packets {
@@ -229,7 +307,10 @@ pub fn encrypt_batch(
             // Phase 1: Prepare all packets (serial — shared nonce counter)
             let prepared: Vec<BytesMut> = {
                 let mut cb = crypto_buf.lock();
-                packets.iter().map(|data| cb.prepare_encrypt(data)).collect()
+                packets
+                    .iter()
+                    .map(|data| cb.prepare_encrypt(data))
+                    .collect()
             };
             // Phase 2: Encrypt in parallel (cipher is stateless)
             let chunk_size = prepared.len().div_ceil(nthreads);
@@ -310,6 +391,9 @@ mod tests {
         assert!(should_cpu_block_encrypt(true, false, 1, 4096));
         // aead same as encrypt
         assert!(should_cpu_block_encrypt(false, true, 4, 0));
+        // snappy compress threshold
+        assert!(!should_cpu_block_compress(4095));
+        assert!(should_cpu_block_compress(4096));
     }
 
     #[test]
@@ -317,7 +401,7 @@ mod tests {
         let packets: Vec<Bytes> = vec![Bytes::from(&b"aaa"[..]), Bytes::from(&b"bbbb"[..])];
         let (crypt, _) = select_block_crypt("null", b"key");
         let cb = parking_lot::Mutex::new(CryptoBuf::new(1));
-        let out = encrypt_batch(packets, crypt.as_ref(), &cb, None, false);
+        let out = encrypt_batch(packets, crypt.as_ref(), &cb, None, false, true);
         assert_eq!(out.len(), 2);
         assert_eq!(&out[0][..], b"aaa");
         assert_eq!(&out[1][..], b"bbbb");
@@ -326,18 +410,35 @@ mod tests {
         let packets: Vec<Bytes> = vec![Bytes::from(&b"hello wire"[..])];
         let mut cb = CryptoBuf::new(2);
         let cb_mu = parking_lot::Mutex::new(CryptoBuf::new(2));
-        let out = encrypt_batch(
-            packets,
-            crypt.as_ref(),
-            &cb_mu,
-            None,
-            true,
-        );
+        let out = encrypt_batch(packets, crypt.as_ref(), &cb_mu, None, true, true);
         assert_eq!(out.len(), 1);
         assert!(out[0].len() > 10);
         let mut enc = out[0].to_vec();
         let dec = cb.decrypt_cfb(&mut enc, crypt.as_ref()).unwrap();
         assert_eq!(&dec[..], b"hello wire");
+    }
+
+    #[test]
+    fn encrypt_batch_allow_parallel_false_still_correct() {
+        let (crypt, _) = select_block_crypt("aes-128", b"test-key-12345678");
+        // ≥4 packets so the parallel branch would normally engage.
+        let packets: Vec<Bytes> = (0..8).map(|i| Bytes::from(vec![i as u8; 64])).collect();
+        let cb_mu = parking_lot::Mutex::new(CryptoBuf::new(99));
+        let out = encrypt_batch(
+            packets.clone(),
+            crypt.as_ref(),
+            &cb_mu,
+            None,
+            true,
+            false, // force serial (cpu_block worker path)
+        );
+        assert_eq!(out.len(), 8);
+        let mut cb = CryptoBuf::new(99);
+        for (i, pkt) in out.iter().enumerate() {
+            let mut enc = pkt.to_vec();
+            let dec = cb.decrypt_cfb(&mut enc, crypt.as_ref()).unwrap();
+            assert_eq!(&dec[..], &vec![i as u8; 64][..]);
+        }
     }
 
     #[test]
@@ -393,5 +494,51 @@ mod tests {
         let encrypted = cb.encrypt_cfb(plaintext, crypt.as_ref());
         // With none cipher, nonce and CRC are still written, data is not encrypted
         assert_eq!(&encrypted[CRYPT_HDR..], plaintext);
+    }
+
+    #[test]
+    fn decrypt_cfb_in_place_roundtrip() {
+        let (crypt, _) = select_block_crypt("aes-128", b"test-key-12345678");
+        let mut cb = CryptoBuf::new(0xBEEF);
+        let plaintext = b"in-place body payload xyz";
+        let encrypted = cb.encrypt_cfb(plaintext, crypt.as_ref());
+        let mut buf = encrypted.to_vec();
+        let body = decrypt_cfb_in_place(&mut buf, crypt.as_ref(), false).unwrap();
+        assert_eq!(body, plaintext);
+        // body is a subslice of buf (after header)
+        assert_eq!(body.as_ptr(), buf[CRYPT_HDR..].as_ptr());
+    }
+
+    #[test]
+    fn decrypt_cfb_in_place_crc_and_short() {
+        let (crypt, _) = select_block_crypt("aes-128", b"test-key-12345678");
+        let mut cb = CryptoBuf::new(1);
+        let mut enc = cb.encrypt_cfb(b"hello", crypt.as_ref()).to_vec();
+        enc[17] ^= 0xFF;
+        assert_eq!(
+            decrypt_cfb_in_place(&mut enc, crypt.as_ref(), false),
+            Err(InboundCryptError::CrcMismatch)
+        );
+        let mut short = [0u8; 10];
+        assert_eq!(
+            decrypt_cfb_in_place(&mut short, crypt.as_ref(), false),
+            Err(InboundCryptError::Short)
+        );
+    }
+
+    #[test]
+    fn strip_probe_raw_kcp_cmd_keeps_buffer() {
+        // Synthetic: decrypted buffer whose byte 4 is cmd PUSH (0x51) → no header.
+        let mut buf = vec![0u8; 30];
+        buf[4] = 0x51;
+        let body = strip_cfb_header_if_present(&buf, true).unwrap();
+        assert_eq!(body.len(), 30);
+        assert_eq!(body.as_ptr(), buf.as_ptr());
+    }
+
+    #[test]
+    fn inbound_null_identity() {
+        let b = b"raw datagram";
+        assert_eq!(inbound_null(b), b);
     }
 }

@@ -3,6 +3,7 @@
 //! Port of Go's `github.com/xtaci/kcp-go/v5/fec.go` with full wire-level
 //! compatibility.
 
+use crate::snmp::{self as snmp, DEFAULT_SNMP};
 use reed_solomon_erasure::galois_8::Field;
 use reed_solomon_erasure::ReedSolomon;
 use std::cmp::Reverse;
@@ -86,25 +87,35 @@ impl FecEncoder {
 
     /// Feed a data packet. Returns parity packets when a full group is
     /// collected and the data is continuous (within `rto` ms since last packet).
-    /// `data` must have space for the FEC header (at least header_offset bytes).
+    ///
+    /// Buffer layout (matching Go):
+    /// `[header_offset zeros][seq 4][type 2][size 2][kcp payload…]`
+    /// SIZE = len from size field through end (includes the 2B size field).
     pub fn encode(&mut self, data: &mut [u8], rto: u32) -> Vec<Vec<u8>> {
         if self.parity_shards == 0 {
             return Vec::new();
         }
 
-        // Seal data header
+        // Seal data header (seq + type)
         self.seal_data(data);
-        // Write payload size at payload_offset
-        if data.len() > self.payload_offset {
-            let plen = (data.len() - self.payload_offset) as u16 + 2;
+
+        // Write SIZE at payload_offset (Go: PutUint16(..., len(b[payloadOffset:])))
+        if data.len() >= self.payload_offset + 2 {
+            let plen = (data.len() - self.payload_offset) as u16;
             data[self.payload_offset..self.payload_offset + 2].copy_from_slice(&plen.to_le_bytes());
         }
 
-        // Copy to shard cache
+        // Copy full packet into shard cache
         let sz = data.len();
-        self.shard_cache[self.shard_count] = self.shard_cache[self.shard_count][..sz].to_vec();
-        self.shard_cache[self.shard_count][self.payload_offset..]
-            .copy_from_slice(&data[self.payload_offset..]);
+        {
+            let slot = &mut self.shard_cache[self.shard_count];
+            if slot.len() < sz {
+                slot.resize(sz, 0);
+            } else {
+                slot.truncate(sz);
+            }
+            slot[..sz].copy_from_slice(data);
+        }
         self.shard_count += 1;
 
         if sz > self.max_size {
@@ -132,34 +143,49 @@ impl FecEncoder {
         Vec::new()
     }
 
+    /// Wrap a raw KCP segment: `[crypt_hdr?][fec 6][size 2][kcp]`, encode, return
+    /// (data_packet, parity_packets). `header_offset` reserves crypt space (0 when
+    /// crypto wraps the whole FEC frame — our session layout).
+    pub fn wrap_kcp_packet(&mut self, kcp: &[u8], rto: u32) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let ho = self.header_offset;
+        let mut pkt = vec![0u8; ho + FEC_HEADER_SIZE_PLUS_2 + kcp.len()];
+        pkt[ho + FEC_HEADER_SIZE_PLUS_2..].copy_from_slice(kcp);
+        let parity = self.encode(&mut pkt, rto);
+        (pkt, parity)
+    }
+
     fn do_encode(&mut self) -> Vec<Vec<u8>> {
         let max_sz = self.max_size;
+        let po = self.payload_offset;
 
-        // Resize all shards to max_size
+        // Pad data shards to max_sz (Go: clear tail)
         for i in 0..self.data_shards {
-            self.shard_cache[i].resize(max_sz, 0u8);
+            let slen = self.shard_cache[i].len();
+            if slen < max_sz {
+                self.shard_cache[i].resize(max_sz, 0u8);
+            }
         }
+        // Allocate parity shard buffers
         for i in self.data_shards..self.shard_size {
             self.shard_cache[i] = vec![0u8; max_sz];
         }
 
-        // Encode using &mut [&mut [u8]] as required by reed-solomon-erasure
+        // RS encode only payload region [payload_offset..max_sz] (matching Go)
         let mut slices: Vec<&mut [u8]> = self
             .shard_cache
             .iter_mut()
-            .map(|s| s.as_mut_slice())
+            .map(|s| &mut s[po..max_sz])
             .collect();
-        let result = self.codec.encode(&mut slices);
-        if let Err(_) = result {
+        if self.codec.encode(&mut slices).is_err() {
             self.skip_parity();
+            snmp::add(&DEFAULT_SNMP.fec_errs, 1);
             return Vec::new();
         }
 
-        // Extract parity shards
         let mut result = Vec::with_capacity(self.parity_shards);
         for i in 0..self.parity_shards {
             let idx = self.data_shards + i;
-            self.seal_parity(idx, max_sz);
+            self.seal_parity(idx);
             result.push(self.shard_cache[idx][..max_sz].to_vec());
         }
         result
@@ -169,18 +195,19 @@ impl FecEncoder {
         if data.len() < self.header_offset + 6 {
             return;
         }
-        data[self.header_offset..self.header_offset + 4].copy_from_slice(&self.next.to_le_bytes());
-        data[self.header_offset + 4..self.header_offset + 6]
-            .copy_from_slice(&FEC_TYPE_DATA.to_le_bytes());
+        let ho = self.header_offset;
+        data[ho..ho + 4].copy_from_slice(&self.next.to_le_bytes());
+        data[ho + 4..ho + 6].copy_from_slice(&FEC_TYPE_DATA.to_le_bytes());
         self.next = (self.next + 1) % self.paws;
     }
 
-    fn seal_parity(&mut self, index: usize, _max_sz: usize) {
-        if self.shard_cache[index].len() < 6 {
+    fn seal_parity(&mut self, index: usize) {
+        let ho = self.header_offset;
+        if self.shard_cache[index].len() < ho + 6 {
             return;
         }
-        self.shard_cache[index][..4].copy_from_slice(&self.next.to_le_bytes());
-        self.shard_cache[index][4..6].copy_from_slice(&FEC_TYPE_PARITY.to_le_bytes());
+        self.shard_cache[index][ho..ho + 4].copy_from_slice(&self.next.to_le_bytes());
+        self.shard_cache[index][ho + 4..ho + 6].copy_from_slice(&FEC_TYPE_PARITY.to_le_bytes());
         self.next = (self.next + 1) % self.paws;
     }
 
@@ -365,6 +392,9 @@ impl FecDecoder {
             self.auto_tune.sample(true, seqid);
         } else {
             self.auto_tune.sample(false, seqid);
+            if flag == FEC_TYPE_PARITY {
+                snmp::add(&DEFAULT_SNMP.fec_parity_shards, 1);
+            }
         }
 
         // Check paws
@@ -425,6 +455,7 @@ impl FecDecoder {
 
         // Try to recover when we have enough shards
         if shard.len() >= self.data_shards {
+            snmp::add(&DEFAULT_SNMP.fec_full_shards, 1);
             let pkts = shard.pop_all();
             return self.recover(pkts, shard_id);
         }
@@ -434,6 +465,8 @@ impl FecDecoder {
             self.newest_shard_id = shard_id;
         }
         self.discard_old();
+        snmp::store(&DEFAULT_SNMP.fec_shard_min, self.newest_shard_id as u64);
+        snmp::store(&DEFAULT_SNMP.fec_shard_set, self.shard_set.len() as u64);
         Vec::new()
     }
 
@@ -499,17 +532,23 @@ impl FecDecoder {
             }
         }
 
-        // Reconstruct using (&mut [u8], bool) as required by reed-solomon-erasure
+        // ReconstructShard for (T, bool): true = present, false = missing
+        // (reed-solomon-erasure: len() is None when bool is false).
         let mut shards: Vec<(&mut [u8], bool)> = Vec::with_capacity(self.shard_size);
         for (i, s) in self.decode_cache.iter_mut().enumerate() {
-            shards.push((s.as_mut_slice(), !present[i]));
+            shards.push((s.as_mut_slice(), present[i]));
         }
         let recovered = if self.codec.reconstruct_data(&mut shards).is_ok() {
-            (0..self.data_shards)
+            let rec: Vec<Vec<u8>> = (0..self.data_shards)
                 .filter(|&i| !present[i])
                 .map(|i| self.decode_cache[i].clone())
-                .collect()
+                .collect();
+            if !rec.is_empty() {
+                snmp::add(&DEFAULT_SNMP.fec_recovered, rec.len() as u64);
+            }
+            rec
         } else {
+            snmp::add(&DEFAULT_SNMP.fec_errs, 1);
             Vec::new()
         };
 
@@ -553,6 +592,46 @@ pub fn is_data_packet(data: &[u8]) -> bool {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
+
+/// Expand raw KCP segments into FEC data frames (+ parity when a group fills).
+/// Each packet is ready for crypto: `[FEC 6][SIZE 2][KCP…]` when header_offset=0.
+pub fn fec_expand_packets(
+    encoder: &mut FecEncoder,
+    packets: &[bytes::Bytes],
+    rto_ms: u32,
+) -> Vec<bytes::Bytes> {
+    let mut out = Vec::with_capacity(packets.len() + packets.len() / 2 + 4);
+    for kcp in packets {
+        let (data, parity) = encoder.wrap_kcp_packet(kcp, rto_ms);
+        out.push(bytes::Bytes::from(data));
+        for p in parity {
+            out.push(bytes::Bytes::from(p));
+        }
+    }
+    out
+}
+
+/// Strip the 2B SIZE field from a recovered FEC payload and return the KCP segment.
+///
+/// Matches Go `kcpInput` recovered handling:
+/// ```text
+/// sz := binary.LittleEndian.Uint16(r)
+/// if int(sz) <= len(r) && sz >= 2 { kcp.Input(r[2:sz], …) }
+/// ```
+/// SIZE includes the 2B field itself; RS recovery may pad beyond SIZE — must not
+/// feed that pad into KCP.
+#[inline]
+pub fn fec_kcp_from_recovered(r: &[u8]) -> Option<&[u8]> {
+    if r.len() < 2 {
+        return None;
+    }
+    let sz = u16::from_le_bytes([r[0], r[1]]) as usize;
+    if sz >= 2 && sz <= r.len() {
+        Some(&r[2..sz])
+    } else {
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -631,5 +710,106 @@ mod tests {
             dec2.decode(p);
         }
         let _recovered = dec2.decode(&parity_pkts[0]);
+    }
+
+    #[test]
+    fn fec_wrap_generates_parity_and_roundtrip_headers() {
+        let mut enc = FecEncoder::new(3, 2, 0).unwrap();
+        let mut data_frames = Vec::new();
+        let mut parity_frames = Vec::new();
+        for i in 0..3u8 {
+            let kcp = {
+                let mut v = vec![0u8; 32];
+                v[0..4].copy_from_slice(&1u32.to_le_bytes());
+                v[4] = 81;
+                v[24..32].fill(i + 1);
+                v
+            };
+            let (data, parity) = enc.wrap_kcp_packet(&kcp, 1000);
+            let size = u16::from_le_bytes(data[6..8].try_into().unwrap()) as usize;
+            assert_eq!(size, data.len() - 6);
+            assert_eq!(&data[8..], &kcp[..]);
+            assert_eq!(
+                u16::from_le_bytes(data[4..6].try_into().unwrap()),
+                FEC_TYPE_DATA
+            );
+            data_frames.push(data);
+            if i == 2 {
+                assert_eq!(parity.len(), 2);
+                for p in &parity {
+                    assert_eq!(
+                        u16::from_le_bytes(p[4..6].try_into().unwrap()),
+                        FEC_TYPE_PARITY
+                    );
+                    assert_eq!(p.len(), data_frames[0].len());
+                }
+                parity_frames = parity;
+            } else {
+                assert!(parity.is_empty());
+            }
+        }
+        assert_eq!(data_frames.len(), 3);
+        assert_eq!(parity_frames.len(), 2);
+        // Seqids should be 0,1,2 for data and 3,4 for parity
+        for (i, f) in data_frames.iter().enumerate() {
+            let seq = u32::from_le_bytes(f[0..4].try_into().unwrap());
+            assert_eq!(seq, i as u32);
+        }
+        for (i, f) in parity_frames.iter().enumerate() {
+            let seq = u32::from_le_bytes(f[0..4].try_into().unwrap());
+            assert_eq!(seq, 3 + i as u32);
+        }
+    }
+
+    #[test]
+    fn fec_recover_strips_size_and_rs_pad() {
+        // Variable-length KCP payloads so RS pads shorter shards; recovered
+        // path must use SIZE (Go r[2:sz]), not the whole padded buffer.
+        let mut enc = FecEncoder::new(3, 2, 0).unwrap();
+        let mut data_frames = Vec::new();
+        let mut parity_frames = Vec::new();
+        let payloads: [&[u8]; 3] = [
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 32
+            b"bbbbbbbbbbbbbbbb",                 // 16 — shorter
+            b"cccccccccccccccccccccccc",         // 24
+        ];
+        for (i, kcp) in payloads.iter().enumerate() {
+            let (data, parity) = enc.wrap_kcp_packet(kcp, 1000);
+            data_frames.push(data);
+            if i == 2 {
+                assert_eq!(parity.len(), 2);
+                parity_frames = parity;
+            }
+        }
+        // Drop data shard 0; recover from data1 + data2 + both parity.
+        let mut dec = FecDecoder::new(3, 2).unwrap();
+        assert!(dec.decode(&data_frames[1]).is_empty());
+        assert!(dec.decode(&data_frames[2]).is_empty());
+        // Third present shard triggers reconstruct; either parity works.
+        let mut recovered = dec.decode(&parity_frames[0]);
+        if recovered.is_empty() {
+            recovered = dec.decode(&parity_frames[1]);
+        }
+        assert_eq!(recovered.len(), 1, "expected data shard 0 recovered");
+        let kcp = fec_kcp_from_recovered(&recovered[0]).expect("valid SIZE");
+        assert_eq!(kcp, payloads[0]);
+        // Without SIZE trim, RS pad would make the slice longer than original.
+        assert!(recovered[0].len() >= kcp.len() + 2);
+        assert_eq!(kcp.len(), payloads[0].len());
+    }
+
+    #[test]
+    fn fec_kcp_from_recovered_rejects_bad_size() {
+        assert!(fec_kcp_from_recovered(&[]).is_none());
+        assert!(fec_kcp_from_recovered(&[1]).is_none());
+        // sz=1 < 2
+        assert!(fec_kcp_from_recovered(&[1, 0, 9, 9]).is_none());
+        // sz > len
+        assert!(fec_kcp_from_recovered(&[10, 0, 1, 2]).is_none());
+        // valid: sz=4 → payload [0xAA, 0xBB]
+        assert_eq!(
+            fec_kcp_from_recovered(&[4, 0, 0xAA, 0xBB]),
+            Some(&[0xAAu8, 0xBB][..])
+        );
     }
 }

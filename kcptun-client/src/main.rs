@@ -33,7 +33,7 @@ use serde::Deserialize;
 use kio::ReadBuf;
 use kio::{self, AsyncRead, AsyncWrite};
 
-use kcp_rs::{KCP, SNMP};
+use kcp_rs::{fec_kcp_from_recovered, FecDecoder, FecEncoder, KCP, SNMP};
 use kcrypt_rs::crypt as kcp_crypt;
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
@@ -311,7 +311,7 @@ impl Cli {
                 cfg.qpp.unwrap_or(false)
             },
             qppcount: cli.qppcount.or(cfg.qppcount),
-            c: cli.c, // CLI --c/-c flag only, not in Config struct
+            c: cli.c,            // CLI --c/-c flag only, not in Config struct
             version_flag: false, // never from config file
         }
     }
@@ -523,6 +523,10 @@ struct KcpConn {
     /// have new data to send. Eliminates the 0~10ms wait of the fixed
     /// sleep interval.
     flush_notify: Arc<kio::Notify>,
+    /// Session-layer FEC encoder (Go fecEncoder). None when ds/ps == 0.
+    fec_encoder: Option<Arc<parking_lot::Mutex<FecEncoder>>>,
+    /// Session-layer FEC decoder (Go fecDecoder).
+    fec_decoder: Option<Arc<parking_lot::Mutex<FecDecoder>>>,
 }
 
 impl KcpConn {
@@ -596,9 +600,19 @@ impl KcpConn {
         kcp.set_mtu(mtu);
         kcp.set_snd_wnd(sndwnd);
         kcp.set_rcv_wnd(rcvwnd);
-        if datashard > 0 || parityshard > 0 {
-            kcp.set_fec(datashard, parityshard);
-        }
+        // Session-layer FEC (Go newUDPSession). header_offset=0: crypto wraps whole FEC frame.
+        let fec_encoder = if datashard > 0 && parityshard > 0 {
+            FecEncoder::new(datashard as usize, parityshard as usize, 0)
+                .map(|e| Arc::new(parking_lot::Mutex::new(e)))
+        } else {
+            None
+        };
+        let fec_decoder = if datashard > 0 && parityshard > 0 {
+            FecDecoder::new(datashard as usize, parityshard as usize)
+                .map(|d| Arc::new(parking_lot::Mutex::new(d)))
+        } else {
+            None
+        };
         if acknodelay {
             // kcp.set_ack_nodelay(true); // removed: pass ack_nodelay to input() instead
         }
@@ -647,6 +661,8 @@ impl KcpConn {
                 DEFAULT_CONV as u64,
             ))),
             flush_notify: Arc::new(kio::Notify::new()),
+            fec_encoder,
+            fec_decoder,
         };
 
         conn.start_background_loops();
@@ -687,10 +703,10 @@ impl KcpConn {
         let write_notify1 = self.write_notify.clone();
         let wait_send1 = self.wait_send.clone();
         let flush_notify1 = self.flush_notify.clone();
+        let fec_decoder1 = self.fec_decoder.clone();
+        let fec_encoder1 = self.fec_encoder.clone();
         let h1 = kio::spawn_task(async move {
             let mut buf = vec![0u8; MAX_DATAGRAM];
-            // Reused decrypt scratch (P1.3) — avoids per-packet Vec alloc for CFB.
-            let mut dec_scratch = vec![0u8; MAX_DATAGRAM];
             // Persistent Snappy framing decoder.
             // Handles Go kcptun's snappy.NewBufferedWriter framing format.
             let mut snappy_dec = if !nocomp {
@@ -704,146 +720,233 @@ impl KcpConn {
                     Ok(_) => continue,
                     Err(e) => {
                         error!("UDP recv error: {}", e);
+                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
                         kio::sleep_ms(100).await;
                         continue;
                     }
                 };
                 // Process this datagram and any further ready ones (P1.3).
                 loop {
-                // ── Decrypt and strip header ──
-                const FEC_HDR: usize = 8;
+                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_pkts, 1);
+                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_bytes, n as u64);
+                    // ── Decrypt and strip header (in-place on recv buf for CFB/null) ──
+                    const FEC_HDR: usize = 8;
 
-                let data: bytes::Bytes = if has_aead1 {
-                    // AEAD path: [nonce 12B][ciphertext+tag 16B] — no CRC32
-                    match aead1.as_ref().unwrap().open(&buf[..n]) {
-                        Ok(plain) => bytes::Bytes::from(plain),
-                        Err(_) => continue, // auth failed, drop
-                    }
-                } else if has_encryption1 {
-                    // CFB: copy into reusable scratch, decrypt_cfb returns payload Bytes.
-                    if n > dec_scratch.len() {
-                        dec_scratch.resize(n, 0);
-                    }
-                    dec_scratch[..n].copy_from_slice(&buf[..n]);
-                    match crypto_buf1
-                        .lock()
-                        .decrypt_cfb(&mut dec_scratch[..n], crypt1.as_ref())
-                    {
-                        Some(payload) => payload,
-                        None => continue, // CRC mismatch or short data
-                    }
-                } else {
-                    bytes::Bytes::copy_from_slice(&buf[..n])
-                };
-
-                let input: &[u8] = &data;
-
-                // ── FEC handling & KCP input (matching Go's kcpInput) ──
-                {
-                    let mut kcp_guard = kcp1.lock();
-                    if input.len() >= 6 {
-                        let fec_flag = u16::from_le_bytes(input[4..6].try_into().unwrap());
-                        match fec_flag {
-                            0x00f1 => {
-                                if input.len() > FEC_HDR {
-                                    let _ = kcp_guard.input(&input[FEC_HDR..], false);
-                                    *last_activity.lock() = std::time::Instant::now();
-                                }
-                            }
-                            0x00f2 => {}
-                            0x00f3 => {
-                                log::trace!("OOB packet received: {} bytes", input.len());
-                            }
-                            _ => {
-                                let _ = kcp_guard.input(input, false);
-                                *last_activity.lock() = std::time::Instant::now();
+                    // AEAD still owns a Vec; CFB/null use slices of `buf` until
+                    // KCP::input finishes (same task, before next recv/try_recv).
+                    let aead_plain: Option<Vec<u8>> = if has_aead1 {
+                        match aead1.as_ref().unwrap().open(&buf[..n]) {
+                            Ok(plain) => Some(plain),
+                            Err(_) => {
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
+                                None
                             }
                         }
-                    } else if input.len() >= 24 {
-                        let _ = kcp_guard.input(input, false);
-                        *last_activity.lock() = std::time::Instant::now();
+                    } else {
+                        None
+                    };
+                    if has_aead1 && aead_plain.is_none() {
+                        match udp1.try_recv(&mut buf) {
+                            Ok(m) if m > 0 => {
+                                n = m;
+                                continue;
+                            }
+                            _ => break,
+                        }
                     }
-                }
 
-                // Extract KCP recv data (decompressed on the KCP stream level)
-                {
-                    let mut kcp_guard = kcp1.lock();
-                    while let Ok(d) = kcp_guard.recv_bytes() {
-                        if !nocomp {
-                            if let Some(ref mut sd) = snappy_dec {
-                                match sd.feed(&d) {
-                                    Ok(decompressed) => {
-                                        if !decompressed.is_empty() {
-                                            if let Err(e) = smux1.process_data(&decompressed) {
-                                                warn!("SMUX process_data error: {:?}", e);
+                    // CFB body offset into buf after successful in-place decrypt (probe=false → CRYPT_HDR).
+                    let mut cfb_body_off: Option<usize> = None;
+                    if has_encryption1 && !has_aead1 {
+                        match kcp_rs::decrypt_cfb_in_place(&mut buf[..n], crypt1.as_ref(), false) {
+                            Ok(body) => {
+                                // body is &buf[CRYPT_HDR..n]; record start offset.
+                                cfb_body_off = Some(n - body.len());
+                            }
+                            Err(_) => {
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
+                                match udp1.try_recv(&mut buf) {
+                                    Ok(m) if m > 0 => {
+                                        n = m;
+                                        continue;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    }
+
+                    // Body view: AEAD owned, CFB payload slice, or null full buf.
+                    let input: &[u8] = if let Some(ref plain) = aead_plain {
+                        plain.as_slice()
+                    } else if let Some(off) = cfb_body_off {
+                        &buf[off..n]
+                    } else {
+                        kcp_rs::inbound_null(&buf[..n])
+                    };
+
+                    // ── FEC handling & KCP input (matching Go's kcpInput) ──
+                    // Feed KCP with slices only — no intermediate Vec of Bytes.
+                    let mut had_input = false;
+                    {
+                        let mut kcp_guard = kcp1.lock();
+                        if let Some(ref dec) = fec_decoder1 {
+                            if input.len() >= 6 {
+                                let fec_flag = u16::from_le_bytes(input[4..6].try_into().unwrap());
+                                let recovered = {
+                                    let mut d = dec.lock();
+                                    d.decode(input)
+                                };
+                                match fec_flag {
+                                    0x00f1 => {
+                                        if input.len() > FEC_HDR {
+                                            if kcp_guard.input(&input[FEC_HDR..], false).is_err() {
+                                                kcp_rs::snmp_add(
+                                                    &kcp_rs::DEFAULT_SNMP.kcp_in_errors,
+                                                    1,
+                                                );
                                             }
-                                            // Peer UPD may have opened send window — re-flush.
-                                            flush_notify1.notify_one();
+                                            had_input = true;
+                                        }
+                                        // recovered = [SIZE 2][KCP…][RS pad]; Go: Input(r[2:sz])
+                                        for r in &recovered {
+                                            if let Some(kcp_slice) = fec_kcp_from_recovered(r) {
+                                                if kcp_guard.input(kcp_slice, false).is_err() {
+                                                    kcp_rs::snmp_add(
+                                                        &kcp_rs::DEFAULT_SNMP.kcp_in_errors,
+                                                        1,
+                                                    );
+                                                }
+                                                had_input = true;
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!("Snappy decompress error: {:?}", e);
+                                    0x00f2 => {
+                                        for r in &recovered {
+                                            if let Some(kcp_slice) = fec_kcp_from_recovered(r) {
+                                                if kcp_guard.input(kcp_slice, false).is_err() {
+                                                    kcp_rs::snmp_add(
+                                                        &kcp_rs::DEFAULT_SNMP.kcp_in_errors,
+                                                        1,
+                                                    );
+                                                }
+                                                had_input = true;
+                                            }
+                                        }
+                                    }
+                                    0x00f3 => {
+                                        log::trace!("OOB packet received: {} bytes", input.len());
+                                    }
+                                    _ => {
+                                        if kcp_guard.input(input, false).is_err() {
+                                            kcp_rs::snmp_add(
+                                                &kcp_rs::DEFAULT_SNMP.kcp_in_errors,
+                                                1,
+                                            );
+                                        }
+                                        had_input = true;
                                     }
                                 }
+                            } else if input.len() >= 24 {
+                                if kcp_guard.input(input, false).is_err() {
+                                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.kcp_in_errors, 1);
+                                }
+                                had_input = true;
                             }
-                        } else {
-                            // Zero-copy path: pass Bytes directly to SMUX
-                            // (process_data accepts &[u8], Bytes derefs to &[u8])
-                            if let Err(e) = smux1.process_data(&d) {
+                        } else if input.len() >= 24 {
+                            if kcp_guard.input(input, false).is_err() {
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.kcp_in_errors, 1);
+                            }
+                            had_input = true;
+                        }
+
+                        if had_input {
+                            *last_activity.lock() = std::time::Instant::now();
+                        }
+
+                        // Extract KCP recv data (decompressed on the KCP stream level)
+                        while let Ok(d) = kcp_guard.recv_bytes() {
+                            if !nocomp {
+                                if let Some(ref mut sd) = snappy_dec {
+                                    match sd.feed(&d) {
+                                        Ok(decompressed) => {
+                                            if !decompressed.is_empty() {
+                                                if let Err(e) = smux1.process_data(&decompressed) {
+                                                    warn!("SMUX process_data error: {:?}", e);
+                                                }
+                                                flush_notify1.notify_one();
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Snappy decompress error: {:?}", e);
+                                        }
+                                    }
+                                }
+                            } else if let Err(e) = smux1.process_data(&d) {
                                 warn!("SMUX process_data error: {:?}", e);
+                                flush_notify1.notify_one();
+                            } else {
+                                flush_notify1.notify_one();
                             }
-                            // Peer UPD may have opened send window — re-flush.
-                            flush_notify1.notify_one();
                         }
                     }
-                }
 
-                // ── Notify writers after ACK processing ──
-                // Go's kcpInput() calls notifyWriteEvent() when waitsnd < snd_wnd
-                // after processing incoming ACKs. This wakes up blocked writers
-                // immediately, rather than waiting for the next flush cycle.
-                {
-                    let kcp_guard = kcp1.lock();
-                    let ws = kcp_guard.wait_send() as usize;
-                    let snd_wnd = kcp_guard.snd_wnd() as usize;
-                    // Update the shared wait_send counter immediately so
-                    // poll_write sees the current (post-ACK) value instead
-                    // of the stale value from the last flush cycle. This
-                    // prevents false backpressure from blocking writers.
-                    wait_send1.store(ws, Ordering::Relaxed);
-                    if ws < snd_wnd {
-                        write_notify1.notify_waiters();
+                    // ── Notify writers after ACK processing ──
+                    // Go's kcpInput() calls notifyWriteEvent() when waitsnd < snd_wnd
+                    // after processing incoming ACKs. This wakes up blocked writers
+                    // immediately, rather than waiting for the next flush cycle.
+                    {
+                        let kcp_guard = kcp1.lock();
+                        let ws = kcp_guard.wait_send() as usize;
+                        let snd_wnd = kcp_guard.snd_wnd() as usize;
+                        // Update the shared wait_send counter immediately so
+                        // poll_write sees the current (post-ACK) value instead
+                        // of the stale value from the last flush cycle. This
+                        // prevents false backpressure from blocking writers.
+                        wait_send1.store(ws, Ordering::Relaxed);
+                        if ws < snd_wnd {
+                            write_notify1.notify_waiters();
+                        }
                     }
-                }
 
-                // ── Drain and send ACKs collected during input() ──
-                // Encrypt inline (ACKs are typically 1 small packet) then async send.
-                let acks: Vec<bytes::Bytes> = std::mem::take(&mut *raw_packets1.lock());
-                let mut aead_out = bytes::BytesMut::new();
-                for data in acks {
-                    let pkt: bytes::Bytes = if has_aead1 {
-                        aead1.as_ref().unwrap().seal_into(&data, &mut aead_out)
-                    } else if has_encryption1 {
-                        crypto_buf1.lock().encrypt_cfb(&data, crypt1.as_ref())
+                    // ── Drain and send ACKs collected during input() ──
+                    // FEC-encode then encrypt inline (ACKs are typically 1 small packet).
+                    let acks: Vec<bytes::Bytes> = std::mem::take(&mut *raw_packets1.lock());
+                    let acks: Vec<bytes::Bytes> = if let Some(ref enc) = fec_encoder1 {
+                        let mut e = enc.lock();
+                        kcp_rs::fec_expand_packets(&mut e, &acks, 500)
                     } else {
-                        // null: Bytes already owns the slice — pass through.
-                        data
+                        acks
                     };
-                    // Send ACK directly (not via spawn_task) — on smol backend,
-                    // spawned tasks may not be scheduled promptly, causing
-                    // ACKs to be delayed and KCP retransmissions to fire.
-                    if let Err(e) = udp1.send(&pkt).await {
-                        error!("UDP send error (ack): {}", e);
+                    let mut aead_out = bytes::BytesMut::new();
+                    for data in acks {
+                        let pkt: bytes::Bytes = if has_aead1 {
+                            aead1.as_ref().unwrap().seal_into(&data, &mut aead_out)
+                        } else if has_encryption1 {
+                            crypto_buf1.lock().encrypt_cfb(&data, crypt1.as_ref())
+                        } else {
+                            // null: Bytes already owns the slice — pass through.
+                            data
+                        };
+                        // Send ACK directly (not via spawn_task) — on smol backend,
+                        // spawned tasks may not be scheduled promptly, causing
+                        // ACKs to be delayed and KCP retransmissions to fire.
+                        match udp1.send(&pkt).await {
+                            Ok(sent) => {
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.out_pkts, 1);
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.out_bytes, sent as u64);
+                            }
+                            Err(e) => error!("UDP send error (ack): {}", e),
+                        }
                     }
-                }
-                // Non-blocking drain of further ready UDP datagrams.
-                match udp1.try_recv(&mut buf) {
-                    Ok(m) if m > 0 => {
-                        n = m;
-                        continue;
+                    // Non-blocking drain of further ready UDP datagrams.
+                    match udp1.try_recv(&mut buf) {
+                        Ok(m) if m > 0 => {
+                            n = m;
+                            continue;
+                        }
+                        _ => break,
                     }
-                    _ => break,
-                }
                 } // end ready-packet drain loop
             }
         });
@@ -874,6 +977,7 @@ impl KcpConn {
         let crypto_buf2 = self.crypto_buf.clone();
         let smuxver = self.smux.version();
         let flush_notify2 = self.flush_notify.clone();
+        let fec_encoder2 = self.fec_encoder.clone();
         let h2 = kio::spawn_task(async move {
             let mut next_update: u64 = KCP_UPDATE_INTERVAL_MS;
             // Reused across iterations: single buffer for SMUX frame assembly (P0.3).
@@ -882,11 +986,8 @@ impl KcpConn {
             loop {
                 // Wait for either the dynamic interval (nearest RTO or
                 // default) or an immediate notify from SMUX stream writes.
-                let _ = kio::timeout(
-                    Duration::from_millis(next_update),
-                    flush_notify2.notified(),
-                )
-                .await;
+                let _ = kio::timeout(Duration::from_millis(next_update), flush_notify2.notified())
+                    .await;
                 // current_ms is no longer needed — flush() uses its own internal timestamp.
 
                 // ── Phase 1: Drain SMUX + encode frames into out_buf (NO KCP lock) ──
@@ -913,10 +1014,7 @@ impl KcpConn {
                                 *id,
                                 0,
                             );
-                            let n = s.drain_send_max(
-                                &mut out_buf,
-                                smux_rs::frame::MAX_FRAME_SIZE,
-                            );
+                            let n = s.drain_send_max(&mut out_buf, smux_rs::frame::MAX_FRAME_SIZE);
                             if n == 0 {
                                 out_buf.truncate(header_pos);
                                 break;
@@ -931,24 +1029,64 @@ impl KcpConn {
                     }
                 }
 
-                // ── Phase 1a: Clean up fully closed streams ──
+                // ── Phase 1a: Collect FIN candidates (do NOT mark yet) ──
+                // mark_fin_sent only after kcp.send succeeds (BUGREPORT.md deadlock class).
+                let fin_candidates: Vec<u32> = {
+                    let streams = smux2.streams();
+                    let stream_map = streams.lock();
+                    stream_map
+                        .iter()
+                        .filter(|(_, s)| {
+                            s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent()
+                        })
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for &stream_id in &fin_candidates {
+                    debug!("flush: encoding FIN for stream {}", stream_id);
+                    smux_rs::frame::Frame::encode_header_into(
+                        &mut out_buf,
+                        smuxver,
+                        smux_rs::frame::Cmd::Fin,
+                        stream_id,
+                        0,
+                    );
+                }
+
+                // ── Phase 1b: Reap fully closed + local-closed past linger ──
+                // Linger bounds map growth when peer FIN is lost (proxy short-connect leak).
+                const STREAM_LINGER_SECS: u64 = 30;
                 {
                     let streams = smux2.streams();
                     let mut stream_map = streams.lock();
+                    let linger = std::time::Duration::from_secs(STREAM_LINGER_SECS);
                     let to_remove: Vec<u32> = stream_map
                         .iter()
                         .filter(|(_, s)| {
-                            s.is_local_closed() && s.is_remote_closed() && s.is_fin_sent()
+                            if s.is_local_closed() && s.is_remote_closed() && s.is_fin_sent() {
+                                return true;
+                            }
+                            if s.is_local_closed() && s.pending_send() == 0 {
+                                if let Some(e) = s.local_closed_elapsed() {
+                                    return e >= linger;
+                                }
+                            }
+                            false
                         })
                         .map(|(id, _)| *id)
                         .collect();
                     for id in &to_remove {
-                        stream_map.remove(id);
+                        if let Some(s) = stream_map.remove(id) {
+                            s.close();
+                        }
+                    }
+                    if !to_remove.is_empty() {
+                        debug!("SMUX: reaped {} closed/stale streams", to_remove.len());
                     }
                     drop(stream_map);
                 }
 
-                // ── Phase 1b: Drain UPD frames (matching Go's sendWindowUpdate) ──
+                // ── Phase 1c: Drain UPD frames (matching Go's sendWindowUpdate) ──
                 smux2.check_upd();
                 let upd_before = out_buf.len();
                 for upd in smux2.take_upd_frames() {
@@ -972,14 +1110,31 @@ impl KcpConn {
 
                 // ── Phase 2: Snappy compress OUTSIDE KCP lock (P0.4) ──
                 // Matches server Phase 3/4 split — keeps ACK path unblocked.
+                // Large flushes offload to cpu_block so the reactor can process
+                // UDP/ACKs concurrently (esp. smol). Small flushes stay inline.
                 let send_data: Option<Vec<u8>> = if out_buf.is_empty() {
                     None
                 } else if !nocomp2 {
                     use std::io::Write;
-                    let mut enc = compressor2.lock();
-                    enc.write_all(&out_buf).ok();
-                    enc.flush().ok();
-                    let compressed = std::mem::take(enc.get_mut());
+                    let plain = out_buf.split().to_vec();
+                    let plain_len = plain.len();
+                    let compress_fn = {
+                        let compressor = compressor2.clone();
+                        move || {
+                            let mut enc = compressor.lock();
+                            enc.write_all(&plain).ok();
+                            enc.flush().ok();
+                            std::mem::take(enc.get_mut())
+                        }
+                    };
+                    let compressed = if kcp_rs::should_cpu_block_compress(plain_len)
+                        && !has_encryption2
+                        && !has_aead2
+                    {
+                        kio::cpu_block(compress_fn).await
+                    } else {
+                        compress_fn()
+                    };
                     if compressed.is_empty() {
                         None
                     } else {
@@ -1004,6 +1159,7 @@ impl KcpConn {
                                 .saturating_mul(mss)
                                 .max(mss);
                             let mut offset = 0;
+                            let mut send_ok = true;
                             while offset < to_send.len() {
                                 let end = (offset + max_chunk).min(to_send.len());
                                 if let Err(e) = kcp_guard.send(&to_send[offset..end]) {
@@ -1013,11 +1169,26 @@ impl KcpConn {
                                         to_send.len(),
                                         e
                                     );
+                                    send_ok = false;
                                     break;
                                 }
                                 offset = end;
                             }
+                            // Only mark FIN after the whole batch was accepted by KCP.
+                            if send_ok && !fin_candidates.is_empty() {
+                                let streams = smux2.streams();
+                                let stream_map = streams.lock();
+                                for id in &fin_candidates {
+                                    if let Some(s) = stream_map.get(id) {
+                                        s.mark_fin_sent();
+                                    }
+                                }
+                            }
                         }
+                    } else if !fin_candidates.is_empty() {
+                        // FIN-only cycle (no PSH/UPD payload after compress empty path handled above).
+                        // fin frames live in send_data when out_buf non-empty; if send_data is None
+                        // there was nothing to send — leave fin_sent false for retry.
                     }
 
                     // Call flush() directly (matching Go's UDPSession.update()
@@ -1049,11 +1220,19 @@ impl KcpConn {
                 let packets: Vec<bytes::Bytes> = std::mem::take(&mut *raw_packets2.lock());
                 if packets.is_empty() {
                     // No KCP wire output this cycle (P2.2 empty_flush metric).
-                    kcp_rs::DEFAULT_SNMP.empty_flush.fetch_add(1, Ordering::Relaxed);
+                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.empty_flush, 1);
                 } else if packets.len() > 1 {
                     debug!("raw_packets drain: {} packets", packets.len());
                 }
                 if !packets.is_empty() {
+                    // FEC encode (Go: KCP → FEC → encrypt → UDP), rto=500ms.
+                    let packets: Vec<bytes::Bytes> = if let Some(ref enc) = fec_encoder2 {
+                        let mut e = enc.lock();
+                        kcp_rs::fec_expand_packets(&mut e, &packets, 500)
+                    } else {
+                        packets
+                    };
+
                     let total_bytes: usize = packets.iter().map(|p| p.len()).sum();
                     let use_cpu_block = kcp_rs::should_cpu_block_encrypt(
                         has_encryption2,
@@ -1065,6 +1244,10 @@ impl KcpConn {
                     let crypt_sb = crypt2.clone();
                     let crypto_buf_sb = crypto_buf2.clone();
                     let aead_sb = aead2.clone();
+                    // When offloaded to cpu_block, disable nested thread::scope
+                    // parallel encrypt (already on a pool worker). Inline path
+                    // may still parallelize large CFB batches (P1.1).
+                    let allow_parallel = !use_cpu_block;
                     let encrypt_fn = move || {
                         kcp_rs::encrypt_batch(
                             packets,
@@ -1072,6 +1255,7 @@ impl KcpConn {
                             &crypto_buf_sb,
                             aead_sb.as_deref(),
                             has_encryption2,
+                            allow_parallel,
                         )
                     };
 
@@ -1081,8 +1265,16 @@ impl KcpConn {
                         encrypt_fn()
                     };
 
-                    if let Err(e) = udp2.send_batch(&encrypted).await {
-                        error!("UDP send error: {}", e);
+                    match udp2.send_batch(&encrypted).await {
+                        Ok(()) => {
+                            let nbytes: u64 = encrypted.iter().map(|b| b.len() as u64).sum();
+                            kcp_rs::snmp_add(
+                                &kcp_rs::DEFAULT_SNMP.out_pkts,
+                                encrypted.len() as u64,
+                            );
+                            kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.out_bytes, nbytes);
+                        }
+                        Err(e) => error!("UDP send error: {}", e),
                     }
                 }
 
@@ -1092,9 +1284,9 @@ impl KcpConn {
                 {
                     let streams = smux2.streams();
                     let stream_map = streams.lock();
-                    let still_pending = stream_map.values().any(|s| {
-                        s.pending_send() > 0 && s.peer_send_window() > 0
-                    });
+                    let still_pending = stream_map
+                        .values()
+                        .any(|s| s.pending_send() > 0 && s.peer_send_window() > 0);
                     drop(stream_map);
                     if still_pending {
                         next_update = 1;
@@ -1285,7 +1477,7 @@ impl AsyncWrite for SmuxStreamAsync {
                 // and sends through KCP without waiting for the timer.
                 this.flush_notify.notify_one();
                 Poll::Ready(Ok(n))
-            },
+            }
             Err(_) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "SMUX stream write error",
@@ -1614,11 +1806,11 @@ async fn handle_client(
         kio::timeout(IDLE_TIMEOUT, pipe(&mut local_pin, &mut smux_pin)).await
     };
 
-    // Ensure the SMUX stream is properly closed regardless of pipe outcome
+    // Local half-close only. Do NOT mark_fin_sent here — that blocked the flush
+    // loop from ever encoding a real FIN (BUGREPORT_PROXY_MEMORY_GROWTH).
+    // Flush marks fin_sent after FIN is queued; linger reaps if peer never FINs.
     smux_stream.mark_local_closed();
-    if !smux_stream.is_fin_sent() {
-        smux_stream.mark_fin_sent();
-    }
+    smux_stream.clear_buffers();
 
     match pipe_result {
         Ok(Ok((a, b))) => {
@@ -1678,8 +1870,9 @@ async fn snmp_logger(path: String, period: Duration, stop: Arc<AtomicBool>) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let snmp = SNMP::new();
-        let values = snmp.to_slice();
+        // Read process-wide counters updated by KCP hot paths.
+        // SNMP::new() is a fresh zeroed instance — that always prints zeros.
+        let values = kcp_rs::DEFAULT_SNMP.to_slice();
         if let Err(e) = writeln!(writer, "{},{}", ts, values.join(",")) {
             error!("SNMP log write error: {}", e);
         }
@@ -1798,6 +1991,7 @@ async fn async_main() -> Result<()> {
         )
         .await?;
 
+        kcp_rs::DEFAULT_SNMP.session_opened(true);
         conns.push(conn);
     }
 
@@ -1811,13 +2005,21 @@ async fn async_main() -> Result<()> {
 
     // Start SNMP logger if configured
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // SNMP collection is off by default (zero hot-path cost). Enable only when
+    // a log path is set and period > 0.
     if let Some(ref snmplog_path) = cli.snmplog {
-        let period = Duration::from_secs(cli.snmpperiod.unwrap_or(60));
-        let s = stop_flag.clone();
-        let p = snmplog_path.clone();
-        kio::spawn_task(async move {
-            snmp_logger(p, period, s).await;
-        });
+        let secs = cli.snmpperiod.unwrap_or(60);
+        if secs > 0 && !snmplog_path.is_empty() {
+            kcp_rs::snmp_enable();
+            let period = Duration::from_secs(secs);
+            let s = stop_flag.clone();
+            let p = snmplog_path.clone();
+            kio::spawn_task(async move {
+                snmp_logger(p, period, s).await;
+            });
+        } else {
+            log::warn!("snmplog set but snmpperiod=0 or empty path — SNMP collection disabled");
+        }
     }
 
     // Start pprof if configured (requires --features pprof)
@@ -1903,6 +2105,8 @@ async fn async_main() -> Result<()> {
                         .with_ver(conn.session().version());
                 if let Err(e) = conn.send_frame(&syn_frame) {
                     error!("failed to send Syn frame: {}", e);
+                    // open_stream already inserted into the session map — drop it.
+                    conn.session().remove_stream(smux_stream.id());
                     continue;
                 }
                 trace!("SYN sent, flushing KCP");
@@ -1918,19 +2122,18 @@ async fn async_main() -> Result<()> {
                 let flush_notify_ref = conn.flush_notify.clone();
                 let write_notify_ref = conn.write_notify.clone();
                 kio::spawn_task(async move {
-                    if let Err(e) =
-                        handle_client(
-                            local,
-                            smux_stream,
-                            ws,
-                            sw,
-                            qpp_enabled,
-                            qpp_key,
-                            qpp_count,
-                            flush_notify_ref,
-                            write_notify_ref,
-                        )
-                            .await
+                    if let Err(e) = handle_client(
+                        local,
+                        smux_stream,
+                        ws,
+                        sw,
+                        qpp_enabled,
+                        qpp_key,
+                        qpp_count,
+                        flush_notify_ref,
+                        write_notify_ref,
+                    )
+                    .await
                     {
                         error!("client handler error (stream {}): {:?}", stream_id, e);
                     }
@@ -2009,12 +2212,7 @@ async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             None => (path_q, ""),
         };
 
-        async fn respond(
-            stream: &mut kio::TcpStream,
-            status: &str,
-            ctype: &str,
-            body: &[u8],
-        ) {
+        async fn respond(stream: &mut kio::TcpStream, status: &str, ctype: &str, body: &[u8]) {
             let header = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()

@@ -1,52 +1,59 @@
 <!-- Parent: ../../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
-# crypt
+# crypt (cipher modules)
 
 ## Purpose
 
-Per-cipher implementations of `BlockCrypt` / `AeadCrypt`. Each file is a self-contained cipher matching Go kcp-go naming and wire behavior. Parent `crypt.rs` owns traits, CFB helpers, `GO_CFB_IV`, and `select_*` factories.
+One implementation module per BlockCrypt/AEAD cipher used by `kcrypt-rs`. Wired through parent `src/crypt.rs` factories and re-exports.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `none.rs` | No-op cipher (`none` / `null` payload transform) |
-| `xor.rs` | Simple XOR with PBKDF2-expanded key (`SALT_XOR`) |
-| `aes_cfb.rs` | AES-128/192/256 CFB |
-| `aes_gcm.rs` | AES-128-GCM AEAD (`AeadCrypt`) |
-| `sm4.rs` | SM4 CFB (tjfoc/gmsm S-box + CK fix) |
-| `tea.rs` | TEA CFB, **8 rounds** |
-| `xtea.rs` | XTEA CFB, 64 rounds |
+| `aes_cfb.rs` | AES-128/192/256 CFB (`AesCfbCrypt`) |
+| `aes_gcm.rs` | AES-128-GCM AEAD (`Aes128GcmCrypt`) |
+| `sm4.rs` | SM4-CFB (tjfoc/gmsm S-box) |
+| `tea.rs` | TEA-CFB (8 rounds for Go compat) |
+| `xtea.rs` | XTEA-CFB |
 | `salsa20.rs` | Salsa20 stream |
-| `blowfish.rs` | Blowfish CFB |
-| `twofish.rs` | Twofish CFB |
-| `cast5_crypt.rs` | CAST5/CAST-128 CFB wrapping `cast5.rs` |
-| `triple_des.rs` | 3DES CFB |
+| `blowfish.rs` | Blowfish-CFB |
+| `twofish.rs` | Twofish-CFB |
+| `cast5_crypt.rs` | CAST-128 CFB wrapper over `crate::cast5` |
+| `triple_des.rs` | 3DES-CFB (uses Go-style DES boxes in `crate::des`) |
+| `xor.rs` | Simple XOR stream (`SimpleXORCrypt`) |
+| `none.rs` | No-op crypt (`NoneCrypt`) for `none`/`null` methods |
+
+## Subdirectories
+
+None.
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- Implement only `encrypt`/`decrypt` (or AEAD seal/open). Packet framing is outside this module.
-- Use parent CFB helpers (`cfb8_enc/dec`, `cfb16_enc/dec`) with monomorphized closures for speed.
-- Never change round counts / S-boxes without Go interop proof.
-- `name()` return values must match CLI crypt strings (`"aes-128"`, `"3des"`, etc.).
+- Prefer monomorphized CFB hot paths consistent with recent AES/3DES/XTEA/Blowfish work.
+- Do not change round counts, S-boxes, or IV usage without e2e crypt matrix.
+- `none` vs `null` header difference is outside these modules (CryptoBuf / binaries).
+- Keep `BlockCrypt`/`AeadCrypt` trait impls `Send + Sync` and encrypt/decrypt on `&self`.
 
 ### Testing Requirements
 
-Change one cipher → e2e that crypt method; full matrix if CFB helpers change.
+- Module tests + parent `crypt.rs` tests
+- `bash test_e2e.sh` crypt matrix after algorithm edits
 
 ### Common Patterns
 
-Construct from 16/24/32-byte key material; store expanded round keys; process in place.
+- Construct from key bytes in factory; no per-packet IV random (CFB fixed IV in parent)
 
 ## Dependencies
 
 ### Internal
-- Parent `crypt` module helpers; `crate::cast5` for CAST5
+
+- Parent `kcrypt-rs` (`cast5`, `des`, trait defs in `crypt.rs`)
 
 ### External
-Cipher crates re-exported via parent Cargo.toml
+
+- Cipher crates re-exported via parent `Cargo.toml`
 
 <!-- MANUAL: -->

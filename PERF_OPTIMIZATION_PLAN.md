@@ -332,7 +332,7 @@ struct StreamInner {
 - [x] `UdpSocket::send_batch` / `send_batch_to` (P1.2a; Linux P1.2b sendmmsg)  
 - [x] Linux `recvmmsg` + try_recv_batch_from (server drain; client try_recv loop)  
 - [x] `cpu_block`：短任务 inline 阈值（callers use `should_cpu_block_encrypt`; not a kio API)  
-- [ ] 保证 smol 多线程下 UDP 与 flush 不饿死（已修 ACK spawn——回归测试锁住）
+- [x] 保证 smol 多线程下 UDP 与 flush 不饿死（已修 ACK spawn——回归测试锁住）
 
 ### 3.5 binaries
 
@@ -413,7 +413,7 @@ BENCH_DATA_MB=50 bash bench/run_bench.sh
 - [x] `send_batch` / `send_batch_to`  
 - [x] 条件 cpu_block（调用方）  
 - [x] Linux sendmmsg/recvmmsg  
-- [ ] smol 饿死回归测试加固  
+- [x] smol 饿死回归测试加固（JoinHandle detach + idle true-timeout）  
 
 ### 9.5 binaries
 

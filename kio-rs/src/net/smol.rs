@@ -143,7 +143,6 @@ impl UdpSocket {
         }
     }
 
-
     /// Non-blocking recv for connected sockets (smol: via get_ref + try).
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         // smol/async-net has no try_recv; use libc recv with MSG_DONTWAIT on Linux,
@@ -198,7 +197,10 @@ impl UdpSocket {
                 x if x == libc::AF_INET as i32 => {
                     let sin = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in) };
                     let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, u16::from_be(sin.sin_port)))
+                    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        ip,
+                        u16::from_be(sin.sin_port),
+                    ))
                 }
                 x if x == libc::AF_INET6 as i32 => {
                     let sin6 = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in6) };
@@ -290,6 +292,11 @@ impl TcpListener {
         let async_listener = async_io::Async::new(std_listener)?;
         let l = smol::net::TcpListener::from(async_listener);
         Ok(Self { inner: l })
+    }
+
+    #[inline(always)]
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
     }
 
     #[inline(always)]

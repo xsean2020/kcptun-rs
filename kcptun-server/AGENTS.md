@@ -1,65 +1,59 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 (feed_data_mut in-place inbound) -->
 
 # kcptun-server
 
 ## Purpose
 
-Server binary: UDP KCP listener, SMUX accept, forward each stream to a TCP `--target`. Large `src/main.rs` (~2589 LOC) plus integration **stress_test**. Session map uses `dashmap`. Default listen `:29900`.
+kcptun server binary: UDP/KCP accept → SMUX → target TCP. `KcpServerSession` per peer, DashMap session table, Snappy session codec, optional QPP, SNMP log, optional pprof. Stress integration tests live in `tests/stress_test.rs` (no AGENTS under `tests/`).
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Same feature layout as client (`tokio`/`smol`, optional `pprof` off by default) + `dashmap` |
-| `src/main.rs` | `KcpServerSession`, `get_or_create_session`, stream handler, flush loop, SNMP |
-| `tests/stress_test.rs` | Multi-thread data-integrity stress (1 B–512 KB, many conns) |
+| `Cargo.toml` | Features `tokio` (default) / `smol`; optional `pprof`; + `dashmap` vs client |
+| `build.rs` | Build-time glue |
+| `src/main.rs` | Entire binary: `Cli`, `KcpServerSession`, `SmuxStreamIo`, `handle_stream`, `pipe` idle timeout, pprof |
+| `tests/stress_test.rs` | Multi-connection stress / data integrity (run via `make stress`) |
 
 ## Subdirectories
 
 | Directory | Purpose |
 |-----------|---------|
-| `tests/` | Integration tests (see `tests/AGENTS.md`) |
+| `tests/` | Integration stress tests only — **no AGENTS.md** |
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- **KCP update interval: 10 ms** (vs client 2 ms) — intentional.
-- Session demux by conversation identity; `get_or_create_session` is the hot UDP path.
-- Flush loop mirrors client 4-phase design; Snappy Phase 3 offloaded via `kio::cpu_block`.
-- Pipe uses `copy_bidirectional_idle` with `closeWait`-style idle timeout.
-- Shared constants/helpers must stay aligned with client (`SALT`, modes, crypto header rules).
-- Log rotation helper `rotate_log` for long-running SNMP/log files.
+- Stack: UDP → decrypt/FEC → KCP → Snappy → SMUX → (optional QPP) → target TCP.
+- `pipe` uses **idle** timeout (`closewait`), not total duration — matches Go; do not convert to hard total timeout.
+- Session demux by peer; inbound via `feed_data_mut(&mut [u8])` — CFB/null decrypt in place (`decrypt_cfb_in_place` / `inbound_null`), then FEC + `KCP::input` + inline SMUX.
+- Flush loop 4-phase like client; keep lock short.
+- Known open issue: proxy SMUX stream leak → RSS growth (`bugs/BUGREPORT_PROXY_MEMORY_GROWTH.md`).
+- PBKDF2 / crypt / mode / nocomp must match client.
 
 ### Testing Requirements
 
 ```bash
-# Unit/integration in main
-cargo test -p kcptun-server
-
-# Stress (release binaries required)
-make release
 make stress
-# or:
-cargo test --release -p kcptun-server --test stress_test -- --nocapture --test-threads=1
-
-# Interop
-bash test_e2e.sh
+cargo test --release --package kcptun-server --test stress_test -- --nocapture --test-threads=1
+make e2e
 ```
 
 ### Common Patterns
 
-- `SmuxStreamIo` = server-side async bridge (cfg dual impl like client)
-- `handle_stream` → TCP dial target → pipe
-- SNMP + optional pprof HTTP (requires `--features pprof`)
+- `DashMap` for concurrent session lookup
+- Log rotation helper for file logs
 
 ## Dependencies
 
 ### Internal
-`kcp-rs`, `kcrypt-rs`, `smux-rs`, `qpp-rs`, `kio-rs`
+
+- `kcp-rs`, `kcrypt-rs`, `smux-rs`, `qpp-rs`, `kio-rs`
 
 ### External
-Same as client + `dashmap`
+
+- Same family as client + `dashmap`; optional `pprof`
 
 <!-- MANUAL: pprof feature is optional and off by default (keeps ARM release bins small). Enable with --features pprof. -->

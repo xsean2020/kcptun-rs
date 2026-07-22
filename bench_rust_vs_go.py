@@ -31,7 +31,7 @@ import json
 REPO = os.path.dirname(os.path.abspath(__file__))
 
 # Port pool — incremented per test to avoid TIME_WAIT conflicts
-_base_port = 40000
+_base_port = 20000
 def next_ports(n=3):
     global _base_port
     ports = (_base_port, _base_port + 1, _base_port + 2)
@@ -41,10 +41,154 @@ def next_ports(n=3):
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+def _pids_on_port(port):
+    """Return PIDs holding TCP-LISTEN or UDP on `port` (macOS/Linux lsof)."""
+    pids = set()
+    # TCP listeners (echo / kcptun client)
+    try:
+        out = subprocess.check_output(
+            ['lsof', f'-tiTCP:{port}', '-sTCP:LISTEN'],
+            stderr=subprocess.DEVNULL, text=True)
+        pids.update(int(x) for x in out.split() if x.strip().isdigit())
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        pass
+    # UDP (kcptun server KCP/UDP bind)
+    try:
+        out = subprocess.check_output(
+            ['lsof', f'-tiUDP:{port}'],
+            stderr=subprocess.DEVNULL, text=True)
+        pids.update(int(x) for x in out.split() if x.strip().isdigit())
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        pass
+    # Fallback: any protocol on that port number
+    try:
+        out = subprocess.check_output(
+            ['lsof', f'-ti:{port}'],
+            stderr=subprocess.DEVNULL, text=True)
+        pids.update(int(x) for x in out.split() if x.strip().isdigit())
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        pass
+    return pids
+
+def port_in_use(port):
+    """True if any process holds TCP-LISTEN or UDP on `port` (lsof-based)."""
+    return bool(_pids_on_port(port))
+
+def _set_reuse(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # macOS: SO_REUSEPORT helps when SO_REUSEADDR alone cannot reclaim a port
+    if hasattr(socket, 'SO_REUSEPORT'):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+
+def can_bind(port, udp=False):
+    """True if we can actually bind `port` right now (catches TIME_WAIT etc.)."""
+    sock_type = socket.SOCK_DGRAM if udp else socket.SOCK_STREAM
+    s = socket.socket(socket.AF_INET, sock_type)
+    try:
+        _set_reuse(s)
+        s.bind(('0.0.0.0', port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+def kill_ports(*ports):
+    """Force-kill holders of the given ports and wait until they are free."""
+    my_pid = os.getpid()
+    for p in ports:
+        for attempt in range(10):
+            pids = _pids_on_port(p)
+            # Never kill ourselves (echo server is in this process)
+            pids.discard(my_pid)
+            if not pids:
+                break
+            for pid in pids:
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    log(f"  warn: no permission to kill pid {pid} on port {p}")
+            time.sleep(0.15)
+        if port_in_use(p):
+            # Still held by another process (or ourselves) — lsof-only check
+            remaining = _pids_on_port(p) - {my_pid}
+            if remaining:
+                log(f"  warn: port {p} still occupied by pids {remaining}")
+
+def wait_port_free(port, timeout=5.0, udp=False):
+    """Poll until port is bindable. Returns True if free, False on timeout."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if can_bind(port, udp=udp):
+            return True
+        time.sleep(0.1)
+    return False
+
+def wait_port_ready(port, timeout=5.0):
+    """Poll until a TCP connect to 127.0.0.1:port succeeds (listener ready)."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        try:
+            s = socket.socket()
+            s.settimeout(0.2)
+            s.connect(('127.0.0.1', port))
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+def ensure_ports_free(echo_port, srv_port, cli_port, timeout=5.0):
+    """Kill holders and wait until the bench port triple is bindable.
+
+    echo/cli are TCP; srv is UDP (KCP). Returns True if all three can bind.
+    """
+    kill_ports(echo_port, srv_port, cli_port)
+    checks = (
+        (echo_port, False),
+        (srv_port, True),
+        (cli_port, False),
+    )
+    ok = True
+    for p, is_udp in checks:
+        if not wait_port_free(p, timeout=timeout, udp=is_udp):
+            log(f"  ERROR: port {p} ({'udp' if is_udp else 'tcp'}) still not bindable")
+            ok = False
+    return ok
+
+def allocate_ports(max_tries=40):
+    """Pick a free (echo, srv, cli) triple; skip/kill occupied ranges."""
+    for _ in range(max_tries):
+        ports = next_ports()
+        echo_port, srv_port, cli_port = ports
+        occupied = [p for p in ports if port_in_use(p) or not can_bind(p, udp=(p == srv_port))]
+        if occupied:
+            # Best-effort free; if still unusable, advance the pool
+            if not ensure_ports_free(echo_port, srv_port, cli_port, timeout=1.5):
+                continue
+        # Final bindability check (lsof can miss TIME_WAIT)
+        if (can_bind(echo_port, udp=False)
+                and can_bind(srv_port, udp=True)
+                and can_bind(cli_port, udp=False)):
+            return ports
+    return None
+
 def start_echo_server(port):
     srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', port))
+    _set_reuse(srv)
+    try:
+        srv.bind(('0.0.0.0', port))
+    except OSError as e:
+        srv.close()
+        raise OSError(e.errno, f"echo bind 0.0.0.0:{port} failed: {e.strerror}") from e
     srv.listen(256)
     def handle():
         while True:
@@ -65,10 +209,6 @@ def start_echo_server(port):
             threading.Thread(target=echo, args=(conn,), daemon=True).start()
     threading.Thread(target=handle, daemon=True).start()
     return srv
-
-def kill_ports(*ports):
-    for p in ports:
-        os.system(f"lsof -ti:{p} 2>/dev/null | xargs kill -9 2>/dev/null")
 
 def build_args(binary_path, is_go, role, echo_port, srv_port, cli_port,
                crypt, nocomp, conn, key='bench-key'):
@@ -173,34 +313,67 @@ def run_one_connection(conn_id, local_port, payload_size, timeout, results):
 def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
               crypt, nocomp, impl_name):
     """Run a single benchmark configuration."""
-    echo_port, srv_port, cli_port = next_ports()
-    kill_ports(echo_port, srv_port, cli_port)
-    time.sleep(0.5)
+    # Allocate a (echo, srv, cli) triple guaranteed bindable right now
+    allocated = allocate_ports()
+    if allocated is None:
+        log(f"  [{label}] cannot allocate free ports after 40 tries; skip")
+        return None
+    echo_port, srv_port, cli_port = allocated
 
-    echo = start_echo_server(echo_port)
-    time.sleep(0.3)
+    try:
+        echo = start_echo_server(echo_port)
+    except OSError as e:
+        log(f"  [{label}] {e}")
+        ensure_ports_free(echo_port, srv_port, cli_port, timeout=2.0)
+        return None
+    if not wait_port_ready(echo_port, timeout=3.0):
+        log(f"  [{label}] echo server not ready on {echo_port}")
+        echo.close()
+        ensure_ports_free(echo_port, srv_port, cli_port, timeout=2.0)
+        return None
 
     srv_args = build_args(server_bin, is_go, 'server', echo_port, srv_port, cli_port,
                           crypt, nocomp, conn)
-    log(f"  [{label}] starting server...")
+    log(f"  [{label}] starting server (udp :{srv_port})...")
     srv = subprocess.Popen(srv_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    time.sleep(1.5)
+    # Wait for process to stay up; UDP bind has no TCP connect probe
+    for _ in range(20):
+        if srv.poll() is not None:
+            break
+        time.sleep(0.1)
     if srv.poll() is not None:
         out = srv.stdout.read().decode(errors='replace') if srv.stdout else ""
-        log(f"  [{label}] server died:\n{out[:200]}")
+        log(f"  [{label}] server died:\n{out[:300]}")
         echo.close()
+        ensure_ports_free(echo_port, srv_port, cli_port, timeout=2.0)
         return None
 
     cli_args = build_args(client_bin, is_go, 'client', echo_port, srv_port, cli_port,
                           crypt, nocomp, conn)
-    log(f"  [{label}] starting client...")
+    log(f"  [{label}] starting client (tcp :{cli_port})...")
     cli = subprocess.Popen(cli_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    time.sleep(2.0)
+    # Poll TCP listener readiness instead of fixed sleep (cold-start first test)
+    if not wait_port_ready(cli_port, timeout=8.0):
+        out = ""
+        if cli.poll() is not None and cli.stdout:
+            out = cli.stdout.read().decode(errors='replace')
+        log(f"  [{label}] client listener not ready on {cli_port}"
+            + (f":\n{out[:300]}" if out else " (process still running)"))
+        cli.terminate()
+        srv.terminate()
+        try: cli.wait(timeout=3)
+        except: cli.kill()
+        try: srv.wait(timeout=3)
+        except: srv.kill()
+        echo.close()
+        ensure_ports_free(echo_port, srv_port, cli_port, timeout=3.0)
+        return None
     if cli.poll() is not None:
         out = cli.stdout.read().decode(errors='replace') if cli.stdout else ""
-        log(f"  [{label}] client died:\n{out[:200]}")
+        log(f"  [{label}] client died:\n{out[:300]}")
         srv.terminate()
         echo.close()
+        ensure_ports_free(echo_port, srv_port, cli_port, timeout=2.0)
         return None
 
     # Warmup — prime KCP congestion window, SMUX, and Snappy before timed measurement
@@ -212,6 +385,9 @@ def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
         daemon=True)
     warmup_thread.start()
     warmup_thread.join(timeout=timeout + 10)
+    if not warmup_results.get(-1, {}).get('ok'):
+        err = warmup_results.get(-1, {}).get('error', 'no result')
+        log(f"  [{label}] warmup failed ({err}); continuing to timed run")
 
     # Run test — start all connections simultaneously for accurate timing
     results = {}
@@ -233,7 +409,8 @@ def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
     try: srv.wait(timeout=5)
     except: srv.kill()
     echo.close()
-    time.sleep(0.5)
+    # Always free ports after each run so the next test is clean
+    ensure_ports_free(echo_port, srv_port, cli_port, timeout=3.0)
 
     ok = sum(1 for r in results.values() if r['ok'])
     fail = sum(1 for r in results.values() if not r['ok'])

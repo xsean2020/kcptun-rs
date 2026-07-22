@@ -21,7 +21,6 @@
 
 use std::fmt;
 
-
 // ─── Submodules ────────────────────────────────────────────────────────
 mod aes_cfb;
 mod aes_gcm;
@@ -53,7 +52,7 @@ pub use xtea::XteaCrypt;
 // ─── Shared constants ──────────────────────────────────────────────────
 
 /// Fixed IV used by Go's kcp-go CFB implementation.
-const GO_CFB_IV: [u8; 16] = [
+pub(crate) const GO_CFB_IV: [u8; 16] = [
     167, 115, 79, 156, 18, 172, 27, 1, 164, 21, 242, 193, 252, 120, 230, 107,
 ];
 
@@ -128,9 +127,9 @@ fn cfb8_enc<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
             let mut b = [0u8; 8];
             f(&tbl, &mut b);
             // 64-bit XOR: 8 bytes in one operation
-            let y = u64::from_le_bytes(
-                [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]],
-            ) ^ u64::from_le_bytes(b);
+            let y = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]) ^ u64::from_le_bytes(b);
             let out = y.to_le_bytes();
             chunk.copy_from_slice(&out);
             tbl = out;
@@ -142,9 +141,9 @@ fn cfb8_enc<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
         let chunk = &mut data[i..i + 8];
         let mut b = [0u8; 8];
         f(&tbl, &mut b);
-        let y = u64::from_le_bytes(
-            [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]],
-        ) ^ u64::from_le_bytes(b);
+        let y = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]) ^ u64::from_le_bytes(b);
         let out = y.to_le_bytes();
         chunk.copy_from_slice(&out);
         tbl = out;
@@ -180,7 +179,9 @@ fn cfb8_dec<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
     // Full blocks with 64-bit XOR
     while i + 8 <= data.len() {
         let chunk = &mut data[i..i + 8];
-        let src = [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]];
+        let src = [
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ];
         let mut b = [0u8; 8];
         f(&tbl, &mut b);
         let y = u64::from_le_bytes(src) ^ u64::from_le_bytes(b);
@@ -383,7 +384,6 @@ pub fn select_aead_crypt(method: &str, pass: &[u8]) -> Option<Box<dyn AeadCrypt>
     }
 }
 
-
 // ─── Monomorphized cipher enum (P3 optional hot-path dispatch) ─────────
 
 /// Concrete cipher set with static dispatch via `match`.
@@ -413,7 +413,10 @@ impl CryptEngine {
     pub fn select(method: &str, pass: &[u8]) -> (Self, String) {
         match method {
             "null" | "none" => (CryptEngine::None(NoneCrypt), method.to_string()),
-            "xor" => (CryptEngine::Xor(SimpleXORCrypt::new(pass)), method.to_string()),
+            "xor" => (
+                CryptEngine::Xor(SimpleXORCrypt::new(pass)),
+                method.to_string(),
+            ),
             "aes-128" => (
                 CryptEngine::AesCfb(AesCfbCrypt::new(&pad(pass, 16))),
                 method.to_string(),
@@ -422,17 +425,24 @@ impl CryptEngine {
                 CryptEngine::AesCfb(AesCfbCrypt::new(&pad(pass, 24))),
                 method.to_string(),
             ),
-            "aes" | "aes-256" => (CryptEngine::AesCfb(AesCfbCrypt::new(pass)), "aes".to_string()),
+            "aes" | "aes-256" => (
+                CryptEngine::AesCfb(AesCfbCrypt::new(pass)),
+                "aes".to_string(),
+            ),
             "aes-128-gcm" => (
                 CryptEngine::Aes128Gcm(Aes128GcmCrypt::new(pass)),
                 "aes-128-gcm".to_string(),
             ),
-            "sm4" => (CryptEngine::Sm4(Sm4Crypt::new(&pad(pass, 16))), method.to_string()),
+            "sm4" => (
+                CryptEngine::Sm4(Sm4Crypt::new(&pad(pass, 16))),
+                method.to_string(),
+            ),
             "tea" => (CryptEngine::Tea(TeaCrypt::new(pass)), method.to_string()),
             "xtea" => (CryptEngine::Xtea(XteaCrypt::new(pass)), method.to_string()),
-            "salsa20" | "salsa" => {
-                (CryptEngine::Salsa20(Salsa20Crypt::new(pass)), "salsa20".to_string())
-            }
+            "salsa20" | "salsa" => (
+                CryptEngine::Salsa20(Salsa20Crypt::new(pass)),
+                "salsa20".to_string(),
+            ),
             "blowfish" => (
                 CryptEngine::Blowfish(BlowfishCrypt::new(pass)),
                 method.to_string(),
@@ -449,7 +459,10 @@ impl CryptEngine {
                 CryptEngine::TripleDes(TripleDesCrypt::new(&pad(pass, 24))),
                 "3des".to_string(),
             ),
-            _ => (CryptEngine::AesCfb(AesCfbCrypt::new(pass)), "aes".to_string()),
+            _ => (
+                CryptEngine::AesCfb(AesCfbCrypt::new(pass)),
+                "aes".to_string(),
+            ),
         }
     }
 

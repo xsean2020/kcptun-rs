@@ -1,18 +1,18 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # qpp-rs
 
 ## Purpose
 
-Quantum Permutation Pad (QPP) stream obfuscation — algorithmic port of Go `xtaci/qpp`. Optional per-stream layer above SMUX (enabled via `--QPP` / `--QPPCount`). Produces **byte-identical** ciphertext to Go given the same key, data, and pad count.
+Quantum Permutation Pad (QPP) stream obfuscation — port of Go `xtaci/qpp` with **algorithmic compatibility** (same ciphertext for same key/data/pad config). Optional upper layer on SMUX streams in client/server.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
 | `Cargo.toml` | `sha1`, `sha2`, `hmac`, `aes`, `pbkdf2` |
-| `src/lib.rs` | Entire implementation (~500 LOC): xoshiro256**, pads, encrypt/decrypt |
+| `src/lib.rs` | Entire crate: `QuantumPermutationPad`, `Rand` (xoshiro256**), pad encrypt/decrypt helpers |
 
 ## Subdirectories
 
@@ -22,27 +22,30 @@ None.
 
 ### Working In This Directory
 
-- Preserve exact Go constants: salts, `PBKDF2_LOOPS=128`, `CHUNK_DERIVE_LOOPS=1024`, `PAD_SWITCH=8`, `QUBITS=8`, pad size 256.
-- PRNG is **xoshiro256\*\*** matching Go `xoshiro256ss` — do not swap for a Rust crate RNG.
-- Key derivation: HMAC-SHA256 selector + PBKDF2-HMAC-SHA1; Fisher-Yates shuffle via AES-256.
-- Pad count should be prime (CLI documents this); min pads = 3; min seed length = 32.
-- Runtime-agnostic pure crypto — no async.
+- Must match Go: xoshiro256** (xoshiro256ss), PBKDF2(SHA1, 128 rounds), `PAD_SWITCH=8`, AES-256 Fisher-Yates pad construction.
+- Constants: `QPP_MIN_SEED_LENGTH=32`, `QPP_POWER=8`, `QPP_PAD_SIZE=256`, `QPP_MINIMUM_PADS=3`.
+- Used from binaries as optional `QPPPort` wrapper around SMUX streams — not on the UDP/KCP path.
+- Do not "modernize" PRNG or KDF without breaking Go interop tests.
 
 ### Testing Requirements
 
-- Any PRNG/pad change requires Go interop vectors (e2e with `--QPP`)
-- Prefer golden tests against Go outputs if available
+- In-file unit tests in `lib.rs`
+- e2e with QPP enabled if Go matrix covers it
 
 ### Common Patterns
 
-Binaries wrap streams: `QPPPort<T>` applies QPP on read/write over an inner `AsyncRead+AsyncWrite`.
+```rust
+use qpp_rs::{QuantumPermutationPad, create_qpp_prng};
+```
 
 ## Dependencies
 
 ### Internal
-None.
+
+None (leaf).
 
 ### External
-`sha1`, `sha2`, `hmac`, `aes`, `pbkdf2`
+
+- `sha1`, `sha2`, `hmac`, `aes`, `pbkdf2`
 
 <!-- MANUAL: -->

@@ -1,41 +1,60 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # bench
 
 ## Purpose
 
-Throughput benchmarking harness comparing **Go kcptun**, **Rust-tokio**, and **Rust-smol**. Invoked via `make bench` (rebuilds both Rust backends first).
+Throughput and CPU-profile tooling for Rust vs Go kcptun. Shell/Python runners, samply flamegraph matrix (L1–L4), Go-compatible pprof export, symbolication helpers, and captured artifacts under `profiles/`.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `run_bench.sh` | Orchestrates builds, process lifecycle, invokes Python thruput runner |
-| `throughput.py` | Measures pipe throughput through client/server pair |
+| `run_bench.sh` | Bench orchestration helper |
+| `throughput.py` | Throughput measurement utility |
+| `profile_flamegraph.sh` | L1–L4 samply capture (`make profile`) |
+| `profile_rust_go_pprof.sh` | Rust CPU → Go pprof protobuf |
+| `profile_go_pprof.sh` | Go side pprof helper |
+| `symbolicate_profile.py` | Post-process flamegraph symbols / named stacks |
+| `kcptun_prof_wl.rs` / `kcptun_prof_wl` | Local workload binary for macOS samply (not system bash/python as root) |
+| `PROFILE_RUNBOOK.md` | How to run and interpret profiles |
+| `profiles/` | Artifacts: `HOTSPOTS.md`, `*.json.gz`, `*.pb`, README |
 
-## Related (repo root)
+## Subdirectories
 
-| File | Description |
-|------|-------------|
-| `../bench_rust_vs_go.py` | Higher-level comparison script |
-| `../bench_results.json` | Latest numeric results (committed artifact of experiments) |
+| Directory | Purpose |
+|-----------|---------|
+| `profiles/` | Flamegraph/pprof outputs and hotspot notes |
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- Expect Go binaries under `tests/kcptun-go/` and Rust under `target/release` + `target/smol-release`.
-- Keep 3-way comparison semantics when editing scripts.
-- Do not treat `bench_results.json` as a source of truth for correctness — only performance snapshots.
+- Before speculative perf edits: skill `.claude/skills/flamegraph-perf/` + `PROFILE_RUNBOOK.md`.
+- Prefer evidence from `profiles/HOTSPOTS.md` + re-bench over guesswork.
+- macOS: do not use system `/bin/bash` as samply root process — use `kcptun_prof_wl`.
+- One optimization class per change; keep wire compatibility; shared `encrypt_batch` paths.
+- Root also has `bench_rust_vs_go.py` / `bench_results.json` for 3-way throughput.
 
 ### Testing Requirements
 
-Manual: `make bench` (long-running, needs free ports).
+- Not unit tests; validate by re-running profile/bench scripts after perf changes
+- `make bench`, `make profile`, `make profile-rust-go`
+
+### Common Patterns
+
+- Env: `BENCH_DATA_MB`, `SKIP_PROFILE_REBUILD=1`
+- Profiling profile: `cargo build --profile profiling -p kcptun-server -p kcptun-client`
 
 ## Dependencies
 
+### Internal
+
+- Built `kcptun-client` / `kcptun-server` release or profiling bins
+
 ### External
-Python 3, bash; optional Go binaries for full comparison.
+
+- `samply`, optional `rustfilt`, Go toolchain for pprof UI
 
 <!-- MANUAL: -->

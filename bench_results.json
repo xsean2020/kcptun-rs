@@ -6,12 +6,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.3666673800034914,
-    "throughput": 28597471.637373783,
+    "total_time": 0.25486974998784717,
+    "throughput": 41141641.95829433,
     "total_bytes": 10485760,
-    "latency_avg": 0.06942391990014585,
-    "latency_min": 0.025224639000953175,
-    "latency_max": 0.1007152899983339
+    "latency_avg": 0.08569052089733305,
+    "latency_min": 0.029079917003400624,
+    "latency_max": 0.13760662499407772
   },
   {
     "label": "Rust-smol null/no-comp",
@@ -20,12 +20,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.40009265399567084,
-    "throughput": 26208329.233941548,
+    "total_time": 0.33675391699944157,
+    "throughput": 31137752.140882708,
     "total_bytes": 10485760,
-    "latency_avg": 0.11601854769905913,
-    "latency_min": 0.08244390499748988,
-    "latency_max": 0.1301207409997005
+    "latency_avg": 0.12836619990121106,
+    "latency_min": 0.10465033299988136,
+    "latency_max": 0.14161050000984687
   },
   {
     "label": "Go null/no-comp",
@@ -34,12 +34,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4257858750061132,
-    "throughput": 24626838.548482735,
+    "total_time": 0.3789781669911463,
+    "throughput": 27668506.825209722,
     "total_bytes": 10485760,
-    "latency_avg": 0.11927777259916184,
-    "latency_min": 0.05484429500211263,
-    "latency_max": 0.1517253870042623
+    "latency_avg": 0.2224109040966141,
+    "latency_min": 0.1344103330047801,
+    "latency_max": 0.2989169169886736
   },
   {
     "label": "Rust-tokio null/comp",
@@ -48,12 +48,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.37967092000326375,
-    "throughput": 27618022.470380038,
+    "total_time": 0.35447191599814687,
+    "throughput": 29581356.171682775,
     "total_bytes": 10485760,
-    "latency_avg": 0.08751661829810473,
-    "latency_min": 0.03396542599512031,
-    "latency_max": 0.11466828599805012
+    "latency_avg": 0.11188543760363245,
+    "latency_min": 0.08269325000583194,
+    "latency_max": 0.14415158300835174
   },
   {
     "label": "Rust-smol null/comp",
@@ -62,12 +62,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6573674669998582,
-    "throughput": 15951139.243102005,
+    "total_time": 0.3319162910047453,
+    "throughput": 31591579.81748503,
     "total_bytes": 10485760,
-    "latency_avg": 0.10901033550035208,
-    "latency_min": 0.02208337400224991,
-    "latency_max": 0.14174496199848363
+    "latency_avg": 0.05038189189799595,
+    "latency_min": 0.025573334001819603,
+    "latency_max": 0.07221837500401307
   },
   {
     "label": "Go null/comp",
@@ -76,12 +76,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.44821183900057804,
-    "throughput": 23394652.00959691,
+    "total_time": 0.29609087499557063,
+    "throughput": 35413992.410799086,
     "total_bytes": 10485760,
-    "latency_avg": 0.13389106200047535,
-    "latency_min": 0.07708974299748661,
-    "latency_max": 0.16929405600239988
+    "latency_avg": 0.17872446700057482,
+    "latency_min": 0.1381431670015445,
+    "latency_max": 0.22826754199923016
   },
   {
     "label": "Rust-tokio none/no-comp",
@@ -90,12 +90,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4835358249983983,
-    "throughput": 21685590.72129709,
+    "total_time": 0.22536787499848288,
+    "throughput": 46527305.63338092,
     "total_bytes": 10485760,
-    "latency_avg": 0.12426075699913781,
-    "latency_min": 0.0524245799970231,
-    "latency_max": 0.1825700589979533
+    "latency_avg": 0.07949494170024991,
+    "latency_min": 0.015831083001103252,
+    "latency_max": 0.10660387499956414
   },
   {
     "label": "Rust-smol none/no-comp",
@@ -104,12 +104,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4874717150014476,
-    "throughput": 21510499.332189687,
+    "total_time": 0.21870870899874717,
+    "throughput": 47943952.7031366,
     "total_bytes": 10485760,
-    "latency_avg": 0.16556442110086209,
-    "latency_min": 0.11780993700085673,
-    "latency_max": 0.18501510300120572
+    "latency_avg": 0.08906416650133905,
+    "latency_min": 0.03747687500435859,
+    "latency_max": 0.10014391699223779
   },
   {
     "label": "Go none/no-comp",
@@ -118,12 +118,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4894605129957199,
-    "throughput": 21423096.902796924,
+    "total_time": 0.22118116599449422,
+    "throughput": 47408014.84092465,
     "total_bytes": 10485760,
-    "latency_avg": 0.14471492500088062,
-    "latency_min": 0.0528534090044559,
-    "latency_max": 0.1877009299932979
+    "latency_avg": 0.07640265820082277,
+    "latency_min": 0.03589079099765513,
+    "latency_max": 0.09644204200594686
   },
   {
     "label": "Rust-tokio none/comp",
@@ -132,12 +132,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5001650480044191,
-    "throughput": 20964599.669322267,
+    "total_time": 0.2449228750047041,
+    "throughput": 42812497.606842995,
     "total_bytes": 10485760,
-    "latency_avg": 0.14934464859979926,
-    "latency_min": 0.0713816420029616,
-    "latency_max": 0.2155001320061274
+    "latency_avg": 0.08001498320081737,
+    "latency_min": 0.027107290996355005,
+    "latency_max": 0.09425341601308901
   },
   {
     "label": "Rust-smol none/comp",
@@ -146,12 +146,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.45387517400376964,
-    "throughput": 23102739.69713292,
+    "total_time": 0.2936496670008637,
+    "throughput": 35708400.78619656,
     "total_bytes": 10485760,
-    "latency_avg": 0.16547150559999863,
-    "latency_min": 0.15047223799774656,
-    "latency_max": 0.17723198999738088
+    "latency_avg": 0.0961381540997536,
+    "latency_min": 0.05270891700638458,
+    "latency_max": 0.10582162499486003
   },
   {
     "label": "Go none/comp",
@@ -160,12 +160,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5156700999941677,
-    "throughput": 20334240.82590516,
+    "total_time": 0.2928665420040488,
+    "throughput": 35803885.03325531,
     "total_bytes": 10485760,
-    "latency_avg": 0.1839077848002489,
-    "latency_min": 0.09382632099732291,
-    "latency_max": 0.22416365599929122
+    "latency_avg": 0.11702669170190347,
+    "latency_min": 0.09487633299431764,
+    "latency_max": 0.13062970800092444
   },
   {
     "label": "Rust-tokio xor/no-comp",
@@ -174,12 +174,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4966230250065564,
-    "throughput": 21114123.735728055,
+    "total_time": 0.30517220799811184,
+    "throughput": 34360140.68510746,
     "total_bytes": 10485760,
-    "latency_avg": 0.16601581489958334,
-    "latency_min": 0.09285334699961822,
-    "latency_max": 0.20451905099616852
+    "latency_avg": 0.10731694589921972,
+    "latency_min": 0.05402641699765809,
+    "latency_max": 0.16014016600092873
   },
   {
     "label": "Rust-smol xor/no-comp",
@@ -188,12 +188,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5526380960000097,
-    "throughput": 18974008.624985956,
+    "total_time": 0.24572474999877159,
+    "throughput": 42672787.336450316,
     "total_bytes": 10485760,
-    "latency_avg": 0.2550339290995908,
-    "latency_min": 0.22366569199948572,
-    "latency_max": 0.26806268299696967
+    "latency_avg": 0.11254951659939252,
+    "latency_min": 0.033531957989907824,
+    "latency_max": 0.1277699579950422
   },
   {
     "label": "Go xor/no-comp",
@@ -202,12 +202,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6107433100041817,
-    "throughput": 17168849.544873778,
+    "total_time": 0.30684220799594186,
+    "throughput": 34173134.356205255,
     "total_bytes": 10485760,
-    "latency_avg": 0.12504549259974737,
-    "latency_min": 0.03265840499807382,
-    "latency_max": 0.1612244540010579
+    "latency_avg": 0.19325365830009106,
+    "latency_min": 0.09107470800518058,
+    "latency_max": 0.22737791600229684
   },
   {
     "label": "Rust-tokio xor/comp",
@@ -216,12 +216,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5820719339972129,
-    "throughput": 18014543.199140415,
+    "total_time": 0.2824700409983052,
+    "throughput": 37121671.25030762,
     "total_bytes": 10485760,
-    "latency_avg": 0.19168644059973303,
-    "latency_min": 0.08846717000415083,
-    "latency_max": 0.238816819000931
+    "latency_avg": 0.10654121249972377,
+    "latency_min": 0.06943262500863057,
+    "latency_max": 0.11907712499669287
   },
   {
     "label": "Rust-smol xor/comp",
@@ -230,12 +230,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6031138809994445,
-    "throughput": 17386036.58503701,
+    "total_time": 0.20732145800138824,
+    "throughput": 50577302.03657832,
     "total_bytes": 10485760,
-    "latency_avg": 0.2812156573010725,
-    "latency_min": 0.24067086300055962,
-    "latency_max": 0.2931231129987282
+    "latency_avg": 0.08640339160192526,
+    "latency_min": 0.060655624998616986,
+    "latency_max": 0.09528387499449309
   },
   {
     "label": "Go xor/comp",
@@ -244,12 +244,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4898491530038882,
-    "throughput": 21406100.09366857,
+    "total_time": 0.21134579200588632,
+    "throughput": 49614235.98965223,
     "total_bytes": 10485760,
-    "latency_avg": 0.15579202730077668,
-    "latency_min": 0.0751659989982727,
-    "latency_max": 0.20712796700536273
+    "latency_avg": 0.10593577500403625,
+    "latency_min": 0.02422566599852871,
+    "latency_max": 0.14169979200232774
   },
   {
     "label": "Rust-tokio aes-128/no-comp",
@@ -258,12 +258,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5072502559996792,
-    "throughput": 20671768.768918335,
+    "total_time": 0.27829400000337046,
+    "throughput": 37678713.87767255,
     "total_bytes": 10485760,
-    "latency_avg": 0.1150264754985983,
-    "latency_min": 0.04901611799868988,
-    "latency_max": 0.16657839499384863
+    "latency_avg": 0.11152323330024956,
+    "latency_min": 0.012379041989333928,
+    "latency_max": 0.16409479100548197
   },
   {
     "label": "Rust-smol aes-128/no-comp",
@@ -272,12 +272,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5085018660029164,
-    "throughput": 20620887.947616424,
+    "total_time": 0.2718305830057943,
+    "throughput": 38574614.68850429,
     "total_bytes": 10485760,
-    "latency_avg": 0.18332600929934414,
-    "latency_min": 0.12640356100018835,
-    "latency_max": 0.21050623399787582
+    "latency_avg": 0.11036689600441604,
+    "latency_min": 0.06943491700803861,
+    "latency_max": 0.12901879200944677
   },
   {
     "label": "Go aes-128/no-comp",
@@ -286,12 +286,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.48356806100491667,
-    "throughput": 21684145.098849665,
+    "total_time": 0.26496975000191014,
+    "throughput": 39573423.003661394,
     "total_bytes": 10485760,
-    "latency_avg": 0.14842658369816492,
-    "latency_min": 0.0676468739984557,
-    "latency_max": 0.19677403700188734
+    "latency_avg": 0.1252385500978562,
+    "latency_min": 0.05901766700844746,
+    "latency_max": 0.14562404199386947
   },
   {
     "label": "Rust-tokio aes-128/comp",
@@ -300,12 +300,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4768892229985795,
-    "throughput": 21987831.75276585,
+    "total_time": 0.2444942500005709,
+    "throughput": 42887552.57015458,
     "total_bytes": 10485760,
-    "latency_avg": 0.15653882879923914,
-    "latency_min": 0.08462887800124008,
-    "latency_max": 0.21101612899656175
+    "latency_avg": 0.0695730124032707,
+    "latency_min": 0.03038570799981244,
+    "latency_max": 0.08885483301128261
   },
   {
     "label": "Rust-smol aes-128/comp",
@@ -314,12 +314,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6238680559981731,
-    "throughput": 16807656.52157498,
+    "total_time": 0.25933629198698327,
+    "throughput": 40433060.56263929,
     "total_bytes": 10485760,
-    "latency_avg": 0.17804154349942108,
-    "latency_min": 0.10612682699866127,
-    "latency_max": 0.2196510700014187
+    "latency_avg": 0.08651064190053148,
+    "latency_min": 0.07554341699869838,
+    "latency_max": 0.101767917003599
   },
   {
     "label": "Go aes-128/comp",
@@ -328,12 +328,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.48578366199944867,
-    "throughput": 21585246.31487483,
+    "total_time": 0.2554946669988567,
+    "throughput": 41041013.196752645,
     "total_bytes": 10485760,
-    "latency_avg": 0.15162309279985492,
-    "latency_min": 0.0835078349991818,
-    "latency_max": 0.19766841100499732
+    "latency_avg": 0.0979336248972686,
+    "latency_min": 0.04864179099968169,
+    "latency_max": 0.12242137499561068
   },
   {
     "label": "Rust-tokio aes-128-gcm/no-comp",
@@ -342,12 +342,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.44518183800391853,
-    "throughput": 23553880.919795528,
+    "total_time": 0.3402377080055885,
+    "throughput": 30818923.809079293,
     "total_bytes": 10485760,
-    "latency_avg": 0.12440727920038626,
-    "latency_min": 0.06949821699527092,
-    "latency_max": 0.16241639799409313
+    "latency_avg": 0.09636500849883305,
+    "latency_min": 0.04188654199242592,
+    "latency_max": 0.15029441700608004
   },
   {
     "label": "Rust-smol aes-128-gcm/no-comp",
@@ -356,12 +356,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.42592956100270385,
-    "throughput": 24618530.76202296,
+    "total_time": 0.2894659170124214,
+    "throughput": 36224506.52644553,
     "total_bytes": 10485760,
-    "latency_avg": 0.100675601799594,
-    "latency_min": 0.04364180300035514,
-    "latency_max": 0.1301525339949876
+    "latency_avg": 0.10899437910120469,
+    "latency_min": 0.07536662499478552,
+    "latency_max": 0.12470491700514685
   },
   {
     "label": "Go aes-128-gcm/no-comp",
@@ -370,12 +370,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.513168391000363,
-    "throughput": 20433370.768529236,
+    "total_time": 0.3303659999946831,
+    "throughput": 31739827.94890745,
     "total_bytes": 10485760,
-    "latency_avg": 0.16018551610031864,
-    "latency_min": 0.07054333799896995,
-    "latency_max": 0.21779805500409566
+    "latency_avg": 0.09287864159996388,
+    "latency_min": 0.04997520800679922,
+    "latency_max": 0.12681787500332575
   },
   {
     "label": "Rust-tokio aes-128-gcm/comp",
@@ -384,12 +384,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.39934075800556457,
-    "throughput": 26257675.405759327,
+    "total_time": 0.29969766600697767,
+    "throughput": 34987793.33088255,
     "total_bytes": 10485760,
-    "latency_avg": 0.08259188860029099,
-    "latency_min": 0.02936539600341348,
-    "latency_max": 0.12540385099418927
+    "latency_avg": 0.08329162900045048,
+    "latency_min": 0.03573270900233183,
+    "latency_max": 0.10562029200082179
   },
   {
     "label": "Rust-smol aes-128-gcm/comp",
@@ -398,12 +398,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4204127979974146,
-    "throughput": 24941581.34563849,
+    "total_time": 0.20941475000290666,
+    "throughput": 50071735.63397258,
     "total_bytes": 10485760,
-    "latency_avg": 0.1356700642987562,
-    "latency_min": 0.10782791800011182,
-    "latency_max": 0.15011626399791567
+    "latency_avg": 0.1084822165008518,
+    "latency_min": 0.07523204099561553,
+    "latency_max": 0.12009524999302812
   },
   {
     "label": "Go aes-128-gcm/comp",
@@ -412,12 +412,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.44436725699779345,
-    "throughput": 23597058.142499615,
+    "total_time": 0.2761367920029443,
+    "throughput": 37973063.72664819,
     "total_bytes": 10485760,
-    "latency_avg": 0.08458292409850401,
-    "latency_min": 0.02921865499956766,
-    "latency_max": 0.12620614600018598
+    "latency_avg": 0.09808702500158688,
+    "latency_min": 0.06192808400373906,
+    "latency_max": 0.11038033300428651
   },
   {
     "label": "Rust-tokio salsa20/no-comp",
@@ -426,12 +426,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4453331549957511,
-    "throughput": 23545877.692623276,
+    "total_time": 0.30076754199399147,
+    "throughput": 34863336.4174964,
     "total_bytes": 10485760,
-    "latency_avg": 0.13256234950167708,
-    "latency_min": 0.07698928400350269,
-    "latency_max": 0.17286304300068878
+    "latency_avg": 0.10548616680171108,
+    "latency_min": 0.03878429200267419,
+    "latency_max": 0.14034129200445022
   },
   {
     "label": "Rust-smol salsa20/no-comp",
@@ -440,12 +440,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5790623299981235,
-    "throughput": 18108171.533164628,
+    "total_time": 0.2741760829958366,
+    "throughput": 38244619.608776115,
     "total_bytes": 10485760,
-    "latency_avg": 0.23375981460121692,
-    "latency_min": 0.21679997699538944,
-    "latency_max": 0.2531487470041611
+    "latency_avg": 0.09486845820210874,
+    "latency_min": 0.07074137500603683,
+    "latency_max": 0.11103299999376759
   },
   {
     "label": "Go salsa20/no-comp",
@@ -454,12 +454,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4700241789978463,
-    "throughput": 22308979.981321443,
+    "total_time": 0.29702549999637995,
+    "throughput": 35302558.19829542,
     "total_bytes": 10485760,
-    "latency_avg": 0.095159629797854,
-    "latency_min": 0.02398140399600379,
-    "latency_max": 0.1405215029953979
+    "latency_avg": 0.09524203339969972,
+    "latency_min": 0.04235274999518879,
+    "latency_max": 0.12991058299667202
   },
   {
     "label": "Rust-tokio salsa20/comp",
@@ -468,12 +468,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4120520270007546,
-    "throughput": 25447660.278057065,
+    "total_time": 0.29908637500193436,
+    "throughput": 35059303.52036994,
     "total_bytes": 10485760,
-    "latency_avg": 0.10524730780234677,
-    "latency_min": 0.03601806900405791,
-    "latency_max": 0.13558700800058432
+    "latency_avg": 0.09436824569711462,
+    "latency_min": 0.05400037499202881,
+    "latency_max": 0.14319541699660476
   },
   {
     "label": "Rust-smol salsa20/comp",
@@ -482,12 +482,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.46253056800196646,
-    "throughput": 22670415.158280782,
+    "total_time": 0.31516008399194106,
+    "throughput": 33271218.44614095,
     "total_bytes": 10485760,
-    "latency_avg": 0.17357947229902493,
-    "latency_min": 0.13719788199523464,
-    "latency_max": 0.18749503399885725
+    "latency_avg": 0.13892793760023778,
+    "latency_min": 0.07988729199860245,
+    "latency_max": 0.15405783300229814
   },
   {
     "label": "Go salsa20/comp",
@@ -496,12 +496,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5278760700020939,
-    "throughput": 19864056.349359438,
+    "total_time": 0.29788162499608006,
+    "throughput": 35201097.080553345,
     "total_bytes": 10485760,
-    "latency_avg": 0.16583116830079234,
-    "latency_min": 0.10126101299829315,
-    "latency_max": 0.2067336330001126
+    "latency_avg": 0.12843330839968986,
+    "latency_min": 0.07312158300192095,
+    "latency_max": 0.16366995900170878
   },
   {
     "label": "Rust-tokio blowfish/no-comp",
@@ -510,12 +510,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4794347140050377,
-    "throughput": 21871090.46069163,
+    "total_time": 0.7078582499962067,
+    "throughput": 14813361.290987555,
     "total_bytes": 10485760,
-    "latency_avg": 0.14613996389962267,
-    "latency_min": 0.07083726700511761,
-    "latency_max": 0.20394462799595203
+    "latency_avg": 0.34978014590160456,
+    "latency_min": 0.21773437500814907,
+    "latency_max": 0.545652542001335
   },
   {
     "label": "Rust-smol blowfish/no-comp",
@@ -524,12 +524,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5015352640039055,
-    "throughput": 20907323.47769338,
+    "total_time": 0.31463579199044034,
+    "throughput": 33326659.798191655,
     "total_bytes": 10485760,
-    "latency_avg": 0.2067438983998727,
-    "latency_min": 0.1724976309997146,
-    "latency_max": 0.23186858400003985
+    "latency_avg": 0.12024302080244524,
+    "latency_min": 0.1121107920043869,
+    "latency_max": 0.12609054100175854
   },
   {
     "label": "Go blowfish/no-comp",
@@ -538,12 +538,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6390290909985197,
-    "throughput": 16408893.03429895,
+    "total_time": 0.38709941699926276,
+    "throughput": 27088028.396643054,
     "total_bytes": 10485760,
-    "latency_avg": 0.30182478179995087,
-    "latency_min": 0.2548919569962891,
-    "latency_max": 0.3526235540048219
+    "latency_avg": 0.17775927489710738,
+    "latency_min": 0.06911524999304675,
+    "latency_max": 0.2214489159960067
   },
   {
     "label": "Rust-tokio blowfish/comp",
@@ -552,12 +552,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6502059729973553,
-    "throughput": 16126828.16748386,
+    "total_time": 0.3214953340066131,
+    "throughput": 32615589.99728534,
     "total_bytes": 10485760,
-    "latency_avg": 0.24463049840196618,
-    "latency_min": 0.06939113400585484,
-    "latency_max": 0.3658921040041605
+    "latency_avg": 0.10572123750025639,
+    "latency_min": 0.06514208299631719,
+    "latency_max": 0.14541804199689068
   },
   {
     "label": "Rust-smol blowfish/comp",
@@ -566,12 +566,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.8504134239992709,
-    "throughput": 12330191.062469624,
+    "total_time": 0.2722879999928409,
+    "throughput": 38509813.140041776,
     "total_bytes": 10485760,
-    "latency_avg": 0.41352901159989414,
-    "latency_min": 0.08050186699983897,
-    "latency_max": 0.46120458700170275
+    "latency_avg": 0.13969657520210604,
+    "latency_min": 0.12653829201008193,
+    "latency_max": 0.14626583299832419
   },
   {
     "label": "Go blowfish/comp",
@@ -580,12 +580,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6491182339959778,
-    "throughput": 16153852.181057317,
+    "total_time": 0.4517549589945702,
+    "throughput": 23211167.450905684,
     "total_bytes": 10485760,
-    "latency_avg": 0.26572283130008145,
-    "latency_min": 0.15416669800470117,
-    "latency_max": 0.36710026700166054
+    "latency_avg": 0.25026925400161415,
+    "latency_min": 0.12517041599494405,
+    "latency_max": 0.3334585409902502
   },
   {
     "label": "Rust-tokio twofish/no-comp",
@@ -594,12 +594,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5079698369954713,
-    "throughput": 20642485.51059831,
+    "total_time": 0.2749871669948334,
+    "throughput": 38131815.80286986,
     "total_bytes": 10485760,
-    "latency_avg": 0.18310805499786512,
-    "latency_min": 0.07922894399962388,
-    "latency_max": 0.23108229499484878
+    "latency_avg": 0.10895940419868566,
+    "latency_min": 0.03305187499790918,
+    "latency_max": 0.1489605419919826
   },
   {
     "label": "Rust-smol twofish/no-comp",
@@ -608,12 +608,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5032365680017392,
-    "throughput": 20836641.585163504,
+    "total_time": 0.28588620900700334,
+    "throughput": 36678089.63720643,
     "total_bytes": 10485760,
-    "latency_avg": 0.19838164059910923,
-    "latency_min": 0.09771374700358137,
-    "latency_max": 0.2282504409959074
+    "latency_avg": 0.13808604149962775,
+    "latency_min": 0.10721975000342354,
+    "latency_max": 0.1613232079980662
   },
   {
     "label": "Go twofish/no-comp",
@@ -622,12 +622,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6689391430045362,
-    "throughput": 15675207.692142624,
+    "total_time": 0.39831808301096316,
+    "throughput": 26325091.546776183,
     "total_bytes": 10485760,
-    "latency_avg": 0.319745165900531,
-    "latency_min": 0.14588932400511112,
-    "latency_max": 0.37782678499934264
+    "latency_avg": 0.25286669160268505,
+    "latency_min": 0.19145795800432097,
+    "latency_max": 0.3177752500050701
   },
   {
     "label": "Rust-tokio twofish/comp",
@@ -636,12 +636,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4492251129995566,
-    "throughput": 23341882.937008355,
+    "total_time": 0.27051370800472796,
+    "throughput": 38762397.94774738,
     "total_bytes": 10485760,
-    "latency_avg": 0.13424018109799363,
-    "latency_min": 0.0692728649955825,
-    "latency_max": 0.18504390799353132
+    "latency_avg": 0.12403922480007168,
+    "latency_min": 0.0822783749899827,
+    "latency_max": 0.1544080000021495
   },
   {
     "label": "Rust-smol twofish/comp",
@@ -650,12 +650,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5173320530011551,
-    "throughput": 20268916.142291665,
+    "total_time": 0.27999470800568815,
+    "throughput": 37449850.658559516,
     "total_bytes": 10485760,
-    "latency_avg": 0.23271391719827078,
-    "latency_min": 0.10720957699959399,
-    "latency_max": 0.2528958289985894
+    "latency_avg": 0.13021186260157264,
+    "latency_min": 0.11984195800323505,
+    "latency_max": 0.13669083300919738
   },
   {
     "label": "Go twofish/comp",
@@ -664,12 +664,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6934840809990419,
-    "throughput": 15120404.760977471,
+    "total_time": 0.4732545410079183,
+    "throughput": 22156702.348101836,
     "total_bytes": 10485760,
-    "latency_avg": 0.3265169207006693,
-    "latency_min": 0.28654427400033455,
-    "latency_max": 0.42190303200186463
+    "latency_avg": 0.264063941501081,
+    "latency_min": 0.11433499999111518,
+    "latency_max": 0.3182313330034958
   },
   {
     "label": "Rust-tokio cast5/no-comp",
@@ -678,12 +678,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.47369475600135047,
-    "throughput": 22136111.635506697,
+    "total_time": 0.3272492090036394,
+    "throughput": 32042124.813457947,
     "total_bytes": 10485760,
-    "latency_avg": 0.15557044750021304,
-    "latency_min": 0.07203685699641937,
-    "latency_max": 0.20711743099673185
+    "latency_avg": 0.11063910849770764,
+    "latency_min": 0.05132579199562315,
+    "latency_max": 0.1647011669992935
   },
   {
     "label": "Rust-smol cast5/no-comp",
@@ -692,12 +692,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6198147410032107,
-    "throughput": 16917571.18107277,
+    "total_time": 0.3230492919974495,
+    "throughput": 32458699.832354955,
     "total_bytes": 10485760,
-    "latency_avg": 0.27804272370194666,
-    "latency_min": 0.16260845799843082,
-    "latency_max": 0.3668947600017418
+    "latency_avg": 0.14236852500325767,
+    "latency_min": 0.11272912500135135,
+    "latency_max": 0.15340208300040103
   },
   {
     "label": "Go cast5/no-comp",
@@ -706,12 +706,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6710560040010023,
-    "throughput": 15625759.903020462,
+    "total_time": 0.3948520409903722,
+    "throughput": 26556175.25415217,
     "total_bytes": 10485760,
-    "latency_avg": 0.3027058222985943,
-    "latency_min": 0.23285353699611733,
-    "latency_max": 0.4040281630004756
+    "latency_avg": 0.173034529198776,
+    "latency_min": 0.08378620799339842,
+    "latency_max": 0.2129380830010632
   },
   {
     "label": "Rust-tokio cast5/comp",
@@ -720,12 +720,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4700641480012564,
-    "throughput": 22307083.074908264,
+    "total_time": 0.29812783299712464,
+    "throughput": 35172026.357234254,
     "total_bytes": 10485760,
-    "latency_avg": 0.15281784000108017,
-    "latency_min": 0.08204669000406284,
-    "latency_max": 0.20194428299873834
+    "latency_avg": 0.10857549170177663,
+    "latency_min": 0.027647542010527104,
+    "latency_max": 0.1454534579970641
   },
   {
     "label": "Rust-smol cast5/comp",
@@ -734,12 +734,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5174331979942508,
-    "throughput": 20264954.08614371,
+    "total_time": 0.3048369169991929,
+    "throughput": 34397933.50235123,
     "total_bytes": 10485760,
-    "latency_avg": 0.24680756340021617,
-    "latency_min": 0.23758959800034063,
-    "latency_max": 0.2572262059984496
+    "latency_avg": 0.1572527665979578,
+    "latency_min": 0.14996162500756327,
+    "latency_max": 0.1681315409950912
   },
   {
     "label": "Go cast5/comp",
@@ -748,12 +748,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6513360219978495,
-    "throughput": 16098848.590988295,
+    "total_time": 0.3719127920048777,
+    "throughput": 28194136.435787015,
     "total_bytes": 10485760,
-    "latency_avg": 0.3087267599978077,
-    "latency_min": 0.18949163099750876,
-    "latency_max": 0.37851080799737247
+    "latency_avg": 0.18645670819969382,
+    "latency_min": 0.09959729200636502,
+    "latency_max": 0.2288288330018986
   },
   {
     "label": "Rust-tokio 3des/no-comp",
@@ -762,12 +762,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.8620192269954714,
-    "throughput": 12164183.4330629,
+    "total_time": 0.996910707995994,
+    "throughput": 10518253.957848085,
     "total_bytes": 10485760,
-    "latency_avg": 0.4235706105988356,
-    "latency_min": 0.17864145399653353,
-    "latency_max": 0.5904314989966224
+    "latency_avg": 0.7236775333003607,
+    "latency_min": 0.5671858750138199,
+    "latency_max": 0.8862527919991408
   },
   {
     "label": "Rust-smol 3des/no-comp",
@@ -776,12 +776,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.8539595469992491,
-    "throughput": 12278989.135780714,
+    "total_time": 0.8177418330014916,
+    "throughput": 12822824.486687198,
     "total_bytes": 10485760,
-    "latency_avg": 0.5435007686981408,
-    "latency_min": 0.476665875998151,
-    "latency_max": 0.5934517749992665
+    "latency_avg": 0.6832409748982172,
+    "latency_min": 0.6653658330033068,
+    "latency_max": 0.7148039169987896
   },
   {
     "label": "Go 3des/no-comp",
@@ -790,12 +790,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.9868599340043147,
-    "throughput": 10625378.170388013,
+    "total_time": 0.7966329590126406,
+    "throughput": 13162598.761914413,
     "total_bytes": 10485760,
-    "latency_avg": 0.6374063188988657,
-    "latency_min": 0.40717896100250073,
-    "latency_max": 0.7261963759956416
+    "latency_avg": 0.5423216914990917,
+    "latency_min": 0.39741837499605026,
+    "latency_max": 0.649925624995376
   },
   {
     "label": "Rust-tokio 3des/comp",
@@ -804,12 +804,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.8108204360032687,
-    "throughput": 12932283.813277898,
+    "total_time": 0.9647811250033556,
+    "throughput": 10868537.669581305,
     "total_bytes": 10485760,
-    "latency_avg": 0.4309170429012738,
-    "latency_min": 0.14714492700295523,
-    "latency_max": 0.5439639350006473
+    "latency_avg": 0.6706898998032557,
+    "latency_min": 0.5095670419977978,
+    "latency_max": 0.7938792909990298
   },
   {
     "label": "Rust-smol 3des/comp",
@@ -818,12 +818,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 1.2785565199956181,
-    "throughput": 8201248.701962692,
+    "total_time": 1.2042237500136252,
+    "throughput": 8707484.800795,
     "total_bytes": 10485760,
-    "latency_avg": 0.8934084686014103,
-    "latency_min": 0.8468440200012992,
-    "latency_max": 0.9584108350027236
+    "latency_avg": 0.9810960251023062,
+    "latency_min": 0.9311952499992913,
+    "latency_max": 1.0845693340088474
   },
   {
     "label": "Go 3des/comp",
@@ -832,12 +832,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 1.0470196990063414,
-    "throughput": 10014864.104229707,
+    "total_time": 0.8207520419964567,
+    "throughput": 12775795.201792832,
     "total_bytes": 10485760,
-    "latency_avg": 0.703346571498696,
-    "latency_min": 0.633462330995826,
-    "latency_max": 0.7521885060050408
+    "latency_avg": 0.6064607333028107,
+    "latency_min": 0.4637716669967631,
+    "latency_max": 0.7597890830074903
   },
   {
     "label": "Rust-tokio tea/no-comp",
@@ -846,12 +846,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.44587598200450884,
-    "throughput": 23517212.012316834,
+    "total_time": 0.2015279159968486,
+    "throughput": 52031302.70132884,
     "total_bytes": 10485760,
-    "latency_avg": 0.11832678990031127,
-    "latency_min": 0.05521174000023166,
-    "latency_max": 0.18237849599972833
+    "latency_avg": 0.08406692500284407,
+    "latency_min": 0.042655333993025124,
+    "latency_max": 0.12814583400904667
   },
   {
     "label": "Rust-smol tea/no-comp",
@@ -860,12 +860,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4608633750031004,
-    "throughput": 22752426.356139623,
+    "total_time": 0.3203350830008276,
+    "throughput": 32733723.39292887,
     "total_bytes": 10485760,
-    "latency_avg": 0.16544372469797963,
-    "latency_min": 0.0800082849964383,
-    "latency_max": 0.19599514600122347
+    "latency_avg": 0.11801555419660872,
+    "latency_min": 0.08575674999156035,
+    "latency_max": 0.14639375000842847
   },
   {
     "label": "Go tea/no-comp",
@@ -874,12 +874,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.7126106750001782,
-    "throughput": 14714570.477066427,
+    "total_time": 0.2827748330018949,
+    "throughput": 37081659.2434509,
     "total_bytes": 10485760,
-    "latency_avg": 0.10649805619977996,
-    "latency_min": 0.03527090799616417,
-    "latency_max": 0.1588405980000971
+    "latency_avg": 0.13087823749374367,
+    "latency_min": 0.0762691249983618,
+    "latency_max": 0.16236637499241624
   },
   {
     "label": "Rust-tokio tea/comp",
@@ -888,12 +888,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5335871189963655,
-    "throughput": 19651448.89502369,
+    "total_time": 0.24610212500556372,
+    "throughput": 42607352.53611867,
     "total_bytes": 10485760,
-    "latency_avg": 0.07882411549944664,
-    "latency_min": 0.02692612199462019,
-    "latency_max": 0.13281055600236868
+    "latency_avg": 0.10366067090217257,
+    "latency_min": 0.0434124590101419,
+    "latency_max": 0.15860516698739957
   },
   {
     "label": "Rust-smol tea/comp",
@@ -902,12 +902,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.54786759900162,
-    "throughput": 19139222.722986754,
+    "total_time": 0.3362943749962142,
+    "throughput": 31180301.48472761,
     "total_bytes": 10485760,
-    "latency_avg": 0.22409804970011465,
-    "latency_min": 0.11486450800293824,
-    "latency_max": 0.2560679509988404
+    "latency_avg": 0.14380489170143845,
+    "latency_min": 0.12890608300222084,
+    "latency_max": 0.15431470899784472
   },
   {
     "label": "Go tea/comp",
@@ -916,12 +916,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4734183960026712,
-    "throughput": 22149033.68465816,
+    "total_time": 0.6430226660013432,
+    "throughput": 16306983.492830869,
     "total_bytes": 10485760,
-    "latency_avg": 0.14988790739880642,
-    "latency_min": 0.043590585999481846,
-    "latency_max": 0.18532483999297256
+    "latency_avg": 0.4383100667997496,
+    "latency_min": 0.3517410829954315,
+    "latency_max": 0.5085797499923501
   },
   {
     "label": "Rust-tokio xtea/no-comp",
@@ -930,12 +930,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.4896069649985293,
-    "throughput": 21416688.792471524,
+    "total_time": 0.37114687499706633,
+    "throughput": 28252319.247152176,
     "total_bytes": 10485760,
-    "latency_avg": 0.170669267600897,
-    "latency_min": 0.08957437999924878,
-    "latency_max": 0.226370529999258
+    "latency_avg": 0.19684413739887532,
+    "latency_min": 0.11317112499091309,
+    "latency_max": 0.24267858400708064
   },
   {
     "label": "Rust-smol xtea/no-comp",
@@ -944,12 +944,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5730876770030591,
-    "throughput": 18296955.982084446,
+    "total_time": 0.5511548340000445,
+    "throughput": 19025071.27425313,
     "total_bytes": 10485760,
-    "latency_avg": 0.27478813899942905,
-    "latency_min": 0.18717903600190766,
-    "latency_max": 0.3084804579993943
+    "latency_avg": 0.2799058042015531,
+    "latency_min": 0.2405181670037564,
+    "latency_max": 0.3592690829973435
   },
   {
     "label": "Go xtea/no-comp",
@@ -958,12 +958,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6796460300029139,
-    "throughput": 15428266.387364969,
+    "total_time": 0.5843198749935254,
+    "throughput": 17945239.32651818,
     "total_bytes": 10485760,
-    "latency_avg": 0.36519588149822085,
-    "latency_min": 0.27169943299668375,
-    "latency_max": 0.40532575699762674
+    "latency_avg": 0.37117624570091723,
+    "latency_min": 0.24610837500949856,
+    "latency_max": 0.43927129200892523
   },
   {
     "label": "Rust-tokio xtea/comp",
@@ -972,12 +972,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5191896189935505,
-    "throughput": 20196397.648178432,
+    "total_time": 0.4411822500114795,
+    "throughput": 23767411.312960036,
     "total_bytes": 10485760,
-    "latency_avg": 0.18546840590133798,
-    "latency_min": 0.0955540770009975,
-    "latency_max": 0.26202931300213095
+    "latency_avg": 0.19345086660032393,
+    "latency_min": 0.10848799999803305,
+    "latency_max": 0.24546545799239539
   },
   {
     "label": "Rust-smol xtea/comp",
@@ -986,12 +986,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.7661948169989046,
-    "throughput": 13685501.085835448,
+    "total_time": 0.653222499997355,
+    "throughput": 16052355.820631497,
     "total_bytes": 10485760,
-    "latency_avg": 0.4295712495004409,
-    "latency_min": 0.3577173390003736,
-    "latency_max": 0.4535948770062532
+    "latency_avg": 0.4860235499014379,
+    "latency_min": 0.46927299999515526,
+    "latency_max": 0.49675012499210425
   },
   {
     "label": "Go xtea/comp",
@@ -1000,12 +1000,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 1.3139091870034463,
-    "throughput": 7980581.994341818,
+    "total_time": 0.48615637500188313,
+    "throughput": 21568697.93172903,
     "total_bytes": 10485760,
-    "latency_avg": 0.5350443087998429,
-    "latency_min": 0.46558254300180124,
-    "latency_max": 1.01117581899598
+    "latency_avg": 0.3152572124017752,
+    "latency_min": 0.23944741699961014,
+    "latency_max": 0.3687310829991475
   },
   {
     "label": "Rust-tokio sm4/no-comp",
@@ -1014,12 +1014,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.760043123998912,
-    "throughput": 13796269.802205341,
+    "total_time": 0.5741422499995679,
+    "throughput": 18263348.49944921,
     "total_bytes": 10485760,
-    "latency_avg": 0.3623063181999896,
-    "latency_min": 0.1088657090003835,
-    "latency_max": 0.4185927150028874
+    "latency_avg": 0.3237747167018824,
+    "latency_min": 0.1525132500100881,
+    "latency_max": 0.40844025000114925
   },
   {
     "label": "Rust-smol sm4/no-comp",
@@ -1028,12 +1028,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.626767492001818,
-    "throughput": 16729904.045453565,
+    "total_time": 0.5246730829967419,
+    "throughput": 19985321.030972566,
     "total_bytes": 10485760,
-    "latency_avg": 0.33793449079967103,
-    "latency_min": 0.2840712399993208,
-    "latency_max": 0.3679104479961097
+    "latency_avg": 0.35059262919967293,
+    "latency_min": 0.3317624579940457,
+    "latency_max": 0.3720017919986276
   },
   {
     "label": "Go sm4/no-comp",
@@ -1042,12 +1042,12 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 2.540034359000856,
-    "throughput": 4128196.125710938,
+    "total_time": 2.7981882500025677,
+    "throughput": 3747339.014803732,
     "total_bytes": 10485760,
-    "latency_avg": 1.662154239899246,
-    "latency_min": 0.9382267190012499,
-    "latency_max": 2.271080553997308
+    "latency_avg": 1.8704685331016662,
+    "latency_min": 1.341022416992928,
+    "latency_max": 2.671930083000916
   },
   {
     "label": "Rust-tokio sm4/comp",
@@ -1056,12 +1056,12 @@
     "impl": "rust",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.5076394040006562,
-    "throughput": 20655922.1316603,
+    "total_time": 0.6051699999952689,
+    "throughput": 17326965.97663793,
     "total_bytes": 10485760,
-    "latency_avg": 0.17014773839982808,
-    "latency_min": 0.07444724699598737,
-    "latency_max": 0.23975977300142404
+    "latency_avg": 0.4104641750018345,
+    "latency_min": 0.23871150000195485,
+    "latency_max": 0.47814150000340305
   },
   {
     "label": "Rust-smol sm4/comp",
@@ -1070,12 +1070,12 @@
     "impl": "smol",
     "ok": 10,
     "fail": 0,
-    "total_time": 0.6251605860015843,
-    "throughput": 16772906.409639565,
+    "total_time": 0.678249708013027,
+    "throughput": 15460028.771289352,
     "total_bytes": 10485760,
-    "latency_avg": 0.354554407899559,
-    "latency_min": 0.3303837100029341,
-    "latency_max": 0.36507924999750685
+    "latency_avg": 0.5029467915999704,
+    "latency_min": 0.4936272079939954,
+    "latency_max": 0.5183788750000531
   },
   {
     "label": "Go sm4/comp",
@@ -1084,11 +1084,11 @@
     "impl": "go",
     "ok": 10,
     "fail": 0,
-    "total_time": 3.1997848299943144,
-    "throughput": 3277020.3489022204,
+    "total_time": 2.5077772910008207,
+    "throughput": 4181296.3366516777,
     "total_bytes": 10485760,
-    "latency_avg": 2.333207001700066,
-    "latency_min": 1.8792453679998289,
-    "latency_max": 2.93619717600086
+    "latency_avg": 1.9119157875000383,
+    "latency_min": 1.4768684580049012,
+    "latency_max": 2.3606529999960912
   }
 ]

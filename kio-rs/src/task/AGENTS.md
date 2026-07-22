@@ -1,35 +1,51 @@
 <!-- Parent: ../../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # task
 
 ## Purpose
 
-Task spawning and blocking offload: `spawn_task`, `block_on`, `cpu_block`, `JoinHandle`. Critical for moving Snappy/crypto off the async reactor.
+Task spawning and CPU offload: `spawn_task`, `cpu_block`, `block_on`, `JoinHandle`. Critical for flush-path crypto/snappy offload.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `mod.rs` | Public API surface |
-| `tokio.rs` | `tokio::spawn` / `spawn_blocking` path |
-| `smol.rs` | smol executor + **persistent** blocking thread pool for `cpu_block` |
+| `mod.rs` | API surface + JoinHandle semantics notes |
+| `tokio.rs` | `tokio::spawn` / `spawn_blocking` style offload |
+| `smol.rs` | Global executor + blocking pool; JoinHandle detaches on drop |
+
+## Subdirectories
+
+None.
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- **smol `cpu_block` must stay a long-lived pool** — do not regress to `smol::unblock` (thread churn under 10–100 ms flush cadence).
-- Pool sizing: ~CPU count clamped [2, 8] (see current smol.rs).
-- `spawn_task` return type is `JoinHandle` — keep abort/detach semantics consistent across backends where possible.
+- Dropping `JoinHandle` must **not** cancel work (smol detaches explicitly).
+- `cpu_block` is the shared offload path — binaries and CryptoBuf policy call into it; keep behavior stable.
+- Avoid nested parallel encrypt inside already-offloaded work without measuring.
 
 ### Testing Requirements
 
-`make test-both`; stress tests exercise `cpu_block` heavily.
+- kio tests; stress/e2e for offload correctness under load
+
+### Common Patterns
+
+```rust
+kio::spawn_task(async move { ... });
+let out = kio::cpu_block(|| heavy()).await;
+```
 
 ## Dependencies
 
+### Internal
+
+- Parent `kio`
+
 ### External
-tokio **or** smol + async-executor + crossbeam-channel (pool impl)
+
+- tokio or smol/`async-executor`/`num_cpus`/`event-listener`
 
 <!-- MANUAL: -->

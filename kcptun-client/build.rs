@@ -14,8 +14,6 @@ fn main() {
     }
 
     if !tokio_enabled && !smol_enabled {
-        panic!(
-            "\n[CRITICAL ERROR] Missing dependency: enable either `tokio` or `smol` feature!\n"
-        );
+        panic!("\n[CRITICAL ERROR] Missing dependency: enable either `tokio` or `smol` feature!\n");
     }
 }

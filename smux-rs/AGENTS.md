@@ -1,53 +1,58 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-20 | Updated: 2026-07-20 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
 
 # smux-rs
 
 ## Purpose
 
-SMUX stream multiplexer (port of Go `xtaci/smux`). Multiple logical streams over one underlying async transport (typically KCP+Snappy). Supports protocol v1 and v2 (window update frames). Runtime-agnostic via `kio-rs` features (`tokio` default / `smol`).
+SMUX stream multiplexer over a single async transport (typically KCP+Snappy). Rust port of Go `xtaci/smux` used by kcptun. Supports v1/v2 framing, keepalive pings, and many logical streams per session.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Features: `default=["tokio"]`, `tokio`, `smol`; depends on `kio-rs` with `default-features=false` |
-| `src/lib.rs` | Re-exports `Frame`, `Session`, `Stream`, `Config` |
-| `src/frame.rs` | 8-byte header codec; `Cmd::{Syn,Fin,Psh,Nop,Upd}` |
-| `src/session.rs` | `Session` multiplexer, keepalive, stream open/accept, flow control |
-| `src/stream.rs` | `Stream` logical channel (AsyncRead/AsyncWrite via kio) |
+| `Cargo.toml` | Features `tokio` (default) / `smol` via `kio-rs`; deps `bytes`, `log`, `parking_lot` |
+| `build.rs` | Runtime feature glue if present |
+| `src/lib.rs` | Public re-exports: `Session`, `Stream`, `Frame`, `Config`, … |
+| `src/frame.rs` | 8B header codec; `Cmd`, `Frame`, `FrameCodec`; `FRAME_HEADER_SIZE=8`, `MAX_FRAME_SIZE` |
+| `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive |
+| `src/stream.rs` | Logical `Stream` (AsyncRead/AsyncWrite via session), window / state |
 
 ## Subdirectories
 
-None.
+None (flat `src/`).
 
 ## For AI Agents
 
 ### Working In This Directory
 
-- Wire header: `ver(1)|cmd(1)|length(2 LE)|stream_id(4 LE)` = 8 bytes. Max payload `MAX_FRAME_SIZE = 60000`.
-- Commands must match Go: SYN=0, FIN=1, PSH=2, NOP=3, UPD=4.
-- Feature flags must stay aligned with `kio-rs` / binaries: enable exactly one of tokio/smol.
-- Stream I/O uses `kio::AsyncRead` / `AsyncWrite` — different traits under each feature; do not import tokio/futures-lite directly in public APIs.
-- Keepalive via periodic NOP frames; v2 uses UPD for window updates.
+- Frame layout: `ver(1)|cmd(1)|length(2 LE)|stream_id(4 LE)` + payload.
+- Features must match the binary: `tokio` XOR `smol` through `kio-rs`.
+- Session owns stream map and read loop; streams are half-close aware.
+- Keepalive via periodic ping frames — do not break idle timeout semantics expected by binaries.
+- Compression is **not** in this crate; binaries wrap transport with Snappy before/after SMUX.
 
 ### Testing Requirements
 
-- Crate tests + e2e with `--smuxver 1` and `2`
-- Stress tests exercise many concurrent streams
+- Crate/unit tests if present
+- Interop: `bash test_e2e.sh` with smuxver matrix after frame/session changes
+- Stress: `make stress` exercises many concurrent streams
 
 ### Common Patterns
 
-- `Session` wraps an async transport; `open_stream` / `accept_stream`
-- `Config` / `DEFAULT_CONFIG` for version, buffers, keepalive
-- Binaries wrap `Stream` in `SmuxStreamAsync` / `SmuxStreamIo` + optional `QPPPort`
+```rust
+use smux_rs::{Config, Session, DEFAULT_CONFIG};
+// Session over async transport from kio
+```
 
 ## Dependencies
 
 ### Internal
-- `kio-rs` (async primitives)
+
+- `kio-rs` — AsyncRead/AsyncWrite, runtime features
 
 ### External
+
 - `bytes`, `log`, `parking_lot`
 
 <!-- MANUAL: -->

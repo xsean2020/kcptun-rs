@@ -29,14 +29,14 @@ use std::time::Duration;
 use anyhow::{Context as AnyContext, Result};
 use bytes::{Buf, BytesMut};
 use clap::Parser;
-use log::{debug, error, info, warn};
-use serde::Deserialize;
 #[cfg(feature = "tokio")]
 use kio::ReadBuf;
 use kio::{self, AsyncRead, AsyncWrite};
+use log::{debug, error, info, warn};
+use serde::Deserialize;
 
-use kcp_rs::FecDecoder;
 use kcp_rs::KCP;
+use kcp_rs::{fec_kcp_from_recovered, FecDecoder, FecEncoder};
 use kcrypt_rs::crypt as kcp_crypt;
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
@@ -514,7 +514,10 @@ struct SmuxStreamIo {
 
 impl SmuxStreamIo {
     fn new(stream: Arc<smux_rs::stream::Stream>, flush_notify: Arc<kio::Notify>) -> Self {
-        SmuxStreamIo { stream, flush_notify }
+        SmuxStreamIo {
+            stream,
+            flush_notify,
+        }
     }
 }
 
@@ -578,7 +581,7 @@ impl AsyncWrite for SmuxStreamIo {
                 // and sends through KCP without waiting for the timer.
                 this.flush_notify.notify_one();
                 Poll::Ready(Ok(n))
-            },
+            }
             Err(_) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "SMUX stream write error",
@@ -939,14 +942,11 @@ async fn handle_stream(
         pipe(&mut tcp_pin, &mut smux_pin, effective_close_wait).await
     };
 
-    // Ensure the SMUX stream is properly closed regardless of pipe outcome.
-    // This is critical: when the pipe times out, poll_shutdown is NOT called
-    // by copy_bidirectional, so we must explicitly mark the stream as closed
-    // to allow the flush loop's cleanup (Phase 1a) to remove it.
+    // Local half-close only. Do NOT mark_fin_sent here — that made flush skip
+    // encoding FIN (same class of leak as client; see BUGREPORT_PROXY_MEMORY_GROWTH).
+    // Flush encodes FIN then marks fin_sent after kcp.send success; linger reaps zombies.
     smux_stream.mark_local_closed();
-    if !smux_stream.is_fin_sent() {
-        smux_stream.mark_fin_sent();
-    }
+    smux_stream.clear_buffers();
 
     match pipe_result {
         Ok((a, b)) => {
@@ -1011,6 +1011,8 @@ struct KcpServerSession {
     ack_nodelay: bool,
     /// Optional FEC decoder for Reed-Solomon error correction recovery.
     fec_decoder: Option<parking_lot::Mutex<FecDecoder>>,
+    /// Optional FEC encoder (Go fecEncoder).
+    fec_encoder: Option<Arc<parking_lot::Mutex<FecEncoder>>>,
     /// Persistent Snappy framing compressor. Uses snap's FrameEncoder
     /// (CRC32C/Castagnoli) matching Go's golang/snappy for interop.
     compressor: Option<Arc<parking_lot::Mutex<snap::write::FrameEncoder<Vec<u8>>>>>,
@@ -1055,8 +1057,7 @@ impl KcpServerSession {
         let crypt_state: Arc<dyn kcrypt_rs::BlockCrypt> = Arc::new(engine);
 
         let aead: Option<Arc<dyn kcrypt_rs::AeadCrypt>> =
-            kcp_crypt::select_aead_crypt(crypt_method, &key[..])
-                .map(|a| Arc::from(a));
+            kcp_crypt::select_aead_crypt(crypt_method, &key[..]).map(|a| Arc::from(a));
         let has_aead = aead.is_some();
         let _has_encryption = crypt_method != "null" && !has_aead;
 
@@ -1081,9 +1082,6 @@ impl KcpServerSession {
         kcp.set_mtu(mtu);
         kcp.set_snd_wnd(sndwnd);
         kcp.set_rcv_wnd(rcvwnd);
-        if datashard > 0 || parityshard > 0 {
-            kcp.set_fec(datashard, parityshard);
-        }
         kcp.set_stream_mode(true);
 
         // Apply mode profile or explicit parameters
@@ -1118,11 +1116,16 @@ impl KcpServerSession {
 
         let handled_streams = Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
-        // Create FEC decoder if FEC parameters are set
-        let fec_decoder = if datashard > 0 && parityshard > 0 {
-            FecDecoder::new(datashard as usize, parityshard as usize).map(parking_lot::Mutex::new)
+        // Session-layer FEC (matching Go newUDPSession).
+        let (fec_decoder, fec_encoder) = if datashard > 0 && parityshard > 0 {
+            (
+                FecDecoder::new(datashard as usize, parityshard as usize)
+                    .map(parking_lot::Mutex::new),
+                FecEncoder::new(datashard as usize, parityshard as usize, 0)
+                    .map(|e| Arc::new(parking_lot::Mutex::new(e))),
+            )
         } else {
-            None
+            (None, None)
         };
 
         let mut session = KcpServerSession {
@@ -1144,6 +1147,7 @@ impl KcpServerSession {
             has_encryption,
             ack_nodelay: acknodelay,
             fec_decoder,
+            fec_encoder,
             compressor: if nocomp {
                 None
             } else {
@@ -1181,6 +1185,7 @@ impl KcpServerSession {
         let handled_streams = self.handled_streams.clone();
         let crypto_buf = self.crypto_buf.clone();
         let flush_notify = self.flush_notify.clone();
+        let fec_encoder = self.fec_encoder.clone();
 
         let h = kio::spawn_task(async move {
             let mut next_update: u64 = KCP_UPDATE_INTERVAL_MS;
@@ -1191,11 +1196,8 @@ impl KcpServerSession {
                 // Wait for either the dynamic interval (nearest RTO or
                 // default) or an immediate notify from SMUX stream writes.
                 // notify_one() stores a permit, so there's no lost-wakeup.
-                let _ = kio::timeout(
-                    Duration::from_millis(next_update),
-                    flush_notify.notified(),
-                )
-                .await;
+                let _ =
+                    kio::timeout(Duration::from_millis(next_update), flush_notify.notified()).await;
 
                 // ── Phase 1: Drain SMUX + encode frames into out_buf (NO KCP lock) ──
                 // Header reserved, payload drained in place, length patched (P0.3).
@@ -1220,10 +1222,7 @@ impl KcpServerSession {
                                 *id,
                                 0,
                             );
-                            let n = s.drain_send_max(
-                                &mut out_buf,
-                                smux_rs::frame::MAX_FRAME_SIZE,
-                            );
+                            let n = s.drain_send_max(&mut out_buf, smux_rs::frame::MAX_FRAME_SIZE);
                             if n == 0 {
                                 out_buf.truncate(header_pos);
                                 break;
@@ -1237,47 +1236,51 @@ impl KcpServerSession {
                         }
                     }
 
-                    // Collect streams that need FIN frames:
-                    // - local_closed = true (we called poll_shutdown)
-                    // - pending_send == 0 (all data already drained)
-                    // - fin_sent == false (haven't sent FIN yet)
-                    // Note: do NOT check is_remote_closed() — we must send FIN
-                    // even if the remote already closed, to properly signal
-                    // half-close to the peer.
+                    // Collect streams that need FIN frames (do NOT mark_fin_sent yet —
+                    // that blocked cleanup in the handle path; mark only after kcp.send
+                    // succeeds, matching the "can't lose FIN" invariant from BUGREPORT.md).
                     let fin_streams: Vec<u32> = stream_map
                         .iter()
                         .filter(|(_, s)| {
                             s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent()
                         })
-                        .map(|(id, s)| {
-                            s.mark_fin_sent();
-                            *id
-                        })
+                        .map(|(id, _)| *id)
                         .collect();
                     fin_streams
                 };
 
-                // ── Phase 1a: Clean up fully closed streams (prevent FD leak) ──
+                // ── Phase 1a: Clean up closed / stale streams ──
+                // Stale = local_closed past linger without peer FIN (proxy short-connect).
+                // Also clean up handled_streams to prevent unbounded growth.
+                const STREAM_LINGER_SECS: u64 = 30;
                 {
                     let streams = smux.streams();
                     let mut stream_map = streams.lock();
+                    let linger = std::time::Duration::from_secs(STREAM_LINGER_SECS);
                     let to_remove: Vec<u32> = stream_map
                         .iter()
                         .filter(|(_, s)| {
-                            s.is_local_closed() && s.is_remote_closed() && s.is_fin_sent()
+                            if s.is_local_closed() && s.is_remote_closed() && s.is_fin_sent() {
+                                return true;
+                            }
+                            if s.is_local_closed() && s.pending_send() == 0 {
+                                if let Some(e) = s.local_closed_elapsed() {
+                                    return e >= linger;
+                                }
+                            }
+                            false
                         })
                         .map(|(id, _)| *id)
                         .collect();
                     for id in &to_remove {
-                        stream_map.remove(id);
+                        if let Some(s) = stream_map.remove(id) {
+                            s.close();
+                        }
+                        let mut handled = handled_streams.lock();
+                        handled.remove(id);
                     }
                     if !to_remove.is_empty() {
-                        debug!("SMUX: cleaned up {} closed streams", to_remove.len());
-                        // Also clean up handled_streams to prevent unbounded growth
-                        let mut handled = handled_streams.lock();
-                        for id in &to_remove {
-                            handled.remove(id);
-                        }
+                        debug!("SMUX: reaped {} closed/stale streams", to_remove.len());
                     }
                     drop(stream_map);
                 }
@@ -1309,19 +1312,37 @@ impl KcpServerSession {
                 }
 
                 // ── Phase 3: Snappy compress (NO KCP lock held) ──
+                // Large flushes → cpu_block; small stay inline (same threshold as client).
                 let send_data = if out_buf.is_empty() {
                     None
-                } else {
-                    let to_send = if !_nocomp {
-                        // Use persistent FrameEncoder (CRC32C/Castagnoli) matching Go's golang/snappy
-                        use std::io::Write;
-                        let mut enc = compressor.as_ref().map(|c| c.lock()).unwrap();
-                        enc.write_all(&out_buf).ok();
-                        enc.flush().ok();
-                        std::mem::take(enc.get_mut())
-                    } else {
-                        out_buf.split().to_vec()
+                } else if !_nocomp {
+                    use std::io::Write;
+                    let plain = out_buf.split().to_vec();
+                    let plain_len = plain.len();
+                    let compress_fn = {
+                        let compressor = compressor.clone();
+                        move || {
+                            let mut enc = compressor.as_ref().map(|c| c.lock()).unwrap();
+                            enc.write_all(&plain).ok();
+                            enc.flush().ok();
+                            std::mem::take(enc.get_mut())
+                        }
                     };
+                    let to_send = if kcp_rs::should_cpu_block_compress(plain_len)
+                        && !has_encryption
+                        && !has_aead
+                    {
+                        kio::cpu_block(compress_fn).await
+                    } else {
+                        compress_fn()
+                    };
+                    if to_send.is_empty() {
+                        None
+                    } else {
+                        Some(to_send)
+                    }
+                } else {
+                    let to_send = out_buf.split().to_vec();
                     if to_send.is_empty() {
                         None
                     } else {
@@ -1343,6 +1364,7 @@ impl KcpServerSession {
                             .max(mss);
                         let mut offset = 0;
                         let mut total_sent = 0usize;
+                        let mut send_ok = true;
                         while offset < data.len() {
                             let end = (offset + max_chunk).min(data.len());
                             if let Err(e) = kcp_guard.send(&data[offset..end]) {
@@ -1352,10 +1374,21 @@ impl KcpServerSession {
                                     data.len(),
                                     e
                                 );
+                                send_ok = false;
                                 break;
                             }
                             total_sent += end - offset;
                             offset = end;
+                        }
+                        // Mark FIN sent only after the entire batch was queued.
+                        if send_ok && !fin_streams.is_empty() {
+                            let streams = smux.streams();
+                            let stream_map = streams.lock();
+                            for id in &fin_streams {
+                                if let Some(s) = stream_map.get(id) {
+                                    s.mark_fin_sent();
+                                }
+                            }
                         }
                         // Only log when there's backpressure
                         let ws = kcp_guard.wait_send();
@@ -1389,9 +1422,17 @@ impl KcpServerSession {
                 // amortized (P0.2). Small batches encrypt inline on this task.
                 let packets: Vec<bytes::Bytes> = std::mem::take(&mut *raw_packets.lock());
                 if packets.is_empty() {
-                    kcp_rs::DEFAULT_SNMP.empty_flush.fetch_add(1, Ordering::Relaxed);
+                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.empty_flush, 1);
                 }
                 if !packets.is_empty() {
+                    // FEC encode (Go postProcess: KCP → FEC → encrypt → UDP).
+                    let packets: Vec<bytes::Bytes> = if let Some(ref enc) = fec_encoder {
+                        let mut e = enc.lock();
+                        kcp_rs::fec_expand_packets(&mut e, &packets, 500)
+                    } else {
+                        packets
+                    };
+
                     let total_bytes: usize = packets.iter().map(|p| p.len()).sum();
                     let use_cpu_block = kcp_rs::should_cpu_block_encrypt(
                         has_encryption,
@@ -1403,6 +1444,10 @@ impl KcpServerSession {
                     let crypt_sb = crypt.clone();
                     let crypto_buf_sb = crypto_buf.clone();
                     let aead_sb = aead.clone();
+                    // When offloaded to cpu_block, disable nested thread::scope
+                    // parallel encrypt (already on a pool worker). Inline path
+                    // may still parallelize large CFB batches (P1.1).
+                    let allow_parallel = !use_cpu_block;
                     let encrypt_fn = move || {
                         kcp_rs::encrypt_batch(
                             packets,
@@ -1410,6 +1455,7 @@ impl KcpServerSession {
                             &crypto_buf_sb,
                             aead_sb.as_deref(),
                             has_encryption,
+                            allow_parallel,
                         )
                     };
 
@@ -1419,8 +1465,16 @@ impl KcpServerSession {
                         encrypt_fn()
                     };
 
-                    if let Err(e) = udp.send_batch_to(&encrypted, peer).await {
-                        warn!("UDP send_to error ({}): {}", peer, e);
+                    match udp.send_batch_to(&encrypted, peer).await {
+                        Ok(()) => {
+                            let nbytes: u64 = encrypted.iter().map(|b| b.len() as u64).sum();
+                            kcp_rs::snmp_add(
+                                &kcp_rs::DEFAULT_SNMP.out_pkts,
+                                encrypted.len() as u64,
+                            );
+                            kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.out_bytes, nbytes);
+                        }
+                        Err(e) => warn!("UDP send_to error ({}): {}", peer, e),
                     }
                 }
 
@@ -1430,9 +1484,9 @@ impl KcpServerSession {
                 {
                     let streams = smux.streams();
                     let stream_map = streams.lock();
-                    let still_pending = stream_map.values().any(|s| {
-                        s.pending_send() > 0 && s.peer_send_window() > 0
-                    });
+                    let still_pending = stream_map
+                        .values()
+                        .any(|s| s.pending_send() > 0 && s.peer_send_window() > 0);
                     drop(stream_map);
                     if still_pending {
                         next_update = 1;
@@ -1449,11 +1503,11 @@ impl KcpServerSession {
     /// This is the core data path:
     /// 1. Decrypt the payload using the block cipher
     /// 2. Verify CRC32 checksum (matching Go kcp-go v5 behavior)
-    /// 3. Strip the 20-byte crypto header [nonce 16B][CRC32 4B]
+    /// 3. Strip the 20-byte crypto header [nonce 16B][CRC32 4B] via slice
     /// 4. Detect and handle FEC header (if present) — feed through FecDecoder
     ///    for erasure recovery
     /// 5. Feed the KCP segment to the KCP state machine
-    /// 6. Extract all reassembled user messages via KCP recv
+    /// 6. Extract reassembled user messages via KCP recv → SMUX
     ///
     /// Go kcp-go v5 wire format:
     ///   No FEC:  [nonce 16B][CRC32 4B][KCP segment 24+ bytes]
@@ -1461,172 +1515,89 @@ impl KcpServerSession {
     ///
     /// FEC types (matching Go): 0x00f1 = data, 0x00f2 = parity, 0x00f3 = OOB
     ///
-    /// We distinguish header-wrapped packets from raw KCP segments by
-    /// checking byte 4. KCP command bytes are 0x51-0x54. If byte 4 is
-    /// NOT a valid KCP command, it carries the Go kcp-go v5 header.
-    fn feed_data(&self, data: &[u8]) -> Vec<Vec<u8>> {
-        // Step 1: Decrypt/authenticate data
-        let feed_slice: Vec<u8> = if let Some(ref aead) = self.aead {
-            // AEAD path: [nonce 12B][ciphertext+tag 16B] — open decrypts+verifies
+    /// CFB header probe: if byte 4 is a KCP cmd (0x51–0x54), treat as raw
+    /// (no crypto header) — server historical/compat path via
+    /// `decrypt_cfb_in_place(..., probe_header=true)`.
+    ///
+    /// `data` is the unique mutable receive buffer for this datagram; CFB
+    /// decrypts in place. The body slice is only used for synchronous
+    /// `KCP::input` before the next recv overwrites the buffer.
+    fn feed_data_mut(&self, data: &mut [u8]) {
+        // AEAD open still allocates; CFB/null use `data` in place.
+        // Branch then call feed_body so lifetimes stay simple.
+        if let Some(ref aead) = self.aead {
             match aead.open(data) {
-                Ok(plain) => plain,
-                Err(_) => return Vec::new(),
-            }
-        } else if self.has_encryption {
-            let mut dec_data = data.to_vec();
-            // CFB path: decrypt in-place, then strip [nonce 16B][CRC32 4B] header
-            self.crypt.decrypt(&mut dec_data);
-            const CRYPT_HEADER: usize = 20;
-            const NONCE_SIZE: usize = 16;
-
-            if dec_data.len() > CRYPT_HEADER {
-                let cmd = dec_data[4];
-                let has_header = cmd != 0x51 && cmd != 0x52 && cmd != 0x53 && cmd != 0x54;
-                if has_header {
-                    let stored_crc =
-                        u32::from_le_bytes(dec_data[NONCE_SIZE..CRYPT_HEADER].try_into().unwrap());
-                    let computed_crc = crc32fast::hash(&dec_data[CRYPT_HEADER..]);
-                    if stored_crc != computed_crc {
-                        return Vec::new();
-                    }
-                    // Drop header in place (one allocation already owned by dec_data).
-                    dec_data.drain(..CRYPT_HEADER);
-                    dec_data
-                } else {
-                    dec_data
+                Ok(plain) => self.feed_body(&plain),
+                Err(_) => {
+                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
                 }
-            } else {
-                dec_data
             }
-        } else {
-            // null cipher: no crypto header, raw data (may include FEC header)
-            data.to_vec()
-        };
+            return;
+        }
+        if self.has_encryption {
+            match kcp_rs::decrypt_cfb_in_place(data, self.crypt.as_ref(), true) {
+                Ok(body) => self.feed_body(body),
+                Err(_) => {
+                    kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
+                }
+            }
+            return;
+        }
+        // null cipher: no crypto header
+        self.feed_body(kcp_rs::inbound_null(data));
+    }
 
-        // Step 3: Handle FEC if decoder is present, then feed to KCP.
-        // Feed incoming FEC packets to the FecDecoder for erasure recovery,
-        // then feed the KCP segments (from data packets and recovered data)
-        // to the KCP state machine.
-        let mut all_results = Vec::new();
+    /// FEC + KCP input + SMUX for an already-decrypted body slice.
+    fn feed_body(&self, body: &[u8]) {
+        // FEC decode may allocate recovered shards; data-path KCP input uses
+        // slices only (no intermediate to_vec for feed_slice[FEC_HDR..]).
         if let Some(ref fec) = self.fec_decoder {
             const FEC_HDR: usize = 8; // fecHeaderSizePlus2
-            let mut fec_dec = fec.lock();
-
-            // Feed data and parity packets to FEC decoder for recovery
-            let recovered = if feed_slice.len() >= FEC_HDR {
-                fec_dec.decode(&feed_slice)
-            } else {
-                Vec::new()
+            let recovered = {
+                let mut fec_dec = fec.lock();
+                if body.len() >= FEC_HDR {
+                    fec_dec.decode(body)
+                } else {
+                    Vec::new()
+                }
             };
 
-            // Prepare KCP input data: always feed data packets directly;
-            // also feed any recovered packets.
-            if feed_slice.len() >= FEC_HDR + 24 {
-                let fec_type = u16::from_le_bytes(feed_slice[4..6].try_into().unwrap());
-                let mut kcp_inputs: Vec<Vec<u8>> = Vec::with_capacity(1 + recovered.len());
+            if body.len() >= FEC_HDR + 24 {
+                let fec_type = u16::from_le_bytes(body[4..6].try_into().unwrap());
                 match fec_type {
                     0x00f1 => {
-                        // FEC data packet: feed KCP data directly
-                        kcp_inputs.push(feed_slice[FEC_HDR..].to_vec());
-                        // Also add recovered data (strip FEC header)
+                        self.kcp_input_and_smux(&body[FEC_HDR..]);
+                        // recovered = [SIZE 2][KCP…][RS pad]; Go: Input(r[2:sz])
                         for r in &recovered {
-                            if r.len() > FEC_HDR {
-                                kcp_inputs.push(r[FEC_HDR..].to_vec());
+                            if let Some(kcp) = fec_kcp_from_recovered(r) {
+                                self.kcp_input_and_smux(kcp);
                             }
                         }
                     }
                     0x00f2 => {
-                        // Parity: only feed recovered data to KCP
                         for r in &recovered {
-                            if r.len() > FEC_HDR {
-                                kcp_inputs.push(r[FEC_HDR..].to_vec());
+                            if let Some(kcp) = fec_kcp_from_recovered(r) {
+                                self.kcp_input_and_smux(kcp);
                             }
                         }
                     }
                     0x00f3 => {
-                        // OOB (Out-of-Band): log at trace level, pass to OOB handler
-                        log::trace!("OOB packet received: {} bytes", feed_slice.len());
-                        // Feed any recovered data from OOB packets
+                        log::trace!("OOB packet received: {} bytes", body.len());
                         for r in &recovered {
-                            if r.len() > FEC_HDR {
-                                kcp_inputs.push(r[FEC_HDR..].to_vec());
+                            if let Some(kcp) = fec_kcp_from_recovered(r) {
+                                self.kcp_input_and_smux(kcp);
                             }
                         }
                     }
                     _ => {
-                        kcp_inputs.push(feed_slice.to_vec());
-                    }
-                }
-                // Feed raw KCP segments to KCP input (NO decompression here).
-                // Compression wraps the SMUX session data, which is sent via KCP.
-                // KCP fragments the compressed data into segments; individual
-                // segments are NOT valid Snappy framing data and cannot be
-                // decompressed before KCP reassembly.
-                // Decompression happens AFTER kcp.recv() returns reassembled data,
-                // matching Go's architecture where CompStream.Read() calls
-                // kcp.Recv() first, then snappy.Reader decompresses.
-                for slice in &kcp_inputs {
-                    let mut kcp = self.kcp.lock();
-                    kcp.input(slice, self.ack_nodelay).ok();
-                    drop(kcp);
-                    let mut kcp = self.kcp.lock();
-                    while let Ok(data) = kcp.recv_bytes() {
-                        if !self.nocomp {
-                            if let Some(ref fb) = self.snappy_fallback {
-                                if let Ok(decompressed) = fb.lock().feed(&data) {
-                                    if !decompressed.is_empty() {
-                                        all_results.push(decompressed);
-                                    }
-                                }
-                            }
-                        } else {
-                            all_results.push(data.to_vec());
-                        }
+                        self.kcp_input_and_smux(body);
                     }
                 }
             } else {
-                let mut kcp = self.kcp.lock();
-                kcp.input(&feed_slice, self.ack_nodelay).ok();
-                drop(kcp);
-                let mut kcp = self.kcp.lock();
-                while let Ok(data) = kcp.recv_bytes() {
-                    if !self.nocomp {
-                        if let Some(ref fb) = self.snappy_fallback {
-                            if let Ok(decompressed) = fb.lock().feed(&data) {
-                                if !decompressed.is_empty() {
-                                    all_results.push(decompressed);
-                                }
-                            }
-                        }
-                    } else {
-                        all_results.push(data.to_vec());
-                    }
-                }
+                self.kcp_input_and_smux(body);
             }
         } else {
-            let mut kcp = self.kcp.lock();
-            let conv = kcp.conv();
-            let input_result = kcp.input(&feed_slice, self.ack_nodelay);
-            debug!(
-                "feed_data: KCP input result = {:?}, conv=0x{:08x}",
-                input_result, conv
-            );
-            drop(kcp);
-            let mut kcp = self.kcp.lock();
-            while let Ok(data) = kcp.recv_bytes() {
-                debug!("feed_data: KCP recv {} bytes", data.len());
-                if !self.nocomp {
-                    if let Some(ref fb) = self.snappy_fallback {
-                        if let Ok(decompressed) = fb.lock().feed(&data) {
-                            if !decompressed.is_empty() {
-                                all_results.push(decompressed);
-                            }
-                        }
-                    }
-                } else {
-                    all_results.push(data.to_vec());
-                }
-            }
+            self.kcp_input_and_smux(body);
         }
 
         // ── Wake flush loop to send ACKs immediately ──
@@ -1639,8 +1610,40 @@ impl KcpServerSession {
         if !self.raw_packets.lock().is_empty() {
             self.flush_notify.notify_one();
         }
+    }
 
-        all_results
+    /// Feed one KCP wire slice, then drain `recv_bytes` into SMUX (with optional
+    /// Snappy). No intermediate `Vec` of messages — matches client inbound path.
+    fn kcp_input_and_smux(&self, slice: &[u8]) {
+        let mut kcp = self.kcp.lock();
+        let conv = kcp.conv();
+        let input_result = kcp.input(slice, self.ack_nodelay);
+        if input_result.is_err() {
+            kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.kcp_in_errors, 1);
+        }
+        debug!(
+            "feed_data: KCP input result = {:?}, conv=0x{:08x}",
+            input_result, conv
+        );
+        while let Ok(data) = kcp.recv_bytes() {
+            debug!("feed_data: KCP recv {} bytes", data.len());
+            // Drop KCP lock before snappy/SMUX to reduce contention.
+            drop(kcp);
+            if !self.nocomp {
+                if let Some(ref fb) = self.snappy_fallback {
+                    if let Ok(decompressed) = fb.lock().feed(&data) {
+                        if !decompressed.is_empty() {
+                            if let Err(e) = self.smux.process_data(&decompressed) {
+                                debug!("SMUX process_data error: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            } else if let Err(e) = self.smux.process_data(&data) {
+                debug!("SMUX process_data error: {:?}", e);
+            }
+            kcp = self.kcp.lock();
+        }
     }
 
     /// Check for newly accepted SMUX streams that need TCP handler tasks.
@@ -1713,8 +1716,9 @@ async fn snmp_logger(path: String, period: Duration, stop: Arc<AtomicBool>) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let snmp = kcp_rs::SNMP::new();
-        let values = snmp.to_slice();
+        // Read process-wide counters updated by KCP hot paths.
+        // SNMP::new() is a fresh zeroed instance — that always prints zeros.
+        let values = kcp_rs::DEFAULT_SNMP.to_slice();
         if let Err(e) = writeln!(writer, "{},{}", ts, values.join(",")) {
             error!("SNMP log write error: {}", e);
         }
@@ -1841,6 +1845,7 @@ fn get_or_create_session(
         0xDEADBEEF
     };
     info!("new KCP session from {} (conv=0x{:08x})", peer, conv);
+    kcp_rs::DEFAULT_SNMP.session_opened(false);
     let session = Arc::new(KcpServerSession::new(
         conv,
         *peer,
@@ -2013,13 +2018,21 @@ async fn async_main() -> Result<()> {
 
     // Start SNMP logger if configured
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // SNMP collection is off by default (zero hot-path cost). Enable only when
+    // a log path is set and period > 0.
     if let Some(ref snmplog_path) = cli.snmplog {
-        let period = Duration::from_secs(cli.snmpperiod.unwrap_or(60));
-        let s = stop_flag.clone();
-        let p = snmplog_path.clone();
-        kio::spawn_task(async move {
-            snmp_logger(p, period, s).await;
-        });
+        let secs = cli.snmpperiod.unwrap_or(60);
+        if secs > 0 && !snmplog_path.is_empty() {
+            kcp_rs::snmp_enable();
+            let period = Duration::from_secs(secs);
+            let s = stop_flag.clone();
+            let p = snmplog_path.clone();
+            kio::spawn_task(async move {
+                snmp_logger(p, period, s).await;
+            });
+        } else {
+            log::warn!("snmplog set but snmpperiod=0 or empty path — SNMP collection disabled");
+        }
     }
 
     // Start pprof if configured (requires --features pprof)
@@ -2056,12 +2069,14 @@ async fn async_main() -> Result<()> {
     // First packet via async recv_from; then drain ready packets with
     // try_recv_batch_from (Linux: recvmmsg) before awaiting again (P1.3).
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut batch_slots: Vec<Vec<u8>> =
-        (0..16).map(|_| Vec::with_capacity(MAX_DATAGRAM)).collect();
+    let mut batch_slots: Vec<Vec<u8>> = (0..16).map(|_| Vec::with_capacity(MAX_DATAGRAM)).collect();
     let mut batch_extra: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(16);
 
     // Local helper: process one encrypted datagram for a peer.
-    let process_datagram = |peer: SocketAddr, data: &[u8]| {
+    // `data` is the unique mut buffer for this packet (main recv or batch slot).
+    let process_datagram = |peer: SocketAddr, data: &mut [u8]| {
+        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_pkts, 1);
+        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_bytes, data.len() as u64);
         let session = get_or_create_session(
             &sessions,
             &peer,
@@ -2088,15 +2103,7 @@ async fn async_main() -> Result<()> {
             nocomp,
         );
         let new_streams = {
-            let messages = session.feed_data(data);
-            if !messages.is_empty() {
-                for msg in &messages {
-                    debug!("SMUX process_data: {} bytes", msg.len());
-                    if let Err(e) = session.smux.process_data(msg) {
-                        debug!("SMUX process_data error: {:?}", e);
-                    }
-                }
-            }
+            session.feed_data_mut(data);
             // Peer UDP may open send window — wake flush promptly.
             session.flush_notify.notify_one();
             session.drain_new_streams()
@@ -2147,24 +2154,26 @@ async fn async_main() -> Result<()> {
                 if n == 0 {
                     continue;
                 }
-                process_datagram(peer, &buf[..n]);
+                process_datagram(peer, &mut buf[..n]);
                 // Drain any further ready datagrams without yielding.
                 batch_extra.clear();
                 match udp.try_recv_batch_from(&mut batch_slots, &mut batch_extra) {
                     Ok(count) if count > 0 => {
-                        for (pkt, peer) in batch_extra.drain(..) {
-                            process_datagram(peer, &pkt);
+                        for (mut pkt, peer) in batch_extra.drain(..) {
+                            process_datagram(peer, pkt.as_mut_slice());
                         }
                     }
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
                         error!("UDP try_recv_batch_from error: {}", e);
+                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
                     }
                 }
             }
             Ok(Err(e)) => {
                 error!("UDP recv_from error: {}", e);
+                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
                 continue;
             }
             Err(_) => continue, // timeout, loop back to check stop_flag
@@ -2235,12 +2244,7 @@ async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             None => (path_q, ""),
         };
 
-        async fn respond(
-            stream: &mut kio::TcpStream,
-            status: &str,
-            ctype: &str,
-            body: &[u8],
-        ) {
+        async fn respond(stream: &mut kio::TcpStream, status: &str, ctype: &str, body: &[u8]) {
             let header = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -2621,14 +2625,6 @@ mod tests {
 
         let recvd = receiver.recv().unwrap();
         assert_eq!(&recvd[..], b"hello kcp server");
-    }
-
-    #[test]
-    fn test_kcp_fec_config() {
-        let mut kcp = KCP::new(1, 0, Box::new(|_| {}));
-        kcp.set_fec(10, 3);
-        // No assertion for FEC state since it's internal,
-        // but we verify the call doesn't panic
     }
 
     #[test]

@@ -1,5 +1,64 @@
 # Hotspot notes
 
+## 3des+comp investigation (2026-07-21, git post-snappy-offload)
+
+### Algorithm vs Go
+Rust `TripleDesCipher` already ports Go `crypto/des`: precomputed Feistel boxes,
+single IP/FP for 48 EDE rounds (better than RustCrypto's 3× IP/FP). CFB-8 matches
+kcp-go fixed IV + 64-bit XOR.
+
+### Regression found
+Snappy unconditional `cpu_block` at ≥4KiB **stacked** with 3des `encrypt_batch`
+`cpu_block` → smol thr collapsed (~4 MB/s). Fix: offload Snappy only for null/none.
+
+### Post-fix median thr (2MB×4)
+| impl | +comp | nocomp |
+|------|------:|-------:|
+| Go | ~9.0 | ~10.7 |
+| Rust-tokio | ~15.2 | ~12.2 |
+| Rust-smol | ~10.7 | ~15.4 |
+
+
+
+## L3 re-capture (post 196408e) — 2026-07-21 15:46
+
+- Git: `196408e` (smol true-idle + MPMC cpu_block + allow_parallel)
+- Host: macOS arm64, samply 0.13.1
+- Build: `cargo build --profile profiling` (debug=2, strip=false, lto=false, frame pointers, `aes_armv8`)
+- Workload: `bash bench/profile_flamegraph.sh l3` with `BENCH_DATA_MB=20`
+- Artifact: `bench/profiles/L3-3des-nocomp-20260721-154613.named.json.gz`
+- Measured thr (profiling bins, not release LTO): **~7.48 MB/s** (expect lower than release)
+
+### Leaf ranking (Gecko samples, all threads, ~15.9k samples)
+
+| Rank | Frame | ~leaf % | Notes |
+|------|-------|---------|-------|
+| 1 | `tokio::…Harness::complete` | ~33% | runtime bookkeeping / task complete |
+| 2 | `KcpServerSession::feed_data` | ~27% | inbound decrypt + FEC + KCP input (inlined body) |
+| 3 | clap `Parser::parse` | ~13% | startup noise in short capture |
+| 4 | `slice::sort::…small_sort` | ~12% | mostly **client** process; not 3DES core |
+| 5 | **`TripleDesCipher::encrypt_block`** | **~11%** | **real 3DES Feistel work (server)** |
+| — | `encrypt_batch` (any-in-stack) | ~8% | outbound batch encrypt |
+| — | CFB / `des::` (any-in-stack) | ~11% | CFB-8 + DES path |
+
+Keyword any-in-stack: `TripleDes`/`encrypt_block` ~11%; `encrypt_batch` ~8%; snappy ≈0% (`--nocomp`).
+
+### Interpretation
+
+1. **Cipher-bound, as expected for L3.** `encrypt_block` is the only large *named* crypto leaf; Feistel already uses Go-style precomputed boxes + single IP/FP for 48 rounds (faster than RustCrypto DES).
+2. **Release matrix already ≥ Go on 3des nocomp** (post-bench: smol ~14.3 vs Go ~13.1 MB/s ≈ **1.09×**). Skill gate: further 3DES micro-opts only if thr **&lt;0.9× Go** — **not met**.
+3. **`feed_data` high leaf %** is mostly **inbound CFB decrypt** collapsed into one mangled frame (profile attributes both client/server samples oddly for that symbol — treat as “data-plane decrypt/input”, not a separate API tax).
+4. **Remaining product gap is not L3-nocomp cipher**: short-connection matrix **3des+comp** still weak on smol vs tokio (~0.81×). That points at **compression + scheduling**, not more Feistel unrolling. Next evidence: L3-with-comp or dedicated 3des/comp profile — **not** more IP/FP tricks.
+
+### Decision (this pass)
+
+- **No 3DES algorithm change.** Wire-risk high, KPI already above Go on nocomp.
+- Prefer next: snappy conditional `cpu_block` / smol pool under **comp=on**, or profile `3des+comp` specifically.
+- Optional hygiene: ignore clap/startup frames; re-run longer capture if ranking startup noise.
+
+---
+
+
 - Date: 2026-07-21
 - Git (worktree at capture): `9aa4b3a` (+ uncommitted tooling then committed as feat(bench) profile script)
 - Host: macOS arm64 (Darwin 25.3)
