@@ -322,10 +322,17 @@ pub fn encrypt_batch(
                     if chunk.is_empty() {
                         break;
                     }
+                    // Pass a reference to the cipher (dyn) into each worker.
+                    // AES CFB's `encrypt` calls through BlockCipher16::encrypt_blocks
+                    // (when the impl overrides it) to use aes::BlockEncrypt::encrypt_blocks
+                    // for ILP on AES-NI/ARMv8 when the caller hands us independent blocks.
+                    let crypt_ref: &dyn BlockCrypt = crypt;
                     handles.push(s.spawn(move || {
                         let mut r = Vec::with_capacity(chunk.len());
                         for mut buf in chunk {
-                            crypt.encrypt(&mut buf);
+                            // Single-call encrypt on the prepared buffer. For AES CFB this
+                            // is one CFB stream; we keep the same sequential CFB per packet.
+                            crypt_ref.encrypt(&mut buf);
                             r.push(buf.freeze());
                         }
                         r

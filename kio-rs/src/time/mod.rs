@@ -2,12 +2,15 @@
 
 use std::time::Duration;
 
-/// Future returned by [`sleep_ms`] / [`sleep`].
-#[cfg(feature = "tokio")]
-pub type Sleep = ::tokio::time::Sleep;
-
-#[cfg(feature = "smol")]
-pub type Sleep = ::smol::Timer;
+/// Monotonic timestamp in milliseconds since an arbitrary start point (process
+/// start). Avoids repeated `Instant::now()` + locking on the hot path.
+/// Matches the semantics of the previous local `mono_ms` helpers.
+#[inline]
+pub fn mono_ms() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(std::time::Instant::now);
+    base.elapsed().as_millis() as u64
+}
 
 /// Sleep for `ms` milliseconds.
 #[inline(always)]

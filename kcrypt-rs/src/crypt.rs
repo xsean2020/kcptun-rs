@@ -98,35 +98,63 @@ pub trait AeadCrypt: Send + Sync + fmt::Debug {
     fn name(&self) -> &'static str;
 }
 
-// ─── CFB helpers (private; accessible to submodules) ──────────────────
+// ─── Block cipher traits for CFB (R1: deduplicate ~400 LOC) ───────────────
 
-/// CFB encrypt for 8-byte blocks (TEA, XTEA, Blowfish, 3DES, CAST5).
+/// Trait for 8-byte block ciphers (TEA, XTEA, Blowfish, 3DES, CAST5).
 ///
-/// Uses 64-bit XOR for speed (matching Go's unsafe uint64 pattern).
-/// Generic over `F` so the compiler can inline the block cipher call,
-/// eliminating per-block vtable overhead.
-fn cfb8_enc<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
+/// Used to provide a uniform interface for the shared CFB-8 implementation.
+pub trait BlockCipher8: Send + Sync {
+    /// Encrypt one 8-byte block: `out = E(inp)`.
+    fn encrypt_block(&self, out: &mut [u8; 8], inp: &[u8; 8]);
+}
+
+/// Trait for 16-byte block ciphers (AES, Twofish, SM4).
+///
+/// Used to provide a uniform interface for the shared CFB-128 implementation.
+pub trait BlockCipher16: Send + Sync {
+    /// Encrypt one 16-byte block: `out = E(inp)`.
+    fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]);
+
+    /// Encrypt multiple 16-byte blocks in place (for hardware ILP / AES-NI pipelining).
+    ///
+    /// Default: fall back to calling `encrypt_block` in a loop.
+    /// Implementations (e.g. AES) should override to use `encrypt_blocks` when available.
+    #[inline]
+    fn encrypt_blocks(&self, blocks: &mut [u8]) {
+        // Process full 16-byte blocks
+        let mut i = 0;
+        while i + 16 <= blocks.len() {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&blocks[i..i + 16]);
+            let mut out = [0u8; 16];
+            self.encrypt_block(&mut out, &b);
+            blocks[i..i + 16].copy_from_slice(&out);
+            i += 16;
+        }
+        // Tail < 16B left as-is (caller handles padding semantics)
+    }
+}
+
+// ─── Shared CFB implementations using the traits ─────────────────────────
+
+/// CFB-8 encrypt using a `BlockCipher8`.
+///
+/// Matches the existing `cfb8_enc` semantics and Go wire format (fixed IV).
+#[inline]
+pub fn cfb8_encrypt<C: BlockCipher8>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
     let mut tbl = [
-        GO_CFB_IV[0],
-        GO_CFB_IV[1],
-        GO_CFB_IV[2],
-        GO_CFB_IV[3],
-        GO_CFB_IV[4],
-        GO_CFB_IV[5],
-        GO_CFB_IV[6],
-        GO_CFB_IV[7],
+        GO_CFB_IV[0], GO_CFB_IV[1], GO_CFB_IV[2], GO_CFB_IV[3],
+        GO_CFB_IV[4], GO_CFB_IV[5], GO_CFB_IV[6], GO_CFB_IV[7],
     ];
     let mut i = 0;
-    // Process 8 blocks at a time (loop unroll matching Go)
     while i + 64 <= data.len() {
         for _ in 0..8 {
             let chunk = &mut data[i..i + 8];
             let mut b = [0u8; 8];
-            f(&tbl, &mut b);
-            // 64-bit XOR: 8 bytes in one operation
+            c.encrypt_block(&mut b, &tbl);
             let y = u64::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             ]) ^ u64::from_le_bytes(b);
@@ -136,11 +164,10 @@ fn cfb8_enc<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
             i += 8;
         }
     }
-    // Remaining full blocks
     while i + 8 <= data.len() {
         let chunk = &mut data[i..i + 8];
         let mut b = [0u8; 8];
-        f(&tbl, &mut b);
+        c.encrypt_block(&mut b, &tbl);
         let y = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]) ^ u64::from_le_bytes(b);
@@ -149,89 +176,79 @@ fn cfb8_enc<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
         tbl = out;
         i += 8;
     }
-    // Tail (partial block)
     if i < data.len() {
         let chunk = &mut data[i..];
         let len = chunk.len();
         let mut b = [0u8; 8];
-        f(&tbl, &mut b);
+        c.encrypt_block(&mut b, &tbl);
         for j in 0..len {
             chunk[j] ^= b[j];
         }
     }
 }
 
-fn cfb8_dec<F: Fn(&[u8; 8], &mut [u8; 8])>(data: &mut [u8], f: &F) {
+/// CFB-8 decrypt using a `BlockCipher8`.
+#[inline]
+pub fn cfb8_decrypt<C: BlockCipher8>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
     let mut tbl = [
-        GO_CFB_IV[0],
-        GO_CFB_IV[1],
-        GO_CFB_IV[2],
-        GO_CFB_IV[3],
-        GO_CFB_IV[4],
-        GO_CFB_IV[5],
-        GO_CFB_IV[6],
-        GO_CFB_IV[7],
+        GO_CFB_IV[0], GO_CFB_IV[1], GO_CFB_IV[2], GO_CFB_IV[3],
+        GO_CFB_IV[4], GO_CFB_IV[5], GO_CFB_IV[6], GO_CFB_IV[7],
     ];
     let mut i = 0;
-    // Full blocks with 64-bit XOR
     while i + 8 <= data.len() {
         let chunk = &mut data[i..i + 8];
         let src = [
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ];
         let mut b = [0u8; 8];
-        f(&tbl, &mut b);
+        c.encrypt_block(&mut b, &tbl);
         let y = u64::from_le_bytes(src) ^ u64::from_le_bytes(b);
         chunk.copy_from_slice(&y.to_le_bytes());
         tbl = src;
         i += 8;
     }
-    // Tail (partial block)
     if i < data.len() {
         let chunk = &mut data[i..];
         let len = chunk.len();
-        let mut n = [0u8; 8];
-        n[..len].copy_from_slice(chunk);
         let mut b = [0u8; 8];
-        f(&tbl, &mut b);
+        c.encrypt_block(&mut b, &tbl);
         for j in 0..len {
             chunk[j] ^= b[j];
         }
     }
 }
 
-#[allow(dead_code)]
-fn pad8(ch: &[u8]) -> [u8; 8] {
-    let mut r = [0u8; 8];
-    let l = ch.len().min(8);
-    r[..l].copy_from_slice(&ch[..l]);
-    r
-}
-
-/// CFB encrypt for 16-byte blocks (AES, Twofish, SM4).
+/// CFB-128 encrypt using a `BlockCipher16`.
 ///
-/// Uses 128-bit XOR (two u64) for speed (matching Go's subtle.XORBytes).
-/// Generic over `F` so the compiler can inline the block cipher call.
-fn cfb16_enc<F: Fn(&[u8; 16], &mut [u8; 16])>(data: &mut [u8], f: &F) {
+/// Uses direct byte indexing (matching `cfb8_encrypt`) instead of
+/// `try_into().unwrap()` to avoid runtime bounds checks in the hot path.
+#[inline]
+pub fn cfb16_encrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
     let mut tbl = GO_CFB_IV;
     let mut i = 0;
-    // Process 8 blocks at a time (loop unroll matching Go)
     while i + 128 <= data.len() {
         for _ in 0..8 {
             let chunk = &mut data[i..i + 16];
             let mut b = [0u8; 16];
-            f(&tbl, &mut b);
-            // 128-bit XOR via two u64
-            let b0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let b1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-            let s0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-            let s1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+            c.encrypt_block(&mut b, &tbl);
+            let b0 = u64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]);
+            let b1 = u64::from_le_bytes([
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            ]);
+            let s0 = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            let s1 = u64::from_le_bytes([
+                chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+            ]);
             let out0 = (s0 ^ b0).to_le_bytes();
             let out1 = (s1 ^ b1).to_le_bytes();
             chunk[0..8].copy_from_slice(&out0);
@@ -240,15 +257,22 @@ fn cfb16_enc<F: Fn(&[u8; 16], &mut [u8; 16])>(data: &mut [u8], f: &F) {
             i += 16;
         }
     }
-    // Remaining full blocks
     while i + 16 <= data.len() {
         let chunk = &mut data[i..i + 16];
         let mut b = [0u8; 16];
-        f(&tbl, &mut b);
-        let b0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let b1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let s0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let s1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        c.encrypt_block(&mut b, &tbl);
+        let b0 = u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]);
+        let b1 = u64::from_le_bytes([
+            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+        ]);
+        let s0 = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        let s1 = u64::from_le_bytes([
+            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+        ]);
         let out0 = (s0 ^ b0).to_le_bytes();
         let out1 = (s1 ^ b1).to_le_bytes();
         chunk[0..8].copy_from_slice(&out0);
@@ -256,34 +280,48 @@ fn cfb16_enc<F: Fn(&[u8; 16], &mut [u8; 16])>(data: &mut [u8], f: &F) {
         tbl.copy_from_slice(chunk);
         i += 16;
     }
-    // Tail (partial block)
     if i < data.len() {
         let chunk = &mut data[i..];
         let len = chunk.len();
         let mut b = [0u8; 16];
-        f(&tbl, &mut b);
+        c.encrypt_block(&mut b, &tbl);
         for j in 0..len {
             chunk[j] ^= b[j];
         }
     }
 }
 
-fn cfb16_dec<F: Fn(&[u8; 16], &mut [u8; 16])>(data: &mut [u8], f: &F) {
+/// CFB-128 decrypt using a `BlockCipher16`.
+///
+/// Uses direct byte indexing (matching `cfb8_decrypt`) instead of
+/// `try_into().unwrap()` to avoid runtime bounds checks in the hot path.
+#[inline]
+pub fn cfb16_decrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
     let mut tbl = GO_CFB_IV;
     let mut i = 0;
-    // Full blocks with 128-bit XOR
     while i + 16 <= data.len() {
         let chunk = &mut data[i..i + 16];
-        let src: [u8; 16] = chunk.try_into().unwrap();
+        let src = [
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+        ];
         let mut b = [0u8; 16];
-        f(&tbl, &mut b);
-        let b0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let b1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let s0 = u64::from_le_bytes(src[0..8].try_into().unwrap());
-        let s1 = u64::from_le_bytes(src[8..16].try_into().unwrap());
+        c.encrypt_block(&mut b, &tbl);
+        let b0 = u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]);
+        let b1 = u64::from_le_bytes([
+            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+        ]);
+        let s0 = u64::from_le_bytes([
+            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+        ]);
+        let s1 = u64::from_le_bytes([
+            src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
+        ]);
         let out0 = (s0 ^ b0).to_le_bytes();
         let out1 = (s1 ^ b1).to_le_bytes();
         chunk[0..8].copy_from_slice(&out0);
@@ -291,26 +329,15 @@ fn cfb16_dec<F: Fn(&[u8; 16], &mut [u8; 16])>(data: &mut [u8], f: &F) {
         tbl = src;
         i += 16;
     }
-    // Tail (partial block)
     if i < data.len() {
         let chunk = &mut data[i..];
         let len = chunk.len();
-        let mut n = [0u8; 16];
-        n[..len].copy_from_slice(chunk);
         let mut b = [0u8; 16];
-        f(&tbl, &mut b);
+        c.encrypt_block(&mut b, &tbl);
         for j in 0..len {
             chunk[j] ^= b[j];
         }
     }
-}
-
-#[allow(dead_code)]
-fn pad16(ch: &[u8]) -> [u8; 16] {
-    let mut r = [0u8; 16];
-    let l = ch.len().min(16);
-    r[..l].copy_from_slice(&ch[..l]);
-    r
 }
 
 // ─── Cipher Selection ──────────────────────────────────────────────────
@@ -370,9 +397,6 @@ pub fn select_block_crypt(method: &str, pass: &[u8]) -> (Box<dyn BlockCrypt>, St
         _ => (Box::new(AesCfbCrypt::new(pass)), "aes".to_string()),
     }
 }
-
-/// Function pointer type for [`select_block_crypt`].
-pub type SelectBlockCrypt = fn(method: &str, pass: &[u8]) -> (Box<dyn BlockCrypt>, String);
 
 /// Select an [`AeadCrypt`] if the method is an AEAD variant.
 ///

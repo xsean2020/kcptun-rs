@@ -1,0 +1,26 @@
+[package]
+name = "kpprof-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Go-compatible pprof HTTP server for kcptun-rs"
+
+[lib]
+name = "kpprof"
+
+[dependencies]
+kio-rs = { path = "../kio-rs", default-features = false }
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"] }
+backtrace = "0.3"
+log = "0.4"
+anyhow = "1"
+mimalloc = { version = "0.1", default-features = false }
+parking_lot = "0.12"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[features]
+default = ["tokio"]
+# Deadlock detection (enables parking_lot deadlock_detection — has overhead)
+deadlock = ["parking_lot/deadlock_detection"]
+# Runtime pass-through (parent crate selects one)
+tokio = ["kio-rs/tokio"]
+smol = ["kio-rs/smol"]

@@ -18,7 +18,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam::queue::SegQueue;
 
 // ─── Wire constants ───────────────────────────────────────────────────────────
@@ -29,9 +29,6 @@ pub const MTU: usize = 1400;
 
 /// Overhead of the KCP header (24 bytes).
 pub const KCP_OVERHEAD: usize = 24;
-
-/// Minimum reliable window.
-pub const KCP_MIN_WND: u32 = 32;
 
 /// Default reliable window.
 /// Matches Go kcp-go `IKCP_WND_SND = 32` / `IKCP_WND_RCV = 32`.
@@ -106,6 +103,12 @@ pub struct Segment {
     pub len: u32,
     /// Payload data.
     pub data: BytesMut,
+    /// Frozen, reference-counted view of the payload for retransmission sharing.
+    ///
+    /// Once set (via `freeze_payload`), retransmits and FEC paths can share this
+    /// `Bytes` without copying the user data again. Header fields (ts/wnd/una) are
+    /// still rewritten on each transmit, so only the payload portion is shared.
+    pub payload: Bytes,
     /// Number of retransmissions.
     pub resendts: u32,
     /// Retransmission timeout.
@@ -132,6 +135,7 @@ impl Segment {
             una: 0,
             len: 0,
             data: BytesMut::with_capacity(cap),
+            payload: Bytes::new(),
             resendts: 0,
             rto: 0,
             fastack: 0,
@@ -152,6 +156,7 @@ impl Segment {
         self.una = 0;
         self.len = 0;
         self.data.clear();
+        self.payload = Bytes::new();
         self.resendts = 0;
         self.rto = 0;
         self.fastack = 0;
@@ -176,7 +181,11 @@ impl Segment {
         hdr[20..24].copy_from_slice(&self.len.to_le_bytes());
         buf.put_slice(&hdr);
         if self.len > 0 {
-            buf.put_slice(&self.data[..self.len as usize]);
+            if !self.payload.is_empty() {
+                buf.put_slice(&self.payload[..self.len as usize]);
+            } else {
+                buf.put_slice(&self.data[..self.len as usize]);
+            }
         }
         KCP_OVERHEAD + self.len as usize
     }
@@ -188,14 +197,16 @@ impl Segment {
         if data.len() < KCP_OVERHEAD {
             return None;
         }
-        let conv = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        // Direct indexing after length guard — consistent with FEC/CFB style
+        // (avoids try_into overhead; all accesses are in-bounds).
+        let conv = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let cmd = data[4];
         let frg = data[5];
-        let wnd = u16::from_le_bytes(data[6..8].try_into().unwrap());
-        let ts = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        let sn = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        let una = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        let len = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        let wnd = u16::from_le_bytes([data[6], data[7]]);
+        let ts = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let sn = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let una = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
 
         let total_len = KCP_OVERHEAD + len as usize;
         if data.len() < total_len {

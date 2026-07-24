@@ -1,35 +1,29 @@
-# Flamegraph / CPU profiling runbook (kcptun-rs)
+# CPU profiling runbook (kcptun-rs)
 
 Reproducible CPU sampling for the data plane on **macOS arm64** (primary) and Linux.
 
 ## Prerequisites
 
 ```bash
-cargo install samply --locked   # primary sampler → Speedscope JSON
-# Script rebuilds unstripped release binaries by default for better stacks:
-#   CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=true
+# Go toolchain (for pprof analysis UI)
+# Install from https://go.dev/dl/ or: brew install go
+
+# Build profiling binaries with symbols + pprof feature
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client
 ```
 
-Fallback (less reliable on macOS): `cargo install flamegraph --locked` (often needs `dtrace` privileges).
-
-### macOS samply constraints (critical)
-
-- samply **cannot** wrap system `/bin/bash` or system Python as the root process.
-- This repo uses a **locally built** helper `bench/kcptun_prof_wl` (`rustc -O bench/kcptun_prof_wl.rs`) as the root; it spawns release server/client + Python echo + concurrent bulk.
-- Default release `strip = true` yields anonymous `0x…` frames; the script rebuilds with strip off unless `SKIP_PROFILE_REBUILD=1`.
-- Even with debug info, LTO can leave many frames poorly named — cross-check with throughput ratios and `nm`/`atos`.
-
-## One-shot capture
+## One-shot capture (Go pprof)
 
 ```bash
-bash bench/profile_flamegraph.sh all     # L1–L4
-# or
-make profile
+# Rust server CPU profile → Go pprof protobuf
+bash bench/profile_rust_go_pprof.sh server 20
+# or: make profile
 
-# Single scenario
-bash bench/profile_flamegraph.sh l1
-BENCH_DATA_MB=100 bash bench/profile_flamegraph.sh l2
-SKIP_PROFILE_REBUILD=1 bash bench/profile_flamegraph.sh l3   # reuse existing unstripped bins
+# Rust client CPU profile
+bash bench/profile_rust_go_pprof.sh client 15
+
+# Override cipher / data size
+CRYPT=3des BENCH_DATA_MB=100 bash bench/profile_rust_go_pprof.sh server 30
 ```
 
 Artifacts land in `bench/profiles/` (gitignored except README / HOTSPOTS / .gitkeep).
@@ -43,14 +37,44 @@ Artifacts land in `bench/profiles/` (gitignored except README / HOTSPOTS / .gitk
 | L3 | `3des` | same | bulk | Heavy cipher dominance |
 | L4 | (stress defaults) | stress test | `test_multithread_10_connections` | Locks / multi-conn |
 
-samply samples the **full process tree** under `kcptun_prof_wl` (server + client).
-
 ## Viewing profiles
 
 ```bash
-samply load bench/profiles/L1-null-nocomp-*.json.gz
-# or upload the .json.gz to https://www.speedscope.app
+# Interactive web UI (flame graph, top, source listing)
+go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-aes-*.pb
+
+# Top functions
+go tool pprof -top bench/profiles/rust-server-aes-*.pb
+
+# Source-level annotation
+go tool pprof -list=encrypt_batch bench/profiles/rust-server-aes-*.pb
 ```
+
+## Manual pprof capture
+
+```bash
+# Start server with pprof HTTP endpoint
+./target/profiling/kcptun-server -l :29900 -t 127.0.0.1:8080 --key k --crypt aes --nocomp --pprof 127.0.0.1:6060
+
+# Capture CPU profile
+curl -o cpu.pb 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20'
+go tool pprof -http=:0 cpu.pb
+
+# Heap allocation profile
+curl -o heap.pb 'http://127.0.0.1:6060/debug/pprof/heap'
+go tool pprof -http=:0 heap.pb
+
+# Thread dump (goroutine equivalent)
+curl 'http://127.0.0.1:6060/debug/pprof/goroutine?debug=2'
+
+# Deadlock check (requires --features pprof-deadlock)
+curl 'http://127.0.0.1:6060/debug/pprof/deadlock'
+
+# Browse all endpoints
+open 'http://127.0.0.1:6060/debug/pprof/'
+```
+
+> Note: profiles show **Rust demangled names** inside Go pprof UI. This is not a Go binary profile of the Go kcptun process — use `bash bench/profile_go_pprof.sh` for pure Go.
 
 ## Symbol map (this stack)
 
@@ -63,37 +87,6 @@ samply load bench/profiles/L1-null-nocomp-*.json.gz
 | snappy compress / decompress | Session compression (off with `--nocomp`) |
 | `send_batch` / UDP send/recv | Network I/O |
 | `cpu_block` / tokio runtime / `park` | Scheduling / offload |
-
-
-
-## Go-compatible pprof (Rust → `go tool pprof`)
-
-Rust binaries emit **Google pprof protobuf** on `--pprof <addr>`:
-
-```bash
-# 1) build with symbols (recommended)
-RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling -p kcptun-server -p kcptun-client
-
-# 2) one-shot capture under load → .pb file
-bash bench/profile_rust_go_pprof.sh server 20
-# or: make profile-rust-go
-
-# 3) analyze with Go toolchain (function names, flame graph UI)
-go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-aes-*.pb
-go tool pprof -top bench/profiles/rust-server-aes-*.pb
-go tool pprof -list=AesCfbCrypt bench/profiles/rust-server-aes-*.pb
-```
-
-Manual:
-
-```bash
-./target/profiling/kcptun-server -l :29900 -t 127.0.0.1:8080 --key k --crypt aes --nocomp --pprof 127.0.0.1:6060
-curl -o cpu.pb 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20'
-go tool pprof -http=:0 cpu.pb
-```
-
-> Note: profiles show **Rust demangled names** inside Go pprof UI. This is not a Go binary profile of the Go kcptun process — use `bash bench/profile_go_pprof.sh` for pure Go.
-
 
 ## Optimization decision tree
 
@@ -117,22 +110,21 @@ make stress
 bash test_e2e.sh
 # re-measure:
 BENCH_DATA_MB=50 bash bench/run_bench.sh
-BENCH_DATA_MB=50 bash bench/profile_flamegraph.sh l1   # or affected ID
+BENCH_DATA_MB=50 bash bench/profile_rust_go_pprof.sh server 20
 ```
 
 Update `bench/profiles/HOTSPOTS.md` with before/after notes.
 
 ## macOS / project gotchas
 
-- No Linux `perf` by default — use **samply**, not `cargo flamegraph` alone.
-- Prefer **wrap-command** mode (`samply record --save-only -o out -- cmd`) over `-p PID` (attach may need `samply setup` codesign).
-- Binary flag `--pprof` is a **placeholder** HTTP banner, not a real pprof endpoint.
+- Build with `--features pprof` to enable the pprof HTTP server; without it, `--pprof` is a no-op.
+- Use `--features pprof-deadlock` to enable deadlock detection (adds overhead from `parking_lot::deadlock_detection`).
 - `null` cipher has **no** crypto header; `none` has header without encryption.
-- Compression is **on by default**; this script uses `--nocomp` for raw data-plane profiles.
-- Release profile strips symbols; samply usually still attributes Rust frames, but stripped frames may look anonymous — build with debug info if needed for deep analysis (`CARGO_PROFILE_RELEASE_DEBUG=1` one-off).
+- Compression is **on by default**; profiling scripts use `--nocomp` for raw data-plane profiles.
+- Release profile strips symbols; profiling profile keeps them (`strip = false, debug = 2`).
 
 ## Related docs
 
 - `PERF_OPTIMIZATION_PLAN.md` — residual R-items and KPI gates
-- `.claude/skills/flamegraph-perf/SKILL.md` — agent skill for the full loop
+- `.claude/skills/flamegraph-perf/SKILL.md` — agent skill for the full profiling loop
 - `bench/profiles/HOTSPOTS.md` — last recorded ranking (after first real matrix)

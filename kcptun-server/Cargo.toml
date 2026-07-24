@@ -24,15 +24,18 @@ parking_lot = "0.12"
 crc32fast = "1"
 socket2 = "0.5"
 mimalloc = { version = "0.1", default-features = false }
-pprof = { version = "0.15", optional = true, default-features = false, features = ["protobuf-codec"] }
+kpprof-rs = { path = "../kpprof-rs", optional = true, default-features = false }
 dashmap = "6"
 
 [features]
 default = ["tokio"]
-# Optional CPU profiler HTTP endpoint (--pprof). Off by default to keep ARM bins small.
-pprof = ["dep:pprof"]
-tokio = ["kio-rs/tokio", "smux-rs/tokio"]
-smol = ["kio-rs/smol", "smux-rs/smol"]
+# Optional Go-compatible pprof HTTP endpoint (--pprof). Off by default to keep ARM bins small.
+# Includes CPU profile + heap/allocs + goroutine (thread dump).
+pprof = ["dep:kpprof-rs"]
+# Deadlock detection (adds parking_lot deadlock_detection overhead).
+pprof-deadlock = ["pprof", "kpprof-rs/deadlock"]
+tokio = ["kio-rs/tokio", "smux-rs/tokio", "kpprof-rs?/tokio"]
+smol = ["kio-rs/smol", "smux-rs/smol", "kpprof-rs?/smol"]
 
 [[bin]]
 name = "kcptun-server"

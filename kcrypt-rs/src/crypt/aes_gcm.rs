@@ -71,17 +71,22 @@ impl AeadCrypt for Aes128GcmCrypt {
         const SPARE: usize = 2048;
         out.clear();
         out.reserve(total + SPARE);
-        out.resize(total, 0);
+        // Build [nonce | plaintext | tag_placeholder] via extend — avoids the
+        // full-buffer zero-fill that `resize(total, 0)` + `copy_from_slice`
+        // would do (two O(n) passes → one O(n) + one O(TAG_SZ)).
         let nonce_bytes = self.next_nonce();
-        out[..NONCE_SZ].copy_from_slice(&nonce_bytes);
-        out[NONCE_SZ..NONCE_SZ + plaintext.len()].copy_from_slice(plaintext);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(plaintext);
+        out.extend_from_slice(&[0u8; TAG_SZ]); // 16-byte tag placeholder
 
         let nonce = GenericArray::from_slice(&nonce_bytes);
+        let pt_start = NONCE_SZ;
+        let pt_end = NONCE_SZ + plaintext.len();
         let tag = self
             .cipher
-            .encrypt_in_place_detached(nonce, b"", &mut out[NONCE_SZ..NONCE_SZ + plaintext.len()])
+            .encrypt_in_place_detached(nonce, b"", &mut out[pt_start..pt_end])
             .expect("AES-GCM encrypt should not fail");
-        out[NONCE_SZ + plaintext.len()..].copy_from_slice(tag.as_slice());
+        out[pt_end..].copy_from_slice(tag.as_slice());
         let frozen = out.split_to(total).freeze();
         // Warm the leftover allocation for the next seal_into call.
         if out.capacity() < SPARE {

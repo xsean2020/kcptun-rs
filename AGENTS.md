@@ -16,7 +16,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Workspace of 7 crates; release: `opt-level=3`, LTO, `panic=abort`, strip; `profiling` profile for flamegraphs |
+| `Cargo.toml` | Workspace of 8 crates; release: `opt-level=3`, LTO, `panic=abort`, strip; `profiling` profile for pprof |
 | `Makefile` | Build/test/clippy/bench/e2e/profile for tokio & smol; ARMv7/ARM64 cross; vendor |
 | `CLAUDE.md` | AI behavioral rules + project gotchas (authoritative for *how to work*) |
 | `README.md` / `README.zh.md` | User-facing docs (EN/ZH) |
@@ -25,9 +25,8 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `bench_rust_vs_go.py` | Throughput comparison harness (Go / Rust-tokio / Rust-smol) |
 | `bench_results.json` | Latest 3-way bench numbers |
 | `PERF_OPTIMIZATION_PLAN.md` | Performance plan: completed P0/P1, remaining R1–R10, acceptance rules |
-| `bench/profile_flamegraph.sh` | samply/flamegraph capture for L1–L4 loads |
 | `bench/profile_rust_go_pprof.sh` | Rust CPU profile as Go pprof protobuf (`go tool pprof`) |
-| `.claude/skills/flamegraph-perf/` | Agent skill: profile → optimize → verify |
+| `.claude/skills/flamegraph-perf/` | Agent skill: Go pprof profile → optimize → verify |
 | `.claude/skills/agents-md-orient/` | Agent skill: AGENTS.md-first orient + sync after structural changes |
 | `.claude/skills/superpowers-sync/` | Agent skill: sync plan+spec to `docs/superpowers/` on task completion |
 | `bugs/BUGREPORT.md` | Known issues (single-KCP deadlock / FIN history) |
@@ -44,6 +43,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `smux-rs/` | SMUX v1/v2 multiplexer (see `smux-rs/AGENTS.md`) |
 | `qpp-rs/` | Quantum Permutation Pad stream obfuscation (see `qpp-rs/AGENTS.md`) |
 | `kio-rs/` | Runtime-agnostic async I/O tokio\|smol (see `kio-rs/AGENTS.md`) |
+| `kpprof-rs/` | Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock) |
 | `kcptun-client/` | Client binary (see `kcptun-client/AGENTS.md`) |
 | `kcptun-server/` | Server binary + stress tests (see `kcptun-server/AGENTS.md`) |
 | `bench/` | Bench/profile runners (see `bench/AGENTS.md`) |
@@ -84,7 +84,7 @@ make install-cross
 make vendor
 ```
 
-Runtime-feature packages (`RT_PKGS`): `kcptun-client`, `kcptun-server`, `kio-rs`, `smux-rs`.  
+Runtime-feature packages (`RT_PKGS`): `kcptun-client`, `kcptun-server`, `kio-rs`, `smux-rs`, `kpprof-rs`.  
 Runtime-agnostic: `kcp-rs`, `kcrypt-rs`, `qpp-rs`.
 
 ## Architecture Summary
@@ -97,7 +97,8 @@ kcptun-client ──┐
 kcptun-server ──┤
                 ├──► smux-rs ──► kio-rs  (feature: tokio | smol)
                 ├──► qpp-rs
-                └──► kio-rs
+                ├──► kio-rs
+                └──► kpprof-rs ──► kio-rs  (optional: feature pprof)
 ```
 
 ### Wire formats (must stay Go-compatible)

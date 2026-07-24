@@ -10,13 +10,15 @@
 use log::debug;
 use std::collections::HashMap;
 use std::io::{self};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::frame::{Cmd, FrameCodec};
+use bytes::Bytes;
+
+use crate::frame::{Cmd, Frame, FrameCodec};
 use crate::stream::{Stream, StreamState};
 
 const MAX_STREAMS: u32 = 65536;
@@ -129,7 +131,7 @@ pub struct Session {
     /// Session configuration.
     config: Config,
     /// Whether the session is closed.
-    closed: Arc<Mutex<bool>>,
+    closed: Arc<AtomicBool>,
     /// All active streams, keyed by stream ID.
     streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
     /// Next stream ID to assign (for client: odd, server: even).
@@ -139,7 +141,9 @@ pub struct Session {
     /// Keepalive interval.
     keepalive_interval: Duration,
     /// Time of last keepalive.
-    last_keepalive: Arc<Mutex<Instant>>,
+    last_keepalive_ms: AtomicU64,
+    /// Time of last inbound activity (any frame).
+    last_activity_ms: AtomicU64,
     /// Maximum streams allowed.
     max_streams: u32,
     /// Token bucket for receive flow control (bytes remaining).
@@ -165,12 +169,13 @@ impl Session {
         let (upd_tx, upd_rx) = kio::bounded(UPD_CHANNEL_CAPACITY);
         Ok(Session {
             config: config.clone(),
-            closed: Arc::new(Mutex::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             codec: Arc::new(Mutex::new(FrameCodec::new(config.max_receive_buffer))),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
-            last_keepalive: Arc::new(Mutex::new(Instant::now())),
+            last_keepalive_ms: AtomicU64::new(kio::mono_ms()),
+            last_activity_ms: AtomicU64::new(kio::mono_ms()),
             max_streams: MAX_STREAMS,
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
             upd_tx,
@@ -186,12 +191,13 @@ impl Session {
         let (upd_tx, upd_rx) = kio::bounded(UPD_CHANNEL_CAPACITY);
         Ok(Session {
             config: config.clone(),
-            closed: Arc::new(Mutex::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU32::new(0),
             codec: Arc::new(Mutex::new(FrameCodec::new(config.max_receive_buffer))),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
-            last_keepalive: Arc::new(Mutex::new(Instant::now())),
+            last_keepalive_ms: AtomicU64::new(kio::mono_ms()),
+            last_activity_ms: AtomicU64::new(kio::mono_ms()),
             max_streams: MAX_STREAMS,
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
             upd_tx,
@@ -202,7 +208,7 @@ impl Session {
     /// Check if the session is closed.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        *self.closed.lock()
+        self.closed.load(Ordering::Relaxed)
     }
 
     /// Get a reference to the streams map.
@@ -305,6 +311,8 @@ impl Session {
         let mut results = Vec::new();
 
         while let Some(frame) = codec.decode() {
+            // Any received frame confirms peer is alive.
+            self.update_activity();
             match frame.cmd {
                 Cmd::Syn => {
                     // Incoming stream request (Go cmdSYN = 0)
@@ -402,7 +410,7 @@ impl Session {
 
     /// Close the session and all streams.
     pub fn close(&self) {
-        *self.closed.lock() = true;
+        self.closed.store(true, Ordering::Release);
         let mut streams = self.streams.lock();
         for (_, stream) in streams.drain() {
             stream.close();
@@ -477,8 +485,34 @@ impl Session {
 
     /// Perform keepalive check — returns true if a ping should be sent.
     pub fn check_keepalive(&self) -> bool {
-        let elapsed = self.last_keepalive.lock().elapsed();
-        elapsed >= self.keepalive_interval
+        let last = self.last_keepalive_ms.load(Ordering::Relaxed);
+        let elapsed_ms = kio::mono_ms().saturating_sub(last);
+        elapsed_ms >= self.keepalive_interval.as_millis() as u64
+    }
+
+    /// Update last inbound activity timestamp.
+    pub fn update_activity(&self) {
+        self.last_activity_ms.store(kio::mono_ms(), Ordering::Relaxed);
+    }
+
+    /// Mark that a keepalive NOP was just sent (resets the interval).
+    pub fn mark_keepalive_sent(&self) {
+        self.last_keepalive_ms.store(kio::mono_ms(), Ordering::Relaxed);
+    }
+
+    /// Returns true if no inbound activity within keepalive_timeout.
+    pub fn is_keepalive_timeout(&self) -> bool {
+        if self.config.keepalive_timeout == 0 {
+            return false;
+        }
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        let elapsed_ms = kio::mono_ms().saturating_sub(last);
+        elapsed_ms >= self.config.keepalive_timeout.saturating_mul(1000)
+    }
+
+    /// Build a NOP keepalive frame (empty payload, stream id 0).
+    pub fn keepalive_frame(&self) -> Frame {
+        Frame::new(Cmd::Nop, 0, Bytes::new()).with_ver(self.config.version)
     }
 }
 
@@ -488,6 +522,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::frame::Frame;
+    use std::time::Instant;
 
     #[test]
     fn session_create_client() {

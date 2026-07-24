@@ -8,7 +8,7 @@ use std::fmt;
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// SMUX protocol version (matching Go smux v2 default).
-pub const SMUX_VER: u8 = 2;
+pub(crate) const SMUX_VER: u8 = 2;
 
 /// Frame header size in bytes (ver|cmd|length|sid = 1+1+2+4 = 8).
 pub const FRAME_HEADER_SIZE: usize = 8;

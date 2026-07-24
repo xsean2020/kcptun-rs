@@ -22,7 +22,7 @@ pub fn enable() {
 
 /// Whether SNMP collection is active.
 #[inline(always)]
-pub fn is_enabled() -> bool {
+pub(crate) fn is_enabled() -> bool {
     SNMP_ENABLED.load(Ordering::Relaxed)
 }
 
@@ -148,7 +148,7 @@ impl SNMP {
     }
 
     /// Point-in-time snapshot of all counters (including Rust-only fields).
-    pub fn snapshot(&self) -> SnmpSnapshot {
+    pub(crate) fn snapshot(&self) -> SnmpSnapshot {
         SnmpSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Acquire),
             bytes_received: self.bytes_received.load(Ordering::Acquire),
@@ -325,7 +325,7 @@ impl SNMP {
 
 /// A point-in-time snapshot of all SNMP counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnmpSnapshot {
+pub(crate) struct SnmpSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub max_conn: u64,

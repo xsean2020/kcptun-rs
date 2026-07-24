@@ -6,6 +6,7 @@
 #   smux-rs       — SMUX stream multiplexer (tokio / smol dual-track)
 #   qpp-rs        — Quantum Permutation Pad encryption
 #   kio-rs        — Async runtime + network I/O abstraction (tokio / smol)
+#   kpprof-rs     — Go-compatible pprof (net/http/pprof) server: CPU + heap/allocs + goroutine + deadlock (opt-in via --features pprof / pprof-deadlock)
 #   kcptun-client — Client binary (tokio / smol)
 #   kcptun-server — Server binary (tokio / smol)
 #
@@ -58,7 +59,7 @@ NUM_JOBS := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null |
 
 # Packages that need runtime feature selection (tokio / smol)
 # kcp-rs, kcrypt-rs, qpp-rs are runtime-agnostic — built normally with workspace.
-RT_PKGS := -p kcptun-client -p kcptun-server -p kio-rs -p smux-rs
+RT_PKGS := -p kcptun-client -p kcptun-server -p kio-rs -p smux-rs -p kpprof-rs
 
 # ---------------------------------------------------------------------------
 # Cross-compilation targets
@@ -160,7 +161,7 @@ endef
         build-armv7 build-armv7-tokio release-armv7 release-armv7-tokio \
         build-arm64 build-arm64-tokio release-arm64 release-arm64-tokio \
         test test-smol test-both stress e2e \
-        clippy clippy-smol clippy-both fmt check-deps bench profile \
+        clippy clippy-smol clippy-both fmt check-deps bench profile profile-mem profile-go profile-rust-go \
         targets install-cross clean distclean
 
 all: build
@@ -231,6 +232,10 @@ release-smol:
 # Auto-selects glibc (armv7-unknown-linux-gnueabihf) or musl
 # (armv7-unknown-linux-musleabihf) based on which C compiler is on PATH.
 #
+# Release builds use opt-level=s (size-optimized) instead of opt-level=3
+# to reduce binary size (~20% smaller text section). On ARMv7/embedded
+# devices, the speed difference is negligible while size matters.
+#
 # Prerequisites:
 #   make install-cross
 #   macOS:  brew install filosottile/musl-cross/musl-cross
@@ -250,15 +255,15 @@ build-armv7-tokio:
 
 release-armv7:
 	$(require-armv7-cc)
-	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (smol, release)..."
-	@$(armv7-env) $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (smol, release, opt-level=s)..."
+	@$(armv7-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARMV7_TARGET)/release/kcptun-client target/$(ARMV7_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARMV7_TARGET)/release/{kcptun-client,kcptun-server}"
 
 release-armv7-tokio:
 	$(require-armv7-cc)
-	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (tokio, release)..."
-	@$(armv7-env) $(CARGO) build --workspace --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (tokio, release, opt-level=s)..."
+	@$(armv7-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build --workspace --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARMV7_TARGET)/release/kcptun-client target/$(ARMV7_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARMV7_TARGET)/release/{kcptun-client,kcptun-server}"
 
@@ -288,15 +293,15 @@ build-arm64-tokio:
 
 release-arm64:
 	$(require-arm64-cc)
-	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (smol, release)..."
-	@$(arm64-env) $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (smol, release, opt-level=s)..."
+	@$(arm64-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARM64_TARGET)/release/kcptun-client target/$(ARM64_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARM64_TARGET)/release/{kcptun-client,kcptun-server}"
 
 release-arm64-tokio:
 	$(require-arm64-cc)
-	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (tokio, release)..."
-	@$(arm64-env) $(CARGO) build --workspace --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (tokio, release, opt-level=s)..."
+	@$(arm64-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build --workspace --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARM64_TARGET)/release/kcptun-client target/$(ARM64_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARM64_TARGET)/release/{kcptun-client,kcptun-server}"
 
@@ -350,6 +355,18 @@ targets:
 	@echo "    make clippy-both        — clippy (both backends)"
 	@echo "    make bench              — Go vs Rust-Tokio vs Rust-Smol"
 	@echo ""
+	@echo "  Profiling (Go pprof compatible):"
+	@echo "    make profiling-bins     — build profiling bins + pprof (CPU+heap+allocs+...)"
+	@echo "    make profile            — capture Rust CPU profile → Go protobuf (pprof)"
+	@echo "    make profile-mem        — capture Rust heap + allocs only (no long CPU sample)"
+	@echo "    make profile-rust-go    — alias for make profile"
+	@echo "    make profile-go         — capture Go kcptun CPU profile (for comparison)"
+	@echo "    After start with --pprof ADDR:"
+	@echo "      curl http://ADDR/debug/pprof/heap   # inuse heap (Go pprof)"
+	@echo "      curl http://ADDR/debug/pprof/allocs # cumulative allocs (Go pprof)"
+	@echo "      go tool pprof -http=:0 http://ADDR/debug/pprof/profile?seconds=30"
+	@echo "      go tool pprof -http=:0 http://ADDR/debug/pprof/heap"
+	@echo ""
 	@echo "  Prerequisites for cross-compilation:"
 	@echo "    1. make install-cross   (installs rustup glibc + musl targets)"
 	@echo "    2. Install a C cross-compiler (auto-detected):"
@@ -397,17 +414,20 @@ check-deps:
 bench: release release-smol
 	@bash bench/run_bench.sh
 
-# Flamegraph / samply (Rust) + Go pprof — see bench/PROFILE_RUNBOOK.md
-# Rust: cargo --profile profiling (readable symbols). SKIP_PROFILE_REBUILD=1 reuses bins.
+# Go pprof profiling — see bench/PROFILE_RUNBOOK.md
+# Rust: cargo --profile profiling --features pprof (readable symbols). SKIP_PROFILE_REBUILD=1 reuses bins.
 profile:
-	@bash bench/profile_flamegraph.sh all
+	@bash bench/profile_rust_go_pprof.sh
+
+profile-mem:
+	@bash bench/profile_rust_go_pprof.sh mem
 
 profiling-bins:
 	@extra="-C force-frame-pointers=yes"; \
 	case "$$(uname -m)" in arm64|aarch64) extra="--cfg aes_armv8 $$extra" ;; esac; \
 	RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$extra" \
-		$(CARGO) build --profile profiling -p kcptun-server -p kcptun-client -j $(NUM_JOBS)
-	@echo "Binaries: target/profiling/kcptun-{client,server}"
+		$(CARGO) build --profile profiling --features pprof -p kcptun-server -p kcptun-client -j $(NUM_JOBS)
+	@echo "Binaries: target/profiling/kcptun-{client,server}  (pprof enabled: /debug/pprof/{profile,heap,allocs,...) "
 
 # Go kcptun: net/http/pprof + go tool pprof (official Go toolchain flame graph)
 profile-go:

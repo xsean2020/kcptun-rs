@@ -3,8 +3,11 @@
 #
 # Go path (compatible with go tool pprof / go flame UI):
 #   - Go server/client:  --pprof  →  :6060/debug/pprof/*
-#   - Capture:           curl .../debug/pprof/profile?seconds=N
+#   - Capture CPU:       curl .../debug/pprof/profile?seconds=N
+#   - Capture Heap:      curl .../debug/pprof/heap
+#   - Capture Allocs:    curl .../debug/pprof/allocs
 #   - View:              go tool pprof -http=:0 cpu.pb.gz
+#                        go tool pprof -http=:0 heap.pb
 #
 # Rust cannot produce native Go pprof protobuf from samply without conversion.
 # For Rust readable stacks: bash bench/profile_flamegraph.sh → *.named.json.gz
@@ -16,7 +19,7 @@
 #   bash bench/profile_go_pprof.sh server 30    # 30s CPU sample
 #   CRYPT=null bash bench/profile_go_pprof.sh
 #
-# Requires: go on PATH, tests/kcptun-go/{server,client}, python3
+# Requires: go on PATH, tests/kcptun-go/{server,client}, python3, curl
 set -e
 cd "$(dirname "$0")/.."
 

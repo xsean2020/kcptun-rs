@@ -14,13 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// FEC header size (seqid + type = 6 bytes).
 pub const FEC_HEADER_SIZE: usize = 6;
 /// FEC header + 2B data size.
-pub const FEC_HEADER_SIZE_PLUS_2: usize = 8;
+pub(crate) const FEC_HEADER_SIZE_PLUS_2: usize = 8;
 /// FEC type: data packet.
 pub const FEC_TYPE_DATA: u16 = 0x00f1;
 /// FEC type: parity packet.
 pub const FEC_TYPE_PARITY: u16 = 0x00f2;
-/// FEC type: out-of-band data.
-pub const FEC_TYPE_OOB: u16 = 0x00f3;
 const MAX_SHARD_SETS: u32 = 3;
 
 // ─── Utilities ───────────────────────────────────────────────────────────
@@ -261,7 +259,7 @@ impl ShardHeap {
         if pkt.len() < 4 {
             return;
         }
-        let seqid = u32::from_le_bytes(pkt[..4].try_into().unwrap());
+        let seqid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         self.marks.insert(seqid, ());
         self.elements.push(Reverse(ShardEntry { seqid, data: pkt }));
     }
@@ -384,8 +382,9 @@ impl FecDecoder {
         if pkt.len() < 6 {
             return Vec::new();
         }
-        let seqid = u32::from_le_bytes(pkt[..4].try_into().unwrap());
-        let flag = u16::from_le_bytes(pkt[4..6].try_into().unwrap());
+        // Safe slice reads: length already checked (>= 6).
+        let seqid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
+        let flag = u16::from_le_bytes([pkt[4], pkt[5]]);
 
         // Auto-tune sampling
         if flag == FEC_TYPE_DATA {
@@ -572,8 +571,9 @@ impl FecDecoder {
 // ─── Utilities ───────────────────────────────────────────────────────────
 
 /// Parse FEC header from raw data.
+#[cfg(test)]
 #[inline]
-pub fn parse_fec_header(data: &[u8]) -> Option<(u32, u16)> {
+pub(crate) fn parse_fec_header(data: &[u8]) -> Option<(u32, u16)> {
     if data.len() < FEC_HEADER_SIZE {
         return None;
     }
@@ -582,8 +582,9 @@ pub fn parse_fec_header(data: &[u8]) -> Option<(u32, u16)> {
     Some((seq, fec_type))
 }
 
+#[cfg(test)]
 #[inline]
-pub fn is_data_packet(data: &[u8]) -> bool {
+pub(crate) fn is_data_packet(data: &[u8]) -> bool {
     if data.len() < FEC_HEADER_SIZE {
         return true;
     }
@@ -726,11 +727,12 @@ mod tests {
                 v
             };
             let (data, parity) = enc.wrap_kcp_packet(&kcp, 1000);
-            let size = u16::from_le_bytes(data[6..8].try_into().unwrap()) as usize;
+            // Use direct indexing instead of try_into().unwrap() for our own well-formed buffers.
+            let size = u16::from_le_bytes([data[6], data[7]]) as usize;
             assert_eq!(size, data.len() - 6);
             assert_eq!(&data[8..], &kcp[..]);
             assert_eq!(
-                u16::from_le_bytes(data[4..6].try_into().unwrap()),
+                u16::from_le_bytes([data[4], data[5]]),
                 FEC_TYPE_DATA
             );
             data_frames.push(data);
@@ -738,7 +740,7 @@ mod tests {
                 assert_eq!(parity.len(), 2);
                 for p in &parity {
                     assert_eq!(
-                        u16::from_le_bytes(p[4..6].try_into().unwrap()),
+                        u16::from_le_bytes([p[4], p[5]]),
                         FEC_TYPE_PARITY
                     );
                     assert_eq!(p.len(), data_frames[0].len());
@@ -752,11 +754,11 @@ mod tests {
         assert_eq!(parity_frames.len(), 2);
         // Seqids should be 0,1,2 for data and 3,4 for parity
         for (i, f) in data_frames.iter().enumerate() {
-            let seq = u32::from_le_bytes(f[0..4].try_into().unwrap());
+            let seq = u32::from_le_bytes([f[0], f[1], f[2], f[3]]);
             assert_eq!(seq, i as u32);
         }
         for (i, f) in parity_frames.iter().enumerate() {
-            let seq = u32::from_le_bytes(f[0..4].try_into().unwrap());
+            let seq = u32::from_le_bytes([f[0], f[1], f[2], f[3]]);
             assert_eq!(seq, 3 + i as u32);
         }
     }

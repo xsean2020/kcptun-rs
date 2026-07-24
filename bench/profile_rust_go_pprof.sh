@@ -5,7 +5,7 @@
 # This is what you want when you said: Rust profile → Go profile format → go tools.
 #
 # Prerequisites:
-#   cargo build --profile profiling -p kcptun-server -p kcptun-client
+#   cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client
 #   go on PATH
 #
 # Usage:
@@ -24,6 +24,15 @@ ROOT="$(pwd)"
 
 SIDE="${1:-server}"          # server | client
 SECONDS_N="${2:-20}"
+
+# Support memory-focused mode: bash ... mem [side] [seconds]
+# In mem mode we skip the long CPU sampling and focus on heap/allocs snapshots.
+MEM_ONLY=0
+if [ "$1" = "mem" ]; then
+  MEM_ONLY=1
+  SIDE="${2:-server}"
+  SECONDS_N="${3:-10}"
+fi
 KEY="${KEY:-bench-key}"
 DATA_MB="${BENCH_DATA_MB:-50}"
 CRYPT="${CRYPT:-aes}"
@@ -44,7 +53,7 @@ mkdir -p "$OUT_DIR"
 
 if [ ! -x "$SERVER" ] || [ ! -x "$CLIENT" ]; then
     echo "Missing binaries. Build first:"
-    echo "  RUSTFLAGS='-C force-frame-pointers=yes' cargo build --profile profiling -p kcptun-server -p kcptun-client"
+    echo "  RUSTFLAGS='-C force-frame-pointers=yes' cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client"
     exit 1
 fi
 if ! command -v go >/dev/null 2>&1; then
@@ -129,10 +138,16 @@ if [ $tries -le 0 ]; then
     echo "tunnel not ready"; tail -30 /tmp/rust-go-pprof-s.log /tmp/rust-go-pprof-c.log; exit 1
 fi
 
-URL="http://${PPROF_ADDR}/debug/pprof/profile?seconds=${SECONDS_N}"
+# URL for CPU profile (Go pprof protobuf)
+CPU_URL="http://${PPROF_ADDR}/debug/pprof/profile?seconds=${SECONDS_N}"
+HEAP_URL="http://${PPROF_ADDR}/debug/pprof/heap"
+ALLOCS_URL="http://${PPROF_ADDR}/debug/pprof/allocs"
+
 echo "╔══════════════════════════════════════════════════════════════════╗"
 echo "║  Rust → Go pprof protobuf   side=$SIDE  crypt=$CRYPT  ${SECONDS_N}s  ║"
-echo "║  $URL"
+echo "║  CPU:    $CPU_URL"
+echo "║  HEAP:   $HEAP_URL"
+echo "║  ALLOCS: $ALLOCS_URL"
 echo "╚══════════════════════════════════════════════════════════════════╝"
 
 # Drive load while sampling
@@ -144,12 +159,24 @@ echo "╚═══════════════════════�
 ) &
 LOAD_PID=$!
 
-if ! curl -fsS -o "$OUT_PB" "$URL"; then
-    echo "curl pprof failed"; tail -40 /tmp/rust-go-pprof-s.log /tmp/rust-go-pprof-c.log; exit 1
+# Capture CPU profile (required)
+if ! curl -fsS -o "$OUT_PB" "$CPU_URL"; then
+    echo "curl pprof (cpu) failed"; tail -40 /tmp/rust-go-pprof-s.log /tmp/rust-go-pprof-c.log; exit 1
 fi
+
+# Capture heap + allocs (Go pprof memory profiles)
+# These are instantaneous snapshots; capture after load settles a bit.
+HEAP_PB="$OUT_DIR/rust-${SIDE}-${CRYPT}-${TS}-heap.pb"
+ALLOCS_PB="$OUT_DIR/rust-${SIDE}-${CRYPT}-${TS}-allocs.pb"
+
+curl -fsS -o "$HEAP_PB" "$HEAP_URL" || echo "  (heap capture failed or empty)"
+curl -fsS -o "$ALLOCS_PB" "$ALLOCS_URL" || echo "  (allocs capture failed or empty)"
+
 wait $LOAD_PID 2>/dev/null || true
 
-echo "  artifact=$OUT_PB ($(wc -c < "$OUT_PB" | tr -d ' ') bytes)"
+echo "  artifact(cpu)=$OUT_PB ($(wc -c < "$OUT_PB" 2>/dev/null | tr -d ' ') bytes)"
+[ -s "$HEAP_PB" ] && echo "  artifact(heap)=$HEAP_PB ($(wc -c < "$HEAP_PB" 2>/dev/null | tr -d ' ') bytes)"
+[ -s "$ALLOCS_PB" ] && echo "  artifact(allocs)=$ALLOCS_PB ($(wc -c < "$ALLOCS_PB" 2>/dev/null | tr -d ' ') bytes)"
 echo "  git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo ""
 if command -v go >/dev/null 2>&1; then

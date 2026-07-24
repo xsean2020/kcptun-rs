@@ -49,7 +49,7 @@ pub mod time;
 pub use net::{TcpListener, TcpStream, UdpSocket};
 pub use sync::Notify;
 pub use task::{block_on, cpu_block, spawn_task, JoinHandle};
-pub use time::{sleep, sleep_ms, timeout, Elapsed};
+pub use time::{sleep, sleep_ms, timeout, Elapsed, mono_ms};
 
 /// Read a file to a string, using a blocking thread pool to avoid stalling
 /// the async runtime. Replaces `tokio::fs::read_to_string`.
@@ -60,27 +60,14 @@ pub async fn read_to_string(
     cpu_block(move || std::fs::read_to_string(&path)).await
 }
 
-/// Bidirectionally copy data between two `AsyncRead + AsyncWrite` streams.
-/// Returns `(a_to_b_bytes, b_to_a_bytes)`.
-///
-/// When one direction reaches EOF, the other's write side is shut down so the
-/// peer can also complete gracefully.
-pub async fn copy_bidirectional<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    cfg_copy_bidirectional(a, b).await
-}
-
 /// Bidirectionally copy data with an **idle** timeout.
 ///
-/// Like [`copy_bidirectional`], but breaks gracefully when no data flows in
-/// either direction for `idle_secs` seconds. The idle timer resets after
-/// every data transfer, matching Go kcptun's `closeWait` semantics (an
-/// idle/cleanup period, NOT a total pipe duration limit).
+/// Breaks gracefully when no data flows in either direction for `idle_secs`
+/// seconds. The idle timer resets after every data transfer, matching Go
+/// kcptun's `closeWait` semantics (an idle/cleanup period, NOT a total pipe
+/// duration limit).
 ///
-/// If `idle_secs == 0`, behaves identically to [`copy_bidirectional`].
+/// If `idle_secs == 0`, behaves as a plain bidirectional copy without timeout.
 pub async fn copy_bidirectional_idle<A, B>(
     a: &mut A,
     b: &mut B,

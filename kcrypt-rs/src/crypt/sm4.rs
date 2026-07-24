@@ -7,7 +7,7 @@
 //! Uses the **tjfoc/gmsm/sm4** S-box, NOT the standard GB/T 32907 S-box.
 //! The tjfoc/gmsm implementation has a different S-box from the standard!
 
-use super::{cfb16_dec, cfb16_enc, BlockCrypt};
+use super::{BlockCrypt, BlockCipher16, cfb16_encrypt, cfb16_decrypt};
 
 /// SM4 S-box from Go's tjfoc/gmsm/sm4/sm4.go (NOT the standard SM4 S-box!)
 const SBOX: [u8; 256] = [
@@ -103,19 +103,21 @@ impl Sm4Crypt {
             out[i * 4..i * 4 + 4].copy_from_slice(&v);
         }
     }
+}
 
+impl BlockCipher16 for Sm4Crypt {
     #[inline]
-    fn sm4_enc(&self, inp: &[u8; 16], out: &mut [u8; 16]) {
+    fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]) {
         self.encrypt_block(inp, out);
     }
 }
 
 impl BlockCrypt for Sm4Crypt {
     fn encrypt(&self, data: &mut [u8]) {
-        cfb16_enc(data, &|i, o| self.sm4_enc(i, o));
+        cfb16_encrypt(data, self);
     }
     fn decrypt(&self, data: &mut [u8]) {
-        cfb16_dec(data, &|i, o| self.sm4_enc(i, o));
+        cfb16_decrypt(data, self);
     }
     fn name(&self) -> &'static str {
         "sm4"

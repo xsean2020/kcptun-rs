@@ -25,14 +25,6 @@ const CHUNK_DERIVE_LOOPS: u32 = 1024;
 const PAD_SWITCH: u8 = 8;
 const QUBITS: u8 = 8;
 
-/// QPP minimum seed length.
-pub const QPP_MIN_SEED_LENGTH: usize = 32;
-/// QPP permutation dimension (power).
-pub const QPP_POWER: u16 = 8;
-/// Default QPP pad size in bytes.
-pub const QPP_PAD_SIZE: usize = 256;
-/// Minimum number of pads.
-pub const QPP_MINIMUM_PADS: u16 = 3;
 
 // ─── Rand (xoshiro256** PRNG) ─────────────────────────────────────────────
 
@@ -407,18 +399,6 @@ fn qpp_minimum_seed_length_inner(qubits: u8) -> usize {
     (bits.ceil() as usize).div_ceil(8)
 }
 
-/// Calculate the minimum seed length required for the given permutation dimension.
-pub fn qpp_minimum_seed_length(_power: u8) -> usize {
-    QPP_MIN_SEED_LENGTH
-}
-pub fn qpp_minimum_pads(_power: u8) -> u16 {
-    QPP_MINIMUM_PADS
-}
-
-/// Create a PRNG from a seed (matching Go's `qpp.CreatePRNG`).
-pub fn create_qpp_prng(seed: &[u8]) -> Rand {
-    create_prng(seed)
-}
 
 // ─── Tests ───────────────────────────────────────────────────────────────
 

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Perf — TEA CFB monomorphize
+
+- **`TeaCrypt`**: specialized CFB-8 (`cfb_enc_specialized` / `cfb_dec_specialized`)
+  calls `encrypt_block` directly with `#[inline(always)]` — no generic
+  `cfb8_enc`/`Fn` closure. Same pattern as XTEA / 3DES / Blowfish.
+- Wire-compatible: fixed `GO_CFB_IV`, CFB-8, 8 TEA rounds (Go
+  `tea.NewCipherWithRounds(key, 16)` → rounds/2).
+- Motivation: tea/comp was the only major cipher under the 0.90× Go thr gate
+  in the prior matrix (~0.86×); random-payload profiles showed TEA CFB as a
+  visible leaf without a monomorphized path.
+
+Tea-only re-bench after change (10×1MB, release, this host):
+| config | Go | Rust-tokio | T/Go |
+|--------|---:|-----------:|-----:|
+| tea/nocomp | 34.7 | **38.8** | **1.12×** |
+| tea/comp | 28.9 | **47.3** | **1.64×** |
+
 ### Fixed — session-layer FEC encode/decode (Go-compatible)
 
 - **FecEncoder** wired on client/server send path (flush + ACK):
@@ -61,6 +78,22 @@ Measured (median of 3, 2MB×4 conn, this host):
   drain is ≥4 KiB, compress via `kio::cpu_block` (persistent pool on smol /
   `spawn_blocking` on tokio). Smaller flushes stay inline.
 - New helper: `kcp_rs::should_cpu_block_compress` (shared threshold).
+
+### Fixed — KCP stream-mode append + Bytes retransmit zero-copy (R5)
+
+- Deferred payload freeze from `send()` to `flush()`: freezing right after
+  `extend_from_slice` emptied `seg.data`, so the next stream-mode append
+  (coalesce via `snd_queue.back_mut()`) appended to empty data, set a larger
+  `len`, but `payload` still held the old shorter view — `encode()` panicked
+  on `payload[..len]`.
+- Stream append now preserves sharing: when the prior segment already has a
+  frozen `payload`, combine it with the new bytes into a fresh `Bytes`
+  (zero-copy of the old prefix); otherwise extend `data` then freeze the
+  combined result. `len` is always derived from the active view.
+- `encode()` prefers the frozen `payload` when present (retransmit sharing);
+  headers (ts/wnd/una) are still written fresh per transmit.
+- Added regression: second `send()` larger than the first in stream mode
+  must not panic, must round-trip, and must not emit packets > MTU.
 
 ### Fixed — SNMP stats aligned with Go kcp-go + opt-in collection
 

@@ -5,6 +5,7 @@ members = [
     "smux-rs",
     "qpp-rs",
     "kio-rs",
+    "kpprof-rs",
     "kcptun-client",
     "kcptun-server",
 ]

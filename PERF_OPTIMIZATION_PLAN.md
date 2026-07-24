@@ -145,7 +145,7 @@ TCP read (64KB pipe)
 | R2 | KCP `output` → `Bytes` 所有权 / `raw_packets: Vec<Bytes>` | ✅ 已完成（P4） | 少一次 output 侧拷贝；bulk ~1.43× Go |
 | R3 | Linux `sendmmsg`/`recvmmsg` | 中（平台） | 高 pps；loopback 收益有限 |
 | R4 | SMUX 收端多锁合并 `StreamInner` | 中 | 读路径；写已部分优化 |
-| R5 | KCP 载荷 `Bytes` 重传零拷贝 | 中 | 重传场景 |
+| R5 | KCP 载荷 `Bytes` 重传零拷贝 | ✅ 已完成 | 重传场景（Segment.payload: Bytes；send/append 即时 freeze；encode 零拷贝） |
 | R6 | `input` 单段栈解析 | 低–中 | 微优化 |
 | R7 | 热路径 metrics / empty_flush | 中（可观测） | 防回归 |
 | R8 | criterion 每 cipher 基准 | 低 | 对比 Go |
@@ -318,7 +318,7 @@ struct StreamInner {
 - [x] `encrypt_batch` / `should_cpu_block_encrypt` (P0.5)  
 - [x] null-path `Bytes::from(Vec)` in encrypt_batch (partial P1.1)  
 - [x] CFB small-batch `encrypt_cfb` reuse; large-batch prepare+parallel (P1.1)  
-- [ ] 载荷 `Bytes` 重传（deferred: stream-mode append + pool; encode header micro-opt done）  
+- [x] 载荷 `Bytes` 重传（R5 已完成：Segment.payload + 即时 freeze；stream 追加/首发/重传零拷贝）  
 - [x] `input` header 栈上 parse（24B slice；payload 仍走 SegmentPool）
 
 ### 7.3 单 PR 纪律
@@ -398,7 +398,7 @@ BENCH_DATA_MB=50 bash bench/run_bench.sh
 - [x] `encrypt_batch` / `should_cpu_block_encrypt`  
 - [x] null move / 小批 encrypt_cfb  
 - [x] output `Bytes`（R2 已完成：`KCP::output` 签名改为 `FnMut(Bytes)`，`encrypt_batch` 收 `Vec<Bytes>`，去掉 `BufferPool`）  
-- [ ] 载荷 `Bytes` 重传  
+- [x] 载荷 `Bytes` 重传（R5 已完成：Segment.payload + 即时 freeze；stream 追加/首发/重传零拷贝）  
 - [~] input 快路径（header 栈解析✅；payload 仍 `extend_from_slice`）  
 
 ### 9.3 `smux-rs`

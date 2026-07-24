@@ -7,7 +7,7 @@
 //! This is ~5x faster than the RustCrypto twofish crate (v0.7.1) which
 //! recomputes sbox+gf_mult per block.
 
-use super::{cfb16_dec, cfb16_enc, BlockCrypt};
+use super::{BlockCrypt, BlockCipher16, cfb16_encrypt, cfb16_decrypt};
 
 // ─── Constants (from Go's twofish.go) ────────────────────────────────────
 
@@ -346,12 +346,19 @@ impl TwofishCrypt {
     }
 }
 
+impl BlockCipher16 for TwofishCrypt {
+    #[inline]
+    fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]) {
+        self.encrypt_block(inp, out);
+    }
+}
+
 impl BlockCrypt for TwofishCrypt {
     fn encrypt(&self, data: &mut [u8]) {
-        cfb16_enc(data, &|i, o| self.encrypt_block(i, o));
+        cfb16_encrypt(data, self);
     }
     fn decrypt(&self, data: &mut [u8]) {
-        cfb16_dec(data, &|i, o| self.encrypt_block(i, o));
+        cfb16_decrypt(data, self);
     }
     fn name(&self) -> &'static str {
         "twofish"

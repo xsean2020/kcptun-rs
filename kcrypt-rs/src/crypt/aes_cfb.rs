@@ -4,8 +4,9 @@
 //! The cipher instance is created ONCE in the constructor and reused —
 //! re-creating it per block (key schedule) was the original perf bug.
 
-use super::{cfb16_dec, cfb16_enc, BlockCrypt};
+use super::{BlockCrypt, BlockCipher16, cfb16_encrypt, cfb16_decrypt};
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use aes::cipher::consts::U16;
 
 enum AesCipher {
     Aes128(aes::Aes128),
@@ -73,12 +74,44 @@ impl AesCfbCrypt {
     }
 }
 
+impl BlockCipher16 for AesCfbCrypt {
+    #[inline]
+    fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]) {
+        self.aes_enc(inp, out);
+    }
+
+    /// Encrypt multiple contiguous 16-byte blocks using the underlying AES
+    /// implementation's `encrypt_blocks`, enabling ILP / pipelining on AES-NI
+    /// and ARMv8 Crypto when the caller has independent blocks.
+    #[inline]
+    fn encrypt_blocks(&self, blocks: &mut [u8]) {
+        use aes::cipher::BlockEncrypt;
+        if blocks.len() < 16 {
+            return;
+        }
+        // Number of full blocks
+        let n = blocks.len() / 16;
+        // Map &mut [u8] (multiple of 16) to &mut [GenericArray<u8, U16>] without copying.
+        // GenericArray<u8, U16> has the same layout as [u8; 16].
+        // We only touch the prefix that is a multiple of the block size.
+        let (head, _tail) = blocks.split_at_mut(n * 16);
+        // SAFETY: head length is a multiple of 16; alignment of u8 is sufficient for GenericArray.
+        let gas: &mut [GenericArray<u8, U16>] =
+            unsafe { std::slice::from_raw_parts_mut(head.as_mut_ptr() as *mut _, n) };
+        match &self.cipher {
+            AesCipher::Aes128(c) => c.encrypt_blocks(gas),
+            AesCipher::Aes192(c) => c.encrypt_blocks(gas),
+            AesCipher::Aes256(c) => c.encrypt_blocks(gas),
+        }
+    }
+}
+
 impl BlockCrypt for AesCfbCrypt {
     fn encrypt(&self, data: &mut [u8]) {
-        cfb16_enc(data, &|i, o| self.aes_enc(i, o));
+        cfb16_encrypt(data, self);
     }
     fn decrypt(&self, data: &mut [u8]) {
-        cfb16_dec(data, &|i, o| self.aes_enc(i, o));
+        cfb16_decrypt(data, self);
     }
     fn name(&self) -> &'static str {
         self.cipher_name

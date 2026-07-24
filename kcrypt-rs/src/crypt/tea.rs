@@ -3,8 +3,11 @@
 //! Ported from Go's `golang.org/x/crypto/tea`. Uses CFB-8 mode.
 //! Go's `tea.NewCipherWithRounds(key, 16)` uses rounds=16,
 //! and the Encrypt loop runs rounds/2 = 8 iterations.
+//!
+//! Hot path: monomorphized CFB (no `Fn` closure) matching XTEA/3DES style,
+//! so CFB XOR + block encrypt can inline through `encrypt_batch`.
 
-use super::{cfb8_dec, cfb8_enc, BlockCrypt};
+use super::{BlockCrypt, BlockCipher8, cfb8_encrypt, cfb8_decrypt};
 
 #[derive(Debug)]
 pub struct TeaCrypt {
@@ -19,7 +22,9 @@ impl TeaCrypt {
         TeaCrypt { key: k }
     }
 
-    fn tea_enc(&self, inp: &[u8; 8], out: &mut [u8; 8]) {
+    /// Single 8-byte block encrypt (matches Go tea, 8 Feistel iterations).
+    #[inline(always)]
+    fn encrypt_block(&self, out: &mut [u8; 8], inp: &[u8; 8]) {
         let mut v0 = u32::from_be_bytes([inp[0], inp[1], inp[2], inp[3]]);
         let mut v1 = u32::from_be_bytes([inp[4], inp[5], inp[6], inp[7]]);
         let k = |i: usize| {
@@ -50,12 +55,19 @@ impl TeaCrypt {
     }
 }
 
+impl BlockCipher8 for TeaCrypt {
+    #[inline]
+    fn encrypt_block(&self, out: &mut [u8; 8], inp: &[u8; 8]) {
+        self.encrypt_block(out, inp);
+    }
+}
+
 impl BlockCrypt for TeaCrypt {
     fn encrypt(&self, data: &mut [u8]) {
-        cfb8_enc(data, &|i, o| self.tea_enc(i, o));
+        cfb8_encrypt(data, self);
     }
     fn decrypt(&self, data: &mut [u8]) {
-        cfb8_dec(data, &|i, o| self.tea_enc(i, o));
+        cfb8_decrypt(data, self);
     }
     fn name(&self) -> &'static str {
         "tea"
@@ -100,5 +112,20 @@ mod tests {
         let k = |i: usize| u32::from_be_bytes([key[i], key[i + 1], key[i + 2], key[i + 3]]);
         assert_eq!(k(0), 0x30313233, "TEA key bytes are big-endian");
         let _ = (block, lo, hi);
+    }
+
+    #[test]
+    fn tea_cfb_roundtrip_variable_lengths() {
+        // Specialized CFB must round-trip multi-length payloads (wire CFB-8).
+        let key = b"bench-key-tea!!!!";
+        let crypt = TeaCrypt::new(key);
+        for len in [1usize, 7, 8, 15, 16, 63, 64, 65, 128, 1024] {
+            let mut data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let orig = data.clone();
+            crypt.encrypt(&mut data);
+            assert_ne!(&data[..], &orig[..], "len={len} must change");
+            crypt.decrypt(&mut data);
+            assert_eq!(&data[..], &orig[..], "len={len} roundtrip");
+        }
     }
 }

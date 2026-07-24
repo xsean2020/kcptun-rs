@@ -240,5 +240,5 @@ bash bench/profile_rust_go_pprof.sh server 20
 go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-*.pb
 ```
 
-samply/Speedscope remains available via `bench/profile_flamegraph.sh` (post-processed `*.named.json.gz`).
+Build with `--features pprof` to enable the Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock). Use `--features pprof-deadlock` for deadlock detection.
 

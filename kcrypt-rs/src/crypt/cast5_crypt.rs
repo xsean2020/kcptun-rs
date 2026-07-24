@@ -4,7 +4,7 @@
 //! `golang.org/x/crypto/cast5` (see [`crate::cast5`]). Wire-compatible
 //! with Go's cast5 cipher. Operates in CFB-8 mode.
 
-use super::{cfb8_dec, cfb8_enc, BlockCrypt};
+use super::{BlockCrypt, BlockCipher8, cfb8_decrypt, cfb8_encrypt};
 
 #[derive(Debug)]
 pub struct Cast5Crypt {
@@ -17,18 +17,21 @@ impl Cast5Crypt {
             .unwrap_or_else(|_| crate::cast5::Cast5Cipher::new(&[0u8; 16]).unwrap());
         Cast5Crypt { cipher }
     }
+}
 
-    fn c5_enc(&self, inp: &[u8; 8], out: &mut [u8; 8]) {
+impl BlockCipher8 for Cast5Crypt {
+    #[inline]
+    fn encrypt_block(&self, out: &mut [u8; 8], inp: &[u8; 8]) {
         self.cipher.encrypt_block(out, inp);
     }
 }
 
 impl BlockCrypt for Cast5Crypt {
     fn encrypt(&self, data: &mut [u8]) {
-        cfb8_enc(data, &|i, o| self.c5_enc(i, o));
+        cfb8_encrypt(data, self);
     }
     fn decrypt(&self, data: &mut [u8]) {
-        cfb8_dec(data, &|i, o| self.c5_enc(i, o));
+        cfb8_decrypt(data, self);
     }
     fn name(&self) -> &'static str {
         "cast5"

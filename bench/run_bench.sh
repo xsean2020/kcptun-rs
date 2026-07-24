@@ -203,5 +203,7 @@ run_bench "Rust-Tokio → Rust-Tokio"    "$RUST_TOKIO_SERVER"   "$RUST_TOKIO_CLI
 run_bench "Rust-Smol → Rust-Smol"      "$RUST_SMOL_SERVER"    "$RUST_SMOL_CLIENT"
 run_bench "Go → Rust-Tokio"            "$GO_SERVER"           "$RUST_TOKIO_CLIENT"
 run_bench "Rust-Tokio → Go"            "$RUST_TOKIO_SERVER"   "$GO_CLIENT"
+run_bench "Rust-Smol → Rust-Tokio"     "$RUST_SMOL_SERVER"    "$RUST_TOKIO_CLIENT"
+run_bench "Rust-Tokio → Rust-Smol"     "$RUST_TOKIO_SERVER"   "$RUST_SMOL_CLIENT"
 
 echo "Benchmark complete."

@@ -11,10 +11,16 @@
     clippy::too_many_arguments
 )]
 
+#[cfg(not(feature = "pprof"))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(feature = "pprof"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+#[cfg(feature = "pprof")]
+#[global_allocator]
+static GLOBAL: kpprof::ProfilingAllocator = kpprof::ProfilingAllocator::new();
 
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -1085,12 +1091,18 @@ impl KcpServerSession {
         kcp.set_stream_mode(true);
 
         // Apply mode profile or explicit parameters
-        if !mode.is_empty() {
-            apply_mode(&mut kcp, mode);
-        } else {
-            let n = if nodelay > 0 { nodelay } else { 0 };
-            let i = if interval >= 10 { interval } else { 40 };
-            kcp.set_nodelay(n, i, resend, nc);
+        // Go semantics: known modes (normal/fast/fast2/fast3) override hidden flags.
+        // "manual" or unknown modes use the explicit nodelay/interval/resend/nc values.
+        match mode {
+            "normal" | "fast" | "fast2" | "fast3" => {
+                apply_mode(&mut kcp, mode);
+            }
+            _ => {
+                // manual mode or unknown: use explicit values (from CLI or config)
+                let n = nodelay;
+                let i = if interval >= 10 { interval } else { 40 };
+                kcp.set_nodelay(n, i, resend, nc);
+            }
         }
 
         let kcp = Arc::new(parking_lot::Mutex::new(kcp));
@@ -1102,7 +1114,11 @@ impl KcpServerSession {
             max_stream_buffer: streambuf,
             max_frame_size: framesize,
             keepalive_interval: keepalive,
-            keepalive_timeout: 30,
+            keepalive_timeout: if keepalive == 0 {
+                0
+            } else {
+                keepalive.saturating_mul(3).max(1)
+            },
         };
         let smux = match smux_rs::Session::new_server(&smux_cfg) {
             Ok(s) => Arc::new(s),
@@ -1191,6 +1207,8 @@ impl KcpServerSession {
             let mut next_update: u64 = KCP_UPDATE_INTERVAL_MS;
             // Reused across iterations: single buffer for SMUX frame assembly (P0.3).
             let mut out_buf = BytesMut::with_capacity(64 * 1024);
+            // Throttle Phase 0 health checks (~100ms); flush still runs at full rate.
+            let mut health_checks_left: u32 = 0;
 
             loop {
                 // Wait for either the dynamic interval (nearest RTO or
@@ -1199,10 +1217,39 @@ impl KcpServerSession {
                 let _ =
                     kio::timeout(Duration::from_millis(next_update), flush_notify.notified()).await;
 
+                // Fresh frame buffer each cycle.
+                out_buf.clear();
+
+                // ── Phase 0: dead-link + SMUX keepalive ──
+                if smux.is_closed() {
+                    break;
+                }
+                if health_checks_left == 0 {
+                    health_checks_left = 50; // ~100ms at 2ms update interval
+                    if kcp.lock().is_dead() {
+                        error!("KCP dead_link detected for peer {} — closing session", peer);
+                        smux.close();
+                        break;
+                    }
+                    if smux.is_keepalive_timeout() {
+                        error!("SMUX keepalive timeout for peer {} — closing session", peer);
+                        smux.close();
+                        break;
+                    }
+                    if smux.check_keepalive() {
+                        let nop = smux.keepalive_frame();
+                        nop.encode(&mut out_buf);
+                        smux.mark_keepalive_sent();
+                        debug!("SMUX: queued NOP keepalive for {}", peer);
+                    }
+                } else {
+                    health_checks_left -= 1;
+                }
+
                 // ── Phase 1: Drain SMUX + encode frames into out_buf (NO KCP lock) ──
                 // Header reserved, payload drained in place, length patched (P0.3).
                 // Wrapped so stream MutexGuard is dropped before any .await.
-                out_buf.clear();
+                // Note: do not clear out_buf here — Phase 0 may have queued NOP.
                 let fin_streams = {
                     let streams = smux.streams();
                     let stream_map = streams.lock();
@@ -1474,7 +1521,14 @@ impl KcpServerSession {
                             );
                             kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.out_bytes, nbytes);
                         }
-                        Err(e) => warn!("UDP send_to error ({}): {}", peer, e),
+                        Err(e) => {
+                            warn!("UDP send_to error ({}): {}", peer, e);
+                            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                                error!("ConnectionRefused for {} — broken socket, closing", peer);
+                                smux.close();
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1930,10 +1984,7 @@ async fn async_main() -> Result<()> {
     }
 
     let listen = cli.listen.as_deref().unwrap_or(":29900");
-    let target = cli
-        .target
-        .as_deref()
-        .context("target address (-t) is required")?;
+    let target = cli.target.as_deref().unwrap_or("127.0.0.1:12948");
 
     let key_str = cli.key.as_deref().unwrap();
     let crypt_method = cli.crypt.as_deref().unwrap();
@@ -1948,9 +1999,9 @@ async fn async_main() -> Result<()> {
     let nocomp = cli.nocomp;
     let acknodelay = cli.acknodelay;
     let nodelay = cli.nodelay.unwrap_or(0);
-    let interval = cli.interval.unwrap_or(30);
-    let resend = cli.resend.unwrap_or(2);
-    let nc = cli.nc.unwrap_or(1);
+    let interval = cli.interval.unwrap_or(50);
+    let resend = cli.resend.unwrap_or(0);
+    let nc = cli.nc.unwrap_or(0);
     let smuxver = cli.smuxver.unwrap_or(2);
     let smuxbuf = cli.smuxbuf.unwrap_or(4 * 1024 * 1024);
     let streambuf = cli.streambuf;
@@ -2039,10 +2090,12 @@ async fn async_main() -> Result<()> {
     #[cfg(feature = "pprof")]
     if let Some(ref pprof_addr) = cli.pprof {
         info!("starting pprof HTTP server on {}", pprof_addr);
+        #[cfg(feature = "pprof-deadlock")]
+        kpprof::start_deadlock_detector();
         let pprof_stop = stop_flag.clone();
         let addr = pprof_addr.clone();
         kio::spawn_task(async move {
-            if let Err(e) = run_pprof(&addr, pprof_stop).await {
+            if let Err(e) = kpprof::run_pprof(&addr, pprof_stop).await {
                 error!("pprof server error: {}", e);
             }
         });
@@ -2188,172 +2241,9 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "pprof")]
-/// HTTP pprof server compatible with `go tool pprof`.
-///
-/// Endpoints (same shape as Go `net/http/pprof`):
-///   GET /debug/pprof/                      — short index
-///   GET /debug/pprof/profile?seconds=N     — CPU profile as **protobuf** (default 30s)
-///
-/// Examples:
-///   ./target/profiling/kcptun-server -l :29900 -t 127.0.0.1:8080 --pprof 127.0.0.1:6060
-///   go tool pprof -http=:0 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20'
-///   curl -o cpu.pb 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20'
-///   go tool pprof -http=:0 cpu.pb
-async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
-    use kio::AsyncReadExt;
-    use kio::AsyncWriteExt;
-    let socket_addr: SocketAddr = addr.parse().context("invalid pprof address")?;
-    let listener = kio::TcpListener::bind(socket_addr).await?;
-    info!("pprof listening on http://{}/debug/pprof/", socket_addr);
-
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let accepted = kio::timeout(Duration::from_millis(500), listener.accept()).await;
-        let (mut stream, peer) = match accepted {
-            Ok(Ok(v)) => v,
-            _ => continue,
-        };
-
-        let mut buf = vec![0u8; 8192];
-        let mut filled = 0usize;
-        loop {
-            if filled >= buf.len() {
-                break;
-            }
-            match kio::timeout(Duration::from_secs(2), stream.read(&mut buf[filled..])).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    filled += n;
-                    if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n")
-                        || buf[..filled].windows(2).any(|w| w == b"\n\n")
-                    {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        let req = String::from_utf8_lossy(&buf[..filled]);
-        let first_line = req.lines().next().unwrap_or("");
-        let path_q = first_line.split_whitespace().nth(1).unwrap_or("/");
-        let (path, query) = match path_q.split_once('?') {
-            Some((p, q)) => (p, q),
-            None => (path_q, ""),
-        };
-
-        async fn respond(stream: &mut kio::TcpStream, status: &str, ctype: &str, body: &[u8]) {
-            let header = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(body).await;
-            let _ = stream.flush().await;
-        }
-
-        if path == "/debug/pprof/" || path == "/debug/pprof" {
-            let body = concat!(
-                "kcptun-rs pprof (Go protobuf format)\n",
-                "  GET /debug/pprof/profile?seconds=30\n",
-                "Use: go tool pprof -http=:0 http://ADDR/debug/pprof/profile?seconds=20\n",
-            );
-            respond(
-                &mut stream,
-                "200 OK",
-                "text/plain; charset=utf-8",
-                body.as_bytes(),
-            )
-            .await;
-            continue;
-        }
-
-        if path == "/debug/pprof/profile" {
-            let mut seconds: u64 = 30;
-            for part in query.split('&') {
-                if let Some(v) = part.strip_prefix("seconds=") {
-                    if let Ok(n) = v.parse::<u64>() {
-                        seconds = n.clamp(1, 300);
-                    }
-                }
-            }
-            info!("pprof CPU profile {}s peer={}", seconds, peer);
-
-            // ProfilerGuard / ReportBuilder are !Send; sample on a blocking thread
-            // so the async task remains Send for kio::spawn_task.
-            let profile_result = kio::cpu_block(move || -> std::result::Result<Vec<u8>, String> {
-                use pprof::protos::Message;
-                // blocklist() is only available on arches with findshlibs support
-                // (x86_64/aarch64/riscv64/loongarch64) — not on armv7.
-                let builder = pprof::ProfilerGuardBuilder::default().frequency(997);
-                #[cfg(any(
-                    target_arch = "x86_64",
-                    target_arch = "aarch64",
-                    target_arch = "riscv64",
-                    target_arch = "loongarch64"
-                ))]
-                let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
-                let guard = builder
-                    .build()
-                    .map_err(|e| format!("profiler start failed: {e}"))?;
-                std::thread::sleep(Duration::from_secs(seconds));
-                let report = guard
-                    .report()
-                    .build()
-                    .map_err(|e| format!("report build failed: {e}"))?;
-                let profile = report
-                    .pprof()
-                    .map_err(|e| format!("build pprof failed: {e}"))?;
-                let mut content = Vec::new();
-                profile
-                    .write_to_vec(&mut content)
-                    .map_err(|e| format!("encode pprof failed: {e}"))?;
-                Ok(content)
-            })
-            .await;
-
-            let profile_bytes = match profile_result {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    let msg = format!("{e}\n");
-                    respond(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "text/plain; charset=utf-8",
-                        msg.as_bytes(),
-                    )
-                    .await;
-                    continue;
-                }
-            };
-
-            respond(
-                &mut stream,
-                "200 OK",
-                "application/octet-stream",
-                &profile_bytes,
-            )
-            .await;
-            info!(
-                "pprof profile complete ({} bytes) peer={}",
-                profile_bytes.len(),
-                peer
-            );
-            continue;
-        }
-
-        respond(
-            &mut stream,
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            b"not found\ntry GET /debug/pprof/\n",
-        )
-        .await;
-    }
-    Ok(())
-}
+// pprof run_pprof() is now provided by the kpprof-rs crate.
+// When --features pprof is enabled, kpprof::run_pprof() serves all
+// Go-compatible /debug/pprof/* endpoints.
 
 // ─── Tests ──────────────────────────────────────────────────────────────────────
 

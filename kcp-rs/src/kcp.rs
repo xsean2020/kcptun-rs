@@ -35,7 +35,7 @@ const IKCP_RTO_DEF: u32 = 200;
 const IKCP_RTO_MAX: u32 = 60000;
 
 /// The first probe interval (500ms, matching Go)
-pub const IKCP_PROBE_INIT: u32 = 500;
+pub(crate) const IKCP_PROBE_INIT: u32 = 500;
 /// Max probe interval (120s, matching Go)
 pub const IKCP_PROBE_LIMIT: u32 = 120000;
 
@@ -66,7 +66,7 @@ pub struct KCP {
 
     // ── Receive side ──
     rcv_queue: VecDeque<Segment>,
-    rcv_buf: Vec<Segment>,
+    rcv_buf: VecDeque<Segment>,
     rcv_nxt: u32,
 
     // ── Windows ──
@@ -142,31 +142,6 @@ impl fmt::Debug for KCP {
     }
 }
 
-// ─── Helpers (matching Go) ────────────────────────────────────────────────
-
-#[inline]
-fn _imin_(a: u32, b: u32) -> u32 {
-    if a <= b {
-        a
-    } else {
-        b
-    }
-}
-
-#[inline]
-fn _imax_(a: u32, b: u32) -> u32 {
-    if a >= b {
-        a
-    } else {
-        b
-    }
-}
-
-#[inline]
-fn _ibound_(lower: u32, middle: u32, upper: u32) -> u32 {
-    _imin_(_imax_(lower, middle), upper)
-}
-
 /// Signed difference for wrapping-safe sequence number comparisons.
 /// Matches the original KCP C function `_itimediff(later, earlier)`.
 #[inline]
@@ -191,7 +166,7 @@ impl KCP {
             snd_nxt: 0,
             snd_una: 0,
             rcv_queue: VecDeque::with_capacity(128),
-            rcv_buf: Vec::with_capacity(128),
+            rcv_buf: VecDeque::with_capacity(128),
             rcv_nxt: 0,
             snd_wnd: KCP_DEFAULT_WND,
             rcv_wnd: KCP_DEFAULT_WND,
@@ -374,6 +349,10 @@ impl KCP {
             }
             seg.data.extend_from_slice(&data[offset..offset + size]);
             seg.len = size as u32;
+            // Note: payload freezing is deferred to flush() — see the freeze
+            // step before encode() in the snd_buf transmit loop.  Freezing
+            // here would empty `data` and break stream-mode append on the
+            // next send() call (capacity check uses data.len()).
             self.snd_queue.push_back(seg);
             offset += size;
         }
@@ -783,7 +762,7 @@ impl KCP {
             let pos = self.rcv_buf.iter().position(|s| _itimediff(s.sn, sn) > 0);
             match pos {
                 Some(p) => self.rcv_buf.insert(p, newseg),
-                None => self.rcv_buf.push(newseg),
+                None => self.rcv_buf.push_back(newseg),
             }
         }
 
@@ -795,12 +774,13 @@ impl KCP {
     /// Move segments from the receive buffer into the receive queue when
     /// they are in-order and within the receive window.
     fn move_receive_buffer(&mut self) {
-        while let Some(seg) = self.rcv_buf.first() {
+        while let Some(seg) = self.rcv_buf.pop_front() {
             if seg.sn == self.rcv_nxt && (self.rcv_queue.len() as u32) < self.rcv_wnd {
-                let seg = self.rcv_buf.remove(0);
                 self.rcv_nxt += 1;
                 self.rcv_queue.push_back(seg);
             } else {
+                // Put back the segment we popped and stop
+                self.rcv_buf.push_front(seg);
                 break;
             }
         }
@@ -826,8 +806,8 @@ impl KCP {
                 self.rx_rttvar += (delta - self.rx_rttvar) >> 2;
             }
         }
-        let rto = self.rx_srtt as u32 + _imax_(self.interval, (self.rx_rttvar as u32) << 2);
-        self.rx_rto = _ibound_(self.rx_minrto, rto, IKCP_RTO_MAX);
+        let rto = self.rx_srtt as u32 + self.interval.max((self.rx_rttvar as u32) << 2);
+        self.rx_rto = rto.clamp(self.rx_minrto, IKCP_RTO_MAX);
     }
 
     // ── Update / flush ────────────────────────────────────────────────────
@@ -990,9 +970,9 @@ impl KCP {
         self.probe = 0;
 
         // ── Calculate window ──
-        let mut cwnd = _imin_(self.snd_wnd, self.rmt_wnd);
+        let mut cwnd = self.snd_wnd.min(self.rmt_wnd);
         if self.nocwnd == 0 {
-            cwnd = _imin_(self.cwnd, cwnd);
+            cwnd = self.cwnd.min(cwnd);
         }
 
         // ── Move segments from snd_queue to snd_buf ──
@@ -1078,6 +1058,13 @@ impl KCP {
                 seg.wnd = current_wnd;
                 seg.una = self.rcv_nxt;
 
+                // Freeze payload for zero-copy retransmit sharing.
+                // Done here (not in send()) so stream-mode append in send()
+                // can still extend seg.data before the segment is transmitted.
+                if seg.payload.is_empty() && !seg.data.is_empty() {
+                    seg.payload = seg.data.split_to(seg.data.len()).freeze();
+                }
+
                 let need = KCP_OVERHEAD + seg.len as usize;
                 if self.buffer.len() + need > mtu {
                     flush_buf(&mut self.buffer, &mut self.output);
@@ -1125,14 +1112,14 @@ impl KCP {
             // Rate halving (RFC 6937)
             if change > 0 {
                 let inflight = self.snd_nxt - self.snd_una;
-                self.ssthresh = _imax_(inflight / 2, IKCP_THRESH_MIN);
+                self.ssthresh = (inflight / 2).max(IKCP_THRESH_MIN);
                 self.cwnd = self.ssthresh + resent;
                 self.incr = self.cwnd * self.mss;
             }
 
             // Congestion control (RFC 5681)
             if lost_segs > 0 {
-                self.ssthresh = _imax_(cwnd / 2, IKCP_THRESH_MIN);
+                self.ssthresh = (cwnd / 2).max(IKCP_THRESH_MIN);
                 self.cwnd = 1;
                 self.incr = self.mss;
             }
@@ -1207,6 +1194,18 @@ impl KCP {
     #[inline]
     pub fn conv(&self) -> u32 {
         self.conv
+    }
+
+    /// KCP connection state. `0xFFFFFFFF` means dead (dead_link exceeded).
+    #[inline]
+    pub fn state(&self) -> u32 {
+        self.state
+    }
+
+    /// Returns true if KCP connection is dead (state == 0xFFFFFFFF).
+    #[inline]
+    pub fn is_dead(&self) -> bool {
+        self.state == 0xFFFFFFFF
     }
 
     /// Get the current RTO value.
@@ -1487,5 +1486,79 @@ mod tests {
             .bytes_received
             .load(Ordering::SeqCst);
         assert!(after_r - before_r >= 6);
+    }
+
+    /// Regression test: stream-mode append must not panic when the second
+    /// `send()` writes more data than the first segment's payload.
+    ///
+    /// Before the fix, `send()` did `seg.payload = seg.data.split_to(...).freeze()`
+    /// which emptied `seg.data`. The next `send()` in stream mode then appended
+    /// to the empty `data` but set `len` to the new (larger) length, while
+    /// `payload` still held the old (shorter) data. On `encode()`,
+    /// `payload[..len]` panicked with "range end index out of range".
+    #[test]
+    fn test_stream_mode_append_no_panic() {
+        use std::sync::{Arc, Mutex};
+
+        let store: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let store2 = store.clone();
+        let mut kcp = KCP::new(
+            1,
+            0,
+            Box::new(move |data: bytes::Bytes| {
+                store2.lock().unwrap().push(data.to_vec());
+            }),
+        );
+        kcp.set_stream_mode(true);
+        // Use a large MTU so the second send fits in one segment via append
+        kcp.set_mtu(1400);
+        let mss = kcp.mss() as usize;
+
+        // First send: small payload (e.g. 100 bytes) → creates a segment
+        let small = vec![0xAAu8; 100];
+        kcp.send(&small).unwrap();
+        assert_eq!(kcp.snd_queue_len(), 1);
+
+        // Second send: larger than the first payload but still ≤ mss.
+        // In stream mode this appends to the last segment in snd_queue.
+        // With the old bug, payload stayed at 100 bytes but len was set to 500,
+        // causing encode() to panic on payload[..500].
+        let large = vec![0xBBu8; 500];
+        kcp.send(&large).unwrap();
+
+        // The segment should now contain 100 + 500 = 600 bytes.
+        // Flush triggers encode() — must not panic.
+        kcp.update(100);
+
+        // Verify the encoded data round-trips correctly
+        let pkts = store.lock().unwrap().clone();
+        assert!(!pkts.is_empty(), "flush should produce output packets");
+
+        // No packet may exceed MTU (1400).  An earlier intermediate fix
+        // computed capacity from `data.len()` (which was 0 after split_to)
+        // instead of the real payload length, letting segments grow past
+        // MSS and producing oversized UDP packets.
+        for (i, p) in pkts.iter().enumerate() {
+            assert!(p.len() <= 1400, "pkt {} exceeds MTU: {}", i, p.len());
+        }
+
+        // Feed packets into a receiver and check data integrity
+        let mut recv_kcp = create_kcp(1);
+        recv_kcp.set_stream_mode(true);
+        for p in &pkts {
+            recv_kcp.input(p, false).unwrap();
+        }
+        let got = recv_kcp.recv().unwrap();
+        assert_eq!(got.len(), 600);
+        assert_eq!(&got[..100], &small[..]);
+        assert_eq!(&got[100..], &large[..]);
+
+        // Also test the case where the second send exceeds mss (creates new
+        // segments after appending). This is the exact scenario from the bug
+        // report where len=1326 and payload.len()=692.
+        let _ = mss; // suppress unused warning
+        let huge = vec![0xCCu8; mss * 2]; // 2 full segments worth
+        kcp.send(&huge).unwrap();
+        kcp.update(200);
     }
 }
