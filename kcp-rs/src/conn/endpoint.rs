@@ -119,6 +119,18 @@ impl SharedIoState {
         }
     }
 
+    /// Stamp the liveness clock. Every inbound datagram and every successful
+    /// write calls this; the sharded listener's idle reaper reads it.
+    ///
+    /// Server sessions run with `background_input(false)` and therefore have
+    /// no input loop, so the feed paths (`feed_batch` / `feed_single`) are the
+    /// only place their receive side can be observed.
+    #[inline]
+    pub(crate) fn mark_activity(&self) {
+        self.last_activity_ms
+            .store(knet::mono_ms(), Ordering::Relaxed);
+    }
+
     pub(crate) fn wake_reader(&self) {
         // `notify_one` stores a permit, so a notification that arrives before
         // the reader registers is retained.
@@ -453,9 +465,7 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 }
                 knet::RaceOutcome::Second(_) => break, // close() cancelled the recv
             };
-            shared
-                .last_activity_ms
-                .store(knet::mono_ms(), Ordering::Relaxed);
+            shared.mark_activity();
 
             // Collect the full recv burst first, then process all datagrams
             // in one batch: FEC decode outside the KCP lock, one KCP lock for

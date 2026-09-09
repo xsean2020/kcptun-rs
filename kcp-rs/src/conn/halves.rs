@@ -192,9 +192,7 @@ impl KcpStream {
         // (measured gap≈10K/2s, gmax≈511 at 256KB@RPS=500, no loss — in≈out).
         if sent > 0 {
             *self.shared.write_deadline.lock() = None;
-            self.shared
-                .last_activity_ms
-                .store(knet::mono_ms(), Ordering::Relaxed);
+            self.shared.mark_activity();
             self.shared.flush_notify.notify_one();
         }
 

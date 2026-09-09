@@ -7,11 +7,10 @@
 //! avoids lost-wakeup races with a single, lightweight implementation:
 //!
 //! - `notify_one()` stores a permit via `AtomicUsize::fetch_or(1)` — O(1),
-//!   no waiter list traversal, no linked-list node allocation.
+//!   and only touches the waiter list when somebody is actually parked.
 //! - `notified()` checks the permit first (one atomic swap). If a permit
 //!   exists, returns `Ready` immediately without registering a waker.
-//!   Only when no permit is available does it register a waker via
-//!   `Mutex<Option<Waker>>`.
+//!   Only when no permit is available does it take the waiter lock.
 //!
 //! This eliminates the per-call overhead of:
 //! - `tokio::sync::Notify`: `Notified` future state machine + waiter list
@@ -22,10 +21,17 @@
 //! Both were significant under high RPS where the flush loop calls
 //! `notified()` ~1000 times per second.
 //!
-//! **Single-waiter design**: all current callers (flush_notify, write_notify,
-//! read_notify, PeerQueue::notify) have at most one task waiting at a time.
-//! `notify_waiters()` behaves like `notify_one()` (wakes the single waiter +
-//! stores a permit), which is correct for single-waiter usage.
+//! **Multiple waiters** are supported: every `notified()` future that parks
+//! keeps its own slot in the waker list, so `notify_one()` wakes one of them
+//! and `notify_waiters()` wakes all of them. The fast path (a stored permit)
+//! never touches the list, so the cost for the common single-waiter call sites
+//! is unchanged.
+//!
+//! The lock-free hand-off between a parking waiter and a notifier is a Dekker
+//! pattern: the waiter publishes its slot count and *then* re-reads the permit,
+//! while the notifier stores the permit and *then* reads the slot count. Both
+//! sides must use `SeqCst` on those four accesses or the store-buffer
+//! interleaving loses the wakeup.
 //!
 //! `Mutex` is re-exported from `async_lock` — runtime-agnostic.
 
@@ -33,20 +39,31 @@ pub use async_lock::Mutex;
 
 pub mod cancel;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 // ─── Notify ───────────────────────────────────────────────────────────────────
+
+/// One parked `notified()` future.
+struct Waiter {
+    /// Identifies the future that owns this slot, so a future's `Drop` only
+    /// ever removes its own waker.
+    id: u64,
+    waker: Waker,
+}
 
 /// Notification state.
 struct NotifyState {
     /// Number of stored permits (0 or 1).  Set by `notify_one`, cleared by
     /// `notified()` when it consumes a permit.
     permits: AtomicUsize,
-    /// True when a waker is currently registered.
-    has_waker: AtomicBool,
-    /// The registered waker.
-    waker: std::sync::Mutex<Option<Waker>>,
+    /// Number of entries in `waiters`; read on the notify fast path so an
+    /// uncontended `notify_one` with nobody parked never takes the lock.
+    waiter_count: AtomicUsize,
+    /// Registered wakers, oldest first (FIFO wake order).
+    waiters: std::sync::Mutex<Vec<Waiter>>,
+    /// Hands out `Waiter::id` values.
+    next_id: AtomicU64,
 }
 
 /// A notification primitive for waking tasks waiting on a condition.
@@ -54,12 +71,8 @@ struct NotifyState {
 /// `notify_one` stores a permit (like tokio's `Notify`), so the next
 /// `notified()` call returns immediately even if no task is currently waiting.
 ///
-/// # Single-waiter limitation
-///
-/// This `Notify` supports **only one concurrent waiter** at a time. If two
-/// tasks call `notified()` simultaneously, only the last-registered waker
-/// will be notified; earlier waiters will never wake. All current call
-/// sites (flush loop, read/write paths, peer-queue) have at most one waiter.
+/// Any number of tasks may await [`notified`](Self::notified) concurrently:
+/// `notify_one` wakes the longest-parked one, `notify_waiters` wakes them all.
 pub struct Notify {
     state: NotifyState,
 }
@@ -70,8 +83,9 @@ impl Notify {
         Self {
             state: NotifyState {
                 permits: AtomicUsize::new(0),
-                has_waker: AtomicBool::new(false),
-                waker: std::sync::Mutex::new(None),
+                waiter_count: AtomicUsize::new(0),
+                waiters: std::sync::Mutex::new(Vec::new()),
+                next_id: AtomicU64::new(0),
             },
         }
     }
@@ -90,14 +104,13 @@ impl Notify {
     /// immediately.  Otherwise, registers the current task's waker and
     /// returns Pending.
     ///
-    /// # Single-waiter limitation
-    ///
-    /// This `Notify` supports **only one concurrent waiter**. Calling
-    /// `notified()` from two tasks simultaneously is a logic error — only
-    /// the last-registered waker will be notified. All current call sites
-    /// guarantee at most one waiter at a time.
+    /// Safe to await from several tasks at once; each parked future holds its
+    /// own waker slot.
     pub fn notified(&self) -> NotifyFuture<'_> {
-        NotifyFuture { notify: self }
+        NotifyFuture {
+            notify: self,
+            id: None,
+        }
     }
 
     /// Wake one task currently waiting on `notified()`.
@@ -106,36 +119,62 @@ impl Notify {
     #[inline(always)]
     pub fn notify_one(&self) {
         // Store a permit first.  If a waiter is registered, wake it.
-        let had_permit = self.state.permits.fetch_or(1, Ordering::AcqRel) != 0;
-        if had_permit {
+        if self.state.permits.fetch_or(1, Ordering::SeqCst) != 0 {
             // Already had a permit — nothing to do (coalesce).
             return;
-        } // Check if a waker is registered.
-        if self.state.has_waker.load(Ordering::Acquire) {
-            let waker = self.state.waker.lock().unwrap().take();
-            self.state.has_waker.store(false, Ordering::Release);
-            if let Some(w) = waker {
-                w.wake();
+        }
+        // SeqCst: pairs with the parking waiter's `waiter_count` store, which
+        // it publishes before its final permit re-read (see module docs).
+        if self.state.waiter_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let waker = {
+            let mut waiters = self.state.waiters.lock().unwrap();
+            if waiters.is_empty() {
+                None
+            } else {
+                let waiter = waiters.remove(0);
+                self.state
+                    .waiter_count
+                    .store(waiters.len(), Ordering::SeqCst);
+                Some(waiter.waker)
             }
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
-    /// Wake all tasks currently waiting.
+    /// Wake every task currently waiting on `notified()`, and store a permit
+    /// so a task that parks afterwards also returns immediately.
     ///
-    /// For the single-waker design, this is equivalent to `notify_one()`
-    /// since we only track one waker.  Callers that need multi-waker
-    /// semantics should use multiple `Notify` instances.
+    /// This is what a terminal transition (`close()`, `cancel()`) needs: with
+    /// several readers/writers parked on the same `Notify`, waking only one
+    /// leaves the rest hung until unrelated traffic arrives.
     #[inline(always)]
     pub fn notify_waiters(&self) {
-        // Same as notify_one — wake the registered waker (if any) and store
-        // a permit for the next waiter.
-        self.state.permits.store(1, Ordering::Release);
-        if self.state.has_waker.load(Ordering::Acquire) {
-            let waker = self.state.waker.lock().unwrap().take();
-            self.state.has_waker.store(false, Ordering::Release);
-            if let Some(w) = waker {
-                w.wake();
-            }
+        self.state.permits.store(1, Ordering::SeqCst);
+        if self.state.waiter_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let woken = {
+            let mut waiters = self.state.waiters.lock().unwrap();
+            self.state.waiter_count.store(0, Ordering::SeqCst);
+            std::mem::take(&mut *waiters)
+        };
+        for w in woken {
+            w.waker.wake();
+        }
+    }
+
+    /// Drop `id`'s waker slot if it is still registered.
+    fn deregister(&self, id: u64) {
+        let mut waiters = self.state.waiters.lock().unwrap();
+        if let Some(pos) = waiters.iter().position(|w| w.id == id) {
+            waiters.remove(pos);
+            self.state
+                .waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
         }
     }
 }
@@ -149,35 +188,67 @@ impl Default for Notify {
 /// Future returned by [`Notify::notified`].
 pub struct NotifyFuture<'a> {
     notify: &'a Notify,
+    /// Set once this future has parked and owns a slot in the waker list.
+    id: Option<u64>,
 }
 
 impl<'a> std::future::Future for NotifyFuture<'a> {
     type Output = ();
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
         // Fast path: consume a stored permit.
-        if self.notify.state.permits.swap(0, Ordering::AcqRel) != 0 {
+        if this.notify.state.permits.swap(0, Ordering::SeqCst) != 0 {
+            if let Some(id) = this.id.take() {
+                this.notify.deregister(id);
+            }
             return Poll::Ready(());
         }
-        // Register our waker.
-        let mut waker_slot = self.notify.state.waker.lock().unwrap();
-        // Check permit again after acquiring lock (notify may have fired).
-        if self.notify.state.permits.swap(0, Ordering::AcqRel) != 0 {
-            *waker_slot = None;
-            self.notify.state.has_waker.store(false, Ordering::Release);
-            return Poll::Ready(());
+        {
+            let mut waiters = this.notify.state.waiters.lock().unwrap();
+            match this.id {
+                Some(id) => match waiters.iter_mut().find(|w| w.id == id) {
+                    // Re-poll of an already-parked future: refresh the waker
+                    // in place, keeping our position in the FIFO.
+                    Some(slot) => {
+                        if !slot.waker.will_wake(cx.waker()) {
+                            slot.waker = cx.waker().clone();
+                        }
+                    }
+                    // Our slot was consumed by a `notify_one` that raced with
+                    // this poll, and the permit check above already came back
+                    // empty (another waiter took it) — park again.
+                    None => {
+                        let id = this.notify.state.next_id.fetch_add(1, Ordering::Relaxed);
+                        this.id = Some(id);
+                        waiters.push(Waiter {
+                            id,
+                            waker: cx.waker().clone(),
+                        });
+                    }
+                },
+                None => {
+                    let id = this.notify.state.next_id.fetch_add(1, Ordering::Relaxed);
+                    this.id = Some(id);
+                    waiters.push(Waiter {
+                        id,
+                        waker: cx.waker().clone(),
+                    });
+                }
+            }
+            this.notify
+                .state
+                .waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
         }
-        // If not already registered, set has_waker.
-        if !self.notify.state.has_waker.load(Ordering::Acquire) {
-            self.notify.state.has_waker.store(true, Ordering::Release);
-        }
-        *waker_slot = Some(cx.waker().clone());
-        drop(waker_slot);
-        // Final check after registration (handles race with notify_one).
-        if self.notify.state.permits.swap(0, Ordering::AcqRel) != 0 {
-            let mut waker_slot = self.notify.state.waker.lock().unwrap();
-            *waker_slot = None;
-            self.notify.state.has_waker.store(false, Ordering::Release);
+        // Our slot is published; re-read the permit. A `notify_one` that
+        // stored its permit before we published saw `waiter_count == 0` and
+        // returned without waking anybody, so this read is the only thing
+        // standing between it and a lost wakeup.
+        if this.notify.state.permits.swap(0, Ordering::SeqCst) != 0 {
+            if let Some(id) = this.id.take() {
+                this.notify.deregister(id);
+            }
             return Poll::Ready(());
         }
         Poll::Pending
@@ -186,11 +257,109 @@ impl<'a> std::future::Future for NotifyFuture<'a> {
 
 impl<'a> Drop for NotifyFuture<'a> {
     fn drop(&mut self) {
-        // Clean up our waker registration if we're still the registered one.
-        if self.notify.state.has_waker.load(Ordering::Acquire) {
-            let mut waker_slot = self.notify.state.waker.lock().unwrap();
-            *waker_slot = None;
-            self.notify.state.has_waker.store(false, Ordering::Release);
+        if let Some(id) = self.id.take() {
+            self.notify.deregister(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize as Counter;
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    struct CountingWaker(Counter);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counting() -> (Waker, Arc<CountingWaker>) {
+        let inner = Arc::new(CountingWaker(Counter::new(0)));
+        (Waker::from(inner.clone()), inner)
+    }
+
+    fn poll_once(fut: &mut NotifyFuture<'_>, waker: &Waker) -> Poll<()> {
+        let mut cx = Context::from_waker(waker);
+        std::pin::Pin::new(fut).poll(&mut cx)
+    }
+
+    #[test]
+    fn notify_waiters_wakes_every_parked_task() {
+        let notify = Notify::new();
+        let (wa, ca) = counting();
+        let (wb, cb) = counting();
+        let mut a = notify.notified();
+        let mut b = notify.notified();
+        assert!(poll_once(&mut a, &wa).is_pending());
+        assert!(poll_once(&mut b, &wb).is_pending());
+        notify.notify_waiters();
+        assert_eq!(ca.0.load(Ordering::Relaxed), 1);
+        assert_eq!(cb.0.load(Ordering::Relaxed), 1);
+        assert!(poll_once(&mut a, &wa).is_ready());
+    }
+
+    #[test]
+    fn notify_one_wakes_the_longest_parked_waiter() {
+        let notify = Notify::new();
+        let (wa, ca) = counting();
+        let (wb, cb) = counting();
+        let mut a = notify.notified();
+        let mut b = notify.notified();
+        assert!(poll_once(&mut a, &wa).is_pending());
+        assert!(poll_once(&mut b, &wb).is_pending());
+        notify.notify_one();
+        assert_eq!(ca.0.load(Ordering::Relaxed), 1);
+        assert_eq!(cb.0.load(Ordering::Relaxed), 0);
+        assert!(poll_once(&mut a, &wa).is_ready());
+    }
+
+    #[test]
+    fn dropping_one_waiter_keeps_the_others_registered() {
+        // The single-waker design used to let a dropped future clear whichever
+        // waker happened to be in the slot, silently unregistering a live one.
+        let notify = Notify::new();
+        let (wa, _ca) = counting();
+        let (wb, cb) = counting();
+        let mut a = notify.notified();
+        let mut b = notify.notified();
+        assert!(poll_once(&mut a, &wa).is_pending());
+        assert!(poll_once(&mut b, &wb).is_pending());
+        drop(a);
+        notify.notify_one();
+        assert_eq!(cb.0.load(Ordering::Relaxed), 1);
+        assert!(poll_once(&mut b, &wb).is_ready());
+    }
+
+    #[test]
+    fn repolling_a_parked_waiter_does_not_leak_slots() {
+        let notify = Notify::new();
+        let (w, _c) = counting();
+        let mut a = notify.notified();
+        for _ in 0..8 {
+            assert!(poll_once(&mut a, &w).is_pending());
+        }
+        assert_eq!(notify.state.waiter_count.load(Ordering::Acquire), 1);
+        drop(a);
+        assert_eq!(notify.state.waiter_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn permit_stored_before_any_waiter_is_consumed_once() {
+        let notify = Notify::new();
+        let (w, _c) = counting();
+        notify.notify_one();
+        let mut a = notify.notified();
+        assert!(poll_once(&mut a, &w).is_ready());
+        let mut b = notify.notified();
+        assert!(poll_once(&mut b, &w).is_pending());
     }
 }

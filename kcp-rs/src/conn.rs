@@ -776,6 +776,7 @@ impl KcpStream {
             crate::sharded::recycle_buf(datagram);
             return Ok(());
         }
+        self.shared.mark_activity();
         let (data_ready, protocol_pending) =
             process_inbound_batch(&self.shared, std::slice::from_ref(&datagram));
         if data_ready {
@@ -795,6 +796,9 @@ impl KcpStream {
                 crate::sharded::recycle_buf(d);
             }
             return Ok(());
+        }
+        if !datagrams.is_empty() {
+            self.shared.mark_activity();
         }
         let (data_ready, protocol_pending) = process_inbound_batch(&self.shared, &datagrams);
         if data_ready {
