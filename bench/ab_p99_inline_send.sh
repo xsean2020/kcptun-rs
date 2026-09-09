@@ -25,9 +25,9 @@ CONN="$REPO/kcp-rs/src/conn.rs"
 CONN_BACKUP="$REPO/kcp-rs/src/conn.rs.ab_backup"
 
 echo "==> Step 1: Build OPTIMIZED binaries (current code with inline-send)"
-cargo build -q --release -p kcp-rs --features async-tokio --example latency_p99
+cargo build -q --release -p kcp-rs --features async --example latency_p99
 cp "$REPO/target/release/examples/latency_p99" "$EX_TOKIO_OPT"
-cargo build -q --release -p kcp-rs --features async-smol --example latency_p99
+cargo build -q --release -p kcp-rs --features async --example latency_p99
 cp "$REPO/target/release/examples/latency_p99" "$EX_SMOL_OPT"
 
 echo "==> Step 2: Save current conn.rs, revert to baseline (notify-only)"
@@ -35,9 +35,9 @@ cp "$CONN" "$CONN_BACKUP"
 git checkout -- "$CONN"
 
 echo "==> Step 3: Build BASELINE binaries (notify-only, no inline-send)"
-cargo build -q --release -p kcp-rs --features async-tokio --example latency_p99
+cargo build -q --release -p kcp-rs --features async --example latency_p99
 cp "$REPO/target/release/examples/latency_p99" "$EX_TOKIO_BASE"
-cargo build -q --release -p kcp-rs --features async-smol --example latency_p99
+cargo build -q --release -p kcp-rs --features async --example latency_p99
 cp "$REPO/target/release/examples/latency_p99" "$EX_SMOL_BASE"
 
 echo "==> Step 4: Restore optimized conn.rs"

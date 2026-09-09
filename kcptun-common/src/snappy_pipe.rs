@@ -1,7 +1,7 @@
 //! Snappy session codec as an `AsyncRead + AsyncWrite` transport adapter.
 //!
-//! [`SnappyPipe`] wraps any `kio::AsyncRead + AsyncWrite` stream (e.g. a
-//! [`kcp_rs::KcpConn`]) and transparently compresses / decompresses the byte
+//! [`SnappyPipe`] wraps any `knet::AsyncRead + AsyncWrite` stream (e.g. a
+//! [`kcp_rs::KcpStream`]) and transparently compresses / decompresses the byte
 //! stream with Go-compatible snappy *framing* (the `snap` crate, CRC32C).
 //!
 //! Placement matches kcptun production: the whole SMUX frame byte stream is
@@ -44,7 +44,7 @@ pub struct SnappyPipe<T> {
 
 impl<T> SnappyPipe<T>
 where
-    T: kio::AsyncRead + kio::AsyncWrite + Unpin,
+    T: knet::AsyncRead + knet::AsyncWrite + Unpin,
 {
     /// Wrap `inner`. When `compress` is `true`, writes are snappy-compressed
     /// (session level) and reads decompressed; `false` = byte passthrough.
@@ -63,11 +63,6 @@ where
         }
     }
 
-    /// Borrow the inner transport.
-    pub fn get_ref(&self) -> &T {
-        &self.inner
-    }
-
     /// Mutably borrow the inner transport.
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
@@ -76,11 +71,6 @@ where
     /// Unwrap back to the inner transport.
     pub fn into_inner(self) -> T {
         self.inner
-    }
-
-    /// Whether session compression is enabled.
-    pub fn compress_enabled(&self) -> bool {
-        self.compress
     }
 
     // ── read side ───────────────────────────────────────────────────────────
@@ -255,13 +245,12 @@ where
 
 // ─── Inner transport poll helpers (trait signature differs per runtime) ───────
 
-#[cfg(feature = "tokio")]
-fn inner_poll_read<T: kio::AsyncRead + Unpin>(
+fn inner_poll_read<T: knet::AsyncRead + Unpin>(
     inner: &mut T,
     cx: &mut Context<'_>,
     buf: &mut [u8],
 ) -> Poll<io::Result<usize>> {
-    let mut rb = kio::ReadBuf::new(buf);
+    let mut rb = knet::ReadBuf::new(buf);
     match Pin::new(inner).poll_read(cx, &mut rb) {
         Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
         Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -269,16 +258,7 @@ fn inner_poll_read<T: kio::AsyncRead + Unpin>(
     }
 }
 
-#[cfg(feature = "smol")]
-fn inner_poll_read<T: kio::AsyncRead + Unpin>(
-    inner: &mut T,
-    cx: &mut Context<'_>,
-    buf: &mut [u8],
-) -> Poll<io::Result<usize>> {
-    Pin::new(inner).poll_read(cx, buf)
-}
-
-fn inner_poll_write<T: kio::AsyncWrite + Unpin>(
+fn inner_poll_write<T: knet::AsyncWrite + Unpin>(
     inner: &mut T,
     cx: &mut Context<'_>,
     buf: &[u8],
@@ -286,40 +266,31 @@ fn inner_poll_write<T: kio::AsyncWrite + Unpin>(
     Pin::new(inner).poll_write(cx, buf)
 }
 
-fn inner_poll_flush<T: kio::AsyncWrite + Unpin>(
+fn inner_poll_flush<T: knet::AsyncWrite + Unpin>(
     inner: &mut T,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
     Pin::new(inner).poll_flush(cx)
 }
 
-#[cfg(feature = "tokio")]
-fn inner_poll_shutdown<T: kio::AsyncWrite + Unpin>(
+fn inner_poll_shutdown<T: knet::AsyncWrite + Unpin>(
     inner: &mut T,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
     Pin::new(inner).poll_shutdown(cx)
 }
 
-#[cfg(feature = "smol")]
-fn inner_poll_shutdown<T: kio::AsyncWrite + Unpin>(
-    inner: &mut T,
-    cx: &mut Context<'_>,
-) -> Poll<io::Result<()>> {
-    Pin::new(inner).poll_close(cx)
-}
-
-// ─── kio::AsyncRead / AsyncWrite impls (feature-gated signatures) ─────────────
+// ─── knet::AsyncRead / AsyncWrite impls (feature-gated signatures) ─────────────
 
 #[cfg(feature = "tokio")]
-impl<T> kio::AsyncRead for SnappyPipe<T>
+impl<T> knet::AsyncRead for SnappyPipe<T>
 where
-    T: kio::AsyncRead + kio::AsyncWrite + Unpin,
+    T: knet::AsyncRead + knet::AsyncWrite + Unpin,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut kio::ReadBuf<'_>,
+        buf: &mut knet::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let space = buf.initialize_unfilled();
@@ -336,9 +307,9 @@ where
 }
 
 #[cfg(feature = "tokio")]
-impl<T> kio::AsyncWrite for SnappyPipe<T>
+impl<T> knet::AsyncWrite for SnappyPipe<T>
 where
-    T: kio::AsyncRead + kio::AsyncWrite + Unpin,
+    T: knet::AsyncRead + knet::AsyncWrite + Unpin,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -357,75 +328,39 @@ where
     }
 }
 
-#[cfg(feature = "smol")]
-impl<T> kio::AsyncRead for SnappyPipe<T>
-where
-    T: kio::AsyncRead + kio::AsyncWrite + Unpin,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_read_into(cx, buf)
-    }
-}
-
-#[cfg(feature = "smol")]
-impl<T> kio::AsyncWrite for SnappyPipe<T>
-where
-    T: kio::AsyncRead + kio::AsyncWrite + Unpin,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_write_impl(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_flush_impl(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_shutdown_impl(cx)
-    }
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use kcp_rs::KcpConfig;
-    use kio::AsyncReadExt;
-    use kio::AsyncWriteExt;
+    use knet::AsyncReadExt;
+    use knet::AsyncWriteExt;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::kcp_transport::kcp_conn_with_socket;
+    use crate::kcp_transport::kcp_stream_with_socket;
     use kcrypt_rs::OffloadProfile;
 
-    /// Pair of connected UDP sockets + null-crypt KcpConn.
-    async fn make_pair(cfg: KcpConfig) -> (kcp_rs::KcpConn, kcp_rs::KcpConn) {
-        let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    /// Pair of connected UDP sockets + null-crypt KcpStream.
+    async fn make_pair(cfg: KcpConfig) -> (kcp_rs::KcpStream, kcp_rs::KcpStream) {
+        let a_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let b_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a_tmp.local_addr().unwrap();
         let addr_b = b_tmp.local_addr().unwrap();
         drop(a_tmp);
         drop(b_tmp);
 
-        let sock_a = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_a, addr_b).unwrap(),
+        let sock_a = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
         ));
-        let sock_b = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_b, addr_a).unwrap(),
+        let sock_b = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
         ));
 
         let key = b"0123456789abcdef0123456789abcdef";
-        let a = kcp_conn_with_socket(
+        let a = kcp_stream_with_socket(
             sock_a,
             addr_b,
             key,
@@ -436,7 +371,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let b = kcp_conn_with_socket(
+        let b = kcp_stream_with_socket(
             sock_b,
             addr_a,
             key,
@@ -460,14 +395,18 @@ mod tests {
         }
     }
 
-    async fn read_exact(conn: &mut (impl kio::AsyncRead + Unpin), buf: &mut [u8], limit: Duration) {
+    async fn read_exact(
+        conn: &mut (impl knet::AsyncRead + Unpin),
+        buf: &mut [u8],
+        limit: Duration,
+    ) {
         let deadline = std::time::Instant::now() + limit;
         let mut filled = 0usize;
         while filled < buf.len() {
             if std::time::Instant::now() > deadline {
                 panic!("timeout waiting for data, got {}/{}", filled, buf.len());
             }
-            match kio::timeout(Duration::from_millis(50), conn.read(&mut buf[filled..])).await {
+            match knet::timeout(Duration::from_millis(50), conn.read(&mut buf[filled..])).await {
                 Ok(Ok(0)) => panic!("unexpected EOF at {}", filled),
                 Ok(Ok(n)) => filled += n,
                 Ok(Err(e)) => panic!("read error: {}", e),

@@ -42,8 +42,8 @@ Key features:
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `tokio` | ✅ | Use tokio runtime (via `kio-rs`) |
-| `smol`  | ❌ | Use smol runtime (via `kio-rs`) — mutually exclusive with `tokio` |
+| `tokio` | ✅ | Use tokio runtime (via `knet-rs`) |
+| `smol`  | ❌ | Use smol runtime (via `knet-rs`) — mutually exclusive with `tokio` |
 
 > `tokio` and `smol` are **mutually exclusive**. The `build.rs` script enforces this at compile time.
 

@@ -6,20 +6,21 @@ description = "Shared helpers for kcptun-client and kcptun-server"
 
 [features]
 default = ["tokio"]
-# Runtime features also enable async KcpConn / PacketTransport on kcp-rs.
-tokio = ["kio-rs/tokio", "kcp-rs/async-tokio", "smux-rs/tokio"]
-smol = ["kio-rs/smol", "kcp-rs/async-smol", "smux-rs/smol"]
+# Runtime feature also enables async KcpStream on kcp-rs.
+tokio = ["knet-rs", "kcp-rs/async", "smux-rs/tokio"]
 qpp = ["dep:qpp-rs"]
 
 [dependencies]
 kcp-rs = { path = "../kcp-rs" }
 kcrypt-rs = { path = "../kcrypt-rs" }
-kio-rs = { path = "../kio-rs", default-features = false }
+knet-rs = { path = "../knet-rs", default-features = false, optional = true }
 smux-rs = { path = "../smux-rs", default-features = false }
 pbkdf2 = "0.12"
 sha1 = "0.10"
 snap = "1"
 log = "0.4"
+libc = "0.2"
+getrandom = "0.2"
 bytes = "1"
 parking_lot = "0.12"
 anyhow = "1"

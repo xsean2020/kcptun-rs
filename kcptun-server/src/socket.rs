@@ -16,23 +16,24 @@ pub(crate) fn parse_addr(addr: &str) -> Result<SocketAddr> {
     addr.parse::<SocketAddr>().context("invalid address")
 }
 
-/// Create a UDP socket bound to `addr` with the given buffer sizes and DSCP.
-pub(crate) fn create_udp_socket(
+/// Bind and tune a UDP fd without registering it with an async runtime.
+///
+/// Sharded server startup moves this raw fd into its dedicated local runtime
+/// before calling `knet::UdpSocket::from_std`, preserving poller ownership.
+pub(crate) fn create_udp_socket_std(
     addr: SocketAddr,
     sockbuf: u32,
     dscp: u32,
-) -> Result<kio::UdpSocket> {
+) -> Result<std::net::UdpSocket> {
     build_udp(addr, sockbuf, dscp, false)
 }
 
-/// Create a **SO_REUSEPORT** UDP socket bound to `addr` (Linux: kernel hashes
-/// each peer to one socket among the shards; per-socket worker threads then
-/// own their fd with no shared-socket send contention).
-pub(crate) fn create_udp_socket_shard(
+/// SO_REUSEPORT variant of [`create_udp_socket_std`].
+pub(crate) fn create_udp_socket_shard_std(
     addr: SocketAddr,
     sockbuf: u32,
     dscp: u32,
-) -> Result<kio::UdpSocket> {
+) -> Result<std::net::UdpSocket> {
     build_udp(addr, sockbuf, dscp, true)
 }
 
@@ -41,7 +42,7 @@ fn build_udp(
     sockbuf: u32,
     dscp: u32,
     reuse_port: bool,
-) -> Result<kio::UdpSocket> {
+) -> Result<std::net::UdpSocket> {
     let socket = socket2::Socket::new(
         if addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -60,19 +61,23 @@ fn build_udp(
     if reuse_port {
         // SO_REUSEPORT: allow N sockets to bind the same addr:port; the kernel
         // distributes inbound datagrams across them (Linux: by connection hash).
+        // Not available on Windows — skip silently.
+        #[cfg(unix)]
         if let Err(e) = socket.set_reuse_port(true) {
             warn!("set_reuse_port failed: {}", e);
         }
     }
     if dscp > 0 {
-        let dscp_shifted = dscp << 2;
-        if let Err(e) = socket.set_tos(dscp_shifted) {
+        // Go: IPv4 → IP_TOS = dscp << 2; IPv6 → IPV6_TCLASS = dscp (no shift).
+        // socket2::set_tos maps to IP_TOS (IPv4) or IPV6_TCLASS (IPv6) on Linux.
+        let tos = if addr.is_ipv4() { dscp << 2 } else { dscp };
+        if let Err(e) = socket.set_tos(tos) {
             warn!("set_tos (DSCP) failed: {}", e);
         }
     }
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
-    Ok(kio::UdpSocket::from_std(socket.into())?)
+    Ok(socket.into())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

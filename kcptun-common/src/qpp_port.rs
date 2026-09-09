@@ -5,10 +5,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, BytesMut};
-use kio::AsyncRead;
-use kio::AsyncWrite;
-#[cfg(feature = "tokio")]
-use kio::ReadBuf;
+use knet::AsyncRead;
+use knet::AsyncWrite;
+use knet::ReadBuf;
 
 /// Same as binaries' pipe buffer (64 KiB).
 const PIPE_BUF_SIZE: usize = 65536;
@@ -40,7 +39,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
 }
 
 // ── tokio QPPPort AsyncRead/AsyncWrite (uses ReadBuf) ──
-#[cfg(feature = "tokio")]
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -97,7 +95,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
     }
 }
 
-#[cfg(feature = "tokio")]
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for QPPPort<T> {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -121,87 +118,5 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for QPPPort<T> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-// ── smol QPPPort AsyncRead/AsyncWrite (uses &mut [u8]) ──
-#[cfg(feature = "smol")]
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-
-        if !this.read_buf.is_empty() {
-            let n = buf.len().min(this.read_buf.len());
-            buf[..n].copy_from_slice(&this.read_buf[..n]);
-            this.read_buf.advance(n);
-            return Poll::Ready(Ok(n));
-        }
-
-        let mut tmp = std::mem::take(&mut this.read_io_buf);
-        tmp.resize(PIPE_BUF_SIZE, 0);
-        match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
-            Poll::Ready(Ok(0)) => {
-                this.read_io_buf = tmp;
-                Poll::Ready(Ok(0))
-            }
-            Poll::Ready(Ok(filled)) => {
-                {
-                    let qpp = this.qpp.lock();
-                    let mut prng = this.prng_dec.lock();
-                    qpp_rs::decrypt_with_pads(
-                        &qpp.rpads,
-                        &mut tmp[..filled],
-                        &mut prng,
-                        qpp.count(),
-                    );
-                }
-                let n = buf.len().min(filled);
-                buf[..n].copy_from_slice(&tmp[..n]);
-                if n < filled {
-                    this.read_buf.extend_from_slice(&tmp[n..filled]);
-                }
-                this.read_io_buf = tmp;
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(Err(e)) => {
-                this.read_io_buf = tmp;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                this.read_io_buf = tmp;
-                Poll::Pending
-            }
-        }
-    }
-}
-
-#[cfg(feature = "smol")]
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for QPPPort<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        this.write_enc_buf.clear();
-        this.write_enc_buf.extend_from_slice(buf);
-        {
-            let qpp = this.qpp.lock();
-            let mut prng = this.prng_enc.lock();
-            qpp_rs::encrypt_with_pads(&qpp.pads, &mut this.write_enc_buf, &mut prng, qpp.count());
-        }
-        Pin::new(&mut this.inner).poll_write(cx, &this.write_enc_buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }

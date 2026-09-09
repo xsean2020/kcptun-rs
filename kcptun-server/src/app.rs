@@ -14,9 +14,10 @@ use crate::socket;
 
 pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // Ignore SIGPIPE to prevent crashes when writing to closed sockets.
-    kio::ignore_sigpipe();
+    knet::ignore_sigpipe();
     // Install SIGUSR1 handler for SNMP stats dump (matching Go kcptun).
-    kio::install_sigusr1_handler();
+    knet::install_sigusr1_handler();
+    kcp_rs::snmp_enable();
 
     if cli.version_flag {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -25,7 +26,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
 
     // Load config file if specified
     let cli = if let Some(ref config_path) = cli.c {
-        let config_str = kio::read_to_string(config_path.clone()).await?;
+        let config_str = knet::read_to_string(config_path.clone()).await?;
         let cfg: Config = serde_json::from_str(&config_str)?;
         Cli::merge(cli, cfg)
     } else {
@@ -117,6 +118,12 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
 
     // Prepare shared state (needed by both TCP and UDP paths).
     let stop_flag = Arc::new(AtomicBool::new(false));
+    {
+        let signal_stop = stop_flag.clone();
+        knet::spawn_task(async move {
+            kcptun_common::snmp_signal_logger(signal_stop).await;
+        });
+    }
     let target_str = target.to_string();
     let key_arr = key;
     let kcp_config = kcptun_common::KcpCliParams {
@@ -141,21 +148,15 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         max_stream_buffer: streambuf,
         max_frame_size: framesize,
         keepalive_interval: keepalive.max(0) as u64,
-        keepalive_timeout: if keepalive <= 0 {
-            0
-        } else {
-            (keepalive as u64).saturating_mul(3).max(1)
-        },
+        // Go's BuildSmuxConfig changes only the interval; timeout remains 30s.
+        keepalive_timeout: 30,
     };
     let session_config = kcptun_common::KcptunConfig {
         kcp: kcp_config,
         smux: smux_config,
         nocomp,
         rate_limit: ratelimit_val,
-        offload_profile: match kio::runtime_kind() {
-            kio::RuntimeKind::Tokio => kcrypt_rs::OffloadProfile::Tokio,
-            kio::RuntimeKind::Smol => kcrypt_rs::OffloadProfile::Smol,
-        },
+        offload_profile: kcrypt_rs::OffloadProfile::Tokio,
     };
 
     // TCP mode: additionally accept raw TCP connections alongside the
@@ -168,7 +169,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         if cfg!(target_os = "linux") {
             let key = key_arr;
             for &addr in &listen_addrs {
-                let listener = match kio::tcpraw_listen(&addr) {
+                let listener = match knet::tcpraw_listen(&addr) {
                     Ok(l) => l,
                     Err(e) => {
                         warn!("tcpraw listen on {} failed: {}", addr, e);
@@ -185,7 +186,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                 let session_config = session_config.clone();
                 let target_loop = target.to_string();
                 let qpp_key_loop = key.to_vec();
-                kio::spawn_task(async move {
+                knet::spawn_task(async move {
                     loop {
                         let (conn, peer) = match listener.accept().await {
                             Ok(c) => c,
@@ -193,7 +194,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                                 if e.kind() == std::io::ErrorKind::WouldBlock
                                     || e.kind() == std::io::ErrorKind::Interrupted =>
                             {
-                                kio::sleep_ms(10).await;
+                                knet::sleep_ms(10).await;
                                 continue;
                             }
                             Err(e) => {
@@ -202,7 +203,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                             }
                         };
                         info!("TCP raw session from {}", peer);
-                        let socket = Arc::new(kio::DatagramSocket::TcpRaw(conn));
+                        let socket = Arc::new(knet::DatagramSocket::TcpRaw(conn));
                         let session = match kcptun_common::KcptunSession::serve_transport(
                             socket,
                             peer,
@@ -218,7 +219,6 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                                 continue;
                             }
                         };
-                        kcp_rs::DEFAULT_SNMP.session_opened(false);
                         server::spawn_session_stream_loop(
                             session,
                             peer,
@@ -244,9 +244,8 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // SO_REUSEPORT shard count: 0 (default) is platform-aware — Linux binds
     // one shard per logical CPU (kernel hashes peers across the sockets →
     // parallel workers, no shared-fd send contention); non-Linux (Darwin does
-    // not SO_REUSEPORT-distribute) defaults to a single socket + one
-    // current-thread worker, which already removes the 16-worker send
-    // contention. Explicit `--shards N` overrides either default.
+    // not SO_REUSEPORT-distribute) defaults to a single socket. Explicit
+    // `--shards N` overrides either default.
     let shards = if cli.shards == 0 {
         #[cfg(target_os = "linux")]
         {
@@ -261,16 +260,14 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     } else {
         cli.shards as usize
     };
-    let mut udp_sockets: Vec<Arc<kio::DatagramSocket>> =
-        Vec::with_capacity(listen_addrs.len() * shards);
+    let mut udp_sockets: Vec<std::net::UdpSocket> = Vec::with_capacity(listen_addrs.len() * shards);
     for addr in &listen_addrs {
         for s in 0..shards {
             let socket = if shards > 1 {
-                socket::create_udp_socket_shard(*addr, sockbuf, dscp_val)?
+                socket::create_udp_socket_shard_std(*addr, sockbuf, dscp_val)?
             } else {
-                socket::create_udp_socket(*addr, sockbuf, dscp_val)?
+                socket::create_udp_socket_std(*addr, sockbuf, dscp_val)?
             };
-            let socket = Arc::new(kio::DatagramSocket::Udp(socket));
             if shards > 1 {
                 info!(
                     "listening on {} for KCP connections (shard {}/{})",
@@ -301,7 +298,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
             let period = Duration::from_secs(secs);
             let s = stop_flag.clone();
             let p = snmplog_path.clone();
-            kio::spawn_task(async move {
+            knet::spawn_task(async move {
                 kcptun_common::snmp_logger(p, period, s).await;
             });
         } else {
@@ -311,81 +308,141 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
 
     // Start pprof if configured (requires --features pprof)
     #[cfg(feature = "pprof")]
-    if let Some(ref pprof_addr) = cli.pprof {
-        info!("starting pprof HTTP server on {}", pprof_addr);
+    if cli.pprof {
+        info!("starting pprof HTTP server on :6060");
         #[cfg(feature = "pprof-deadlock")]
         kpprof::start_deadlock_detector();
         let pprof_stop = stop_flag.clone();
-        let addr = pprof_addr.clone();
-        kio::spawn_task(async move {
-            if let Err(e) = kpprof::run_pprof(&addr, pprof_stop).await {
+        knet::spawn_task(async move {
+            if let Err(e) = kpprof::run_pprof("0.0.0.0:6060", pprof_stop).await {
                 error!("pprof server error: {}", e);
             }
         });
     }
     #[cfg(not(feature = "pprof"))]
-    if cli.pprof.is_some() {
+    if cli.pprof {
         log::warn!("--pprof requested but binary built without `pprof` feature; rebuild with --features pprof");
     }
 
     // Spawn Ctrl-C handler (runtime-agnostic)
     {
         let stop = stop_flag.clone();
-        kio::spawn_task(async move {
-            let _ = kio::ctrl_c().await;
+        knet::spawn_task(async move {
+            let _ = knet::ctrl_c().await;
             stop.store(true, Ordering::Relaxed);
         });
     }
 
     info!("using shared kcptun server session stack");
 
-    for udp in &udp_sockets {
+    for udp in udp_sockets {
         // Encrypt each accepted peer's transport via kcp-rs' listener wrapper
         // (direct KcpListener use — no kcptun-common KcptunListener layer).
         let qpp_key = key_arr.to_vec();
         let key = Arc::<[u8]>::from(key_arr);
         let crypt = Arc::<str>::from(crypt_method);
         let offload = session_config.offload_profile;
-        let listener = Arc::new(
-            kcp_rs::KcpListener::from_socket(udp.clone())
-                .config(session_config.kcp.clone())
-                .transport_wrapper(move |transport: Arc<dyn PacketTransport>, _peer| {
-                    let mut ct = kcptun_common::CryptoTransport::with_transport(
-                        transport,
-                        key.as_ref(),
-                        crypt.as_ref(),
-                    );
-                    ct.set_offload_profile(offload);
-                    Arc::new(ct)
-                })
-                .build()
-                .await?,
-        );
+        let rate_limit = session_config.rate_limit;
         let target = target_str.clone();
         let stop = stop_flag.clone();
-        let fut = serve_udp_shard(
-            listener,
-            target,
-            qpp_enabled,
-            qpp_key,
-            qpp_count,
-            quiet,
-            close_wait_val,
-            session_config.clone(),
-            stop,
-        );
+        let shard_config = session_config.clone();
+
+        // A single shard uses the shared tokio runtime directly.
+        // A multi-shard deployment keeps one worker per SO_REUSEPORT fd,
+        // preserving strict fd affinity and independent socket send queues.
+        if shards == 1 {
+            let udp = Arc::new(knet::DatagramSocket::Udp(knet::UdpSocket::from_std(udp)?));
+            let listener = Arc::new(
+                kcp_rs::KcpListener::from_socket(udp)
+                    .config(shard_config.kcp.clone())
+                    .transport_wrapper(move |transport: Arc<dyn PacketTransport>, _peer| {
+                        let mut ct = kcptun_common::CryptoTransport::with_transport(
+                            transport,
+                            key.as_ref(),
+                            crypt.as_ref(),
+                        );
+                        ct.set_offload_profile(offload);
+                        ct.set_rate_limit(rate_limit);
+                        Arc::new(ct)
+                    })
+                    .build()
+                    .await?,
+            );
+            knet::spawn_task(serve_udp_shard(
+                listener,
+                target,
+                qpp_enabled,
+                qpp_key,
+                qpp_count,
+                quiet,
+                close_wait_val,
+                shard_config,
+                stop,
+            ));
+            continue;
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
         // Each shard runs on a dedicated OS thread + current-thread runtime:
         // this shard's fd is only touched by one worker → no shared-socket
         // send contention (Linux SO_REUSEPORT hashes peers across shards).
         std::thread::Builder::new()
             .name("kcptun-shard".into())
-            .spawn(move || kio::block_on_local(fut))
+            .spawn(move || {
+                knet::block_on_local(async move {
+                    // Register the already-bound fd only after entering this shard's P.
+                    let udp = match knet::UdpSocket::from_std(udp) {
+                        Ok(udp) => Arc::new(knet::DatagramSocket::Udp(udp)),
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.into()));
+                            return;
+                        }
+                    };
+                    let listener = match kcp_rs::KcpListener::from_socket(udp)
+                        .config(shard_config.kcp.clone())
+                        .transport_wrapper(move |transport: Arc<dyn PacketTransport>, _peer| {
+                            let mut ct = kcptun_common::CryptoTransport::with_transport(
+                                transport,
+                                key.as_ref(),
+                                crypt.as_ref(),
+                            );
+                            ct.set_offload_profile(offload);
+                            ct.set_rate_limit(rate_limit);
+                            Arc::new(ct)
+                        })
+                        .build()
+                        .await
+                    {
+                        Ok(listener) => Arc::new(listener),
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.into()));
+                            return;
+                        }
+                    };
+                    let _ = ready_tx.send(Ok(()));
+                    serve_udp_shard(
+                        listener,
+                        target,
+                        qpp_enabled,
+                        qpp_key,
+                        qpp_count,
+                        quiet,
+                        close_wait_val,
+                        shard_config,
+                        stop,
+                    )
+                    .await;
+                })
+            })
             .expect("spawn shard worker");
+        ready_rx
+            .recv()
+            .context("UDP shard startup channel closed")??;
     }
 
     // Main task waits for stop signal (Ctrl-C).
     loop {
-        kio::sleep_ms(500).await;
+        knet::sleep_ms(500).await;
         if stop_flag.load(Ordering::Relaxed) {
             info!("received Ctrl+C, shutting down...");
             break;
@@ -394,16 +451,16 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
 
     // Graceful shutdown
     info!("shutting down...");
-    kio::sleep(Duration::from_secs(1)).await;
+    knet::sleep(Duration::from_secs(1)).await;
     info!("bye");
 
     Ok(())
 }
 
 /// Serve one UDP shard: accept KCP sessions off this shard's `kcp_rs::KcpListener`
-/// and forward their SMUX streams to `target`. Runs inside a dedicated
-/// current-thread worker runtime (`--shards N`, SO_REUSEPORT) so the shard's fd
-/// is only touched by one worker — no shared-socket send contention.
+/// and forward their SMUX streams to `target`. Single-shard builds run on the
+/// shared tokio runtime; explicit multi-shard SO_REUSEPORT builds keep every fd
+/// on one worker to avoid shared-socket send contention.
 async fn serve_udp_shard(
     listener: Arc<kcp_rs::KcpListener>,
     target: String,
@@ -425,19 +482,20 @@ async fn serve_udp_shard(
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => break,
             Err(error) => {
                 error!("KCP accept error: {}", error);
-                kio::sleep_ms(10).await;
+                knet::sleep_ms(10).await;
                 continue;
             }
         };
         info!("new shared KCP session from {}", peer);
-        kcp_rs::DEFAULT_SNMP.session_opened(false);
-        let session = match kcptun_common::KcptunSession::server(kcp, &session_config) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                error!("session create failed for {}: {}", peer, e);
-                continue;
-            }
-        };
+        let session =
+            match kcptun_common::KcptunSession::server_with_limited_transport(kcp, &session_config)
+            {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    error!("session create failed for {}: {}", peer, e);
+                    continue;
+                }
+            };
         server::spawn_session_stream_loop(
             session,
             peer,

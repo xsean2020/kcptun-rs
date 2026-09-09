@@ -285,16 +285,13 @@ impl CryptoBuf {
     }
 }
 
-/// Runtime-shaped `cpu_block` defaults (scheduling only — not wire format).
+/// `cpu_block` offload thresholds (scheduling only — not wire format).
 ///
-/// Evidence (2026-07-30, multi-conn xtea no-comp, env A/B):
-/// - smol default (1 pkt / 512 B): r_off≈1.0, med thr lower
-/// - smol raised (4 pkt / 2 KiB): r_off≈0.14, **+19.6%** thr
-/// - tokio raised same knobs: thr **regressed** → keep early offload on tokio
+/// Tokio is the sole runtime; thresholds are tuned for its multi-worker
+/// scheduler. Env overrides still apply (see `KCPTUN_*` env vars).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffloadProfile {
     Tokio,
-    Smol,
 }
 
 /// Optional env overrides. Non-profile keys cache via OnceLock.
@@ -349,10 +346,7 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
 /// Decide whether a batch encrypt should be offloaded to `cpu_block`.
 ///
 /// Heavy-8 defaults depend on `profile`:
-/// - **Tokio**: 1 pkt / 512 B (protect multi-worker async from CFB-8)
-/// - **Smol**: 4 pkts / 2 KiB (avoid r_off≈1 on every tiny flush; measured +19.6%
-///   on smol xtea no-comp; same raise hurts tokio)
-///
+/// Tokio: 1 pkt / 512 B (protect multi-worker async from CFB-8).
 /// Fast/AEAD and other CFB thresholds are shared. Env overrides still apply.
 #[inline]
 pub fn should_cpu_block_encrypt(
@@ -361,7 +355,7 @@ pub fn should_cpu_block_encrypt(
     packet_count: usize,
     total_bytes: usize,
     crypt: &CryptEngine,
-    profile: OffloadProfile,
+    _profile: OffloadProfile,
 ) -> bool {
     // Null cipher: the "encrypt" is `out.extend(packets)` — just moving Bytes
     // references (pointer copies). cpu_block dispatch costs more.
@@ -380,10 +374,7 @@ pub fn should_cpu_block_encrypt(
 
     // Heavy 8-byte CFB ciphers (cast5, 3des, blowfish, tea, xtea).
     if matches!(cname, "cast5" | "3des" | "blowfish" | "tea" | "xtea") {
-        let (def_pkts, def_bytes) = match profile {
-            OffloadProfile::Tokio => (1, 512),
-            OffloadProfile::Smol => (4, 2048),
-        };
+        let (def_pkts, def_bytes) = (1, 512);
         let min_pkts = env_or_profile("KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS", def_pkts);
         let min_bytes = env_or_profile("KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES", def_bytes);
         return packet_count >= min_pkts || total_bytes >= min_bytes;
@@ -398,32 +389,29 @@ pub fn should_cpu_block_encrypt(
 ///
 /// - null/none: never
 /// - AEAD: ≥4 KiB
-/// - CFB: tokio ≥512 B; smol ≥1 KiB (slightly less eager, mirrors encrypt)
+/// - CFB: ≥512 B
 #[inline]
 pub fn should_cpu_block_decrypt(
     has_encryption: bool,
     has_aead: bool,
     data_len: usize,
-    profile: OffloadProfile,
+    _profile: OffloadProfile,
 ) -> bool {
     if !has_encryption && !has_aead {
         false
     } else if has_aead {
         data_len >= 4096
     } else {
-        let thr = match profile {
-            OffloadProfile::Tokio => 512,
-            OffloadProfile::Smol => 1024,
-        };
+        let thr = 512;
         data_len >= thr
     }
 }
 
 /// Size threshold for session-level Snappy offload (default ≥16 KiB).
 ///
-/// Previous threshold (64 KiB) was too high for smol: inline Snappy + inline
+/// Previous threshold (64 KiB) was too high: inline Snappy + inline
 /// encrypt ("double-inline") starves UDP/ACK processing on fast ciphers
-/// (xor/salsa) + compression. H2 sweep (smol xor comp, 2 MiB random, 3 runs):
+/// (xor/salsa) + compression. Threshold sweep (2 MiB random, 3 runs):
 ///   16 KiB → +22.9% vs 64 KiB; null-comp control → +72.8%.
 ///
 /// Override with `KCPTUN_COMPRESS_CPU_BLOCK_BYTES`.
@@ -460,8 +448,8 @@ pub fn encrypt_batch(
     allow_parallel: bool,
 ) -> Vec<Bytes> {
     let mut out = Vec::with_capacity(packets.len());
-    encrypt_batch_into(
-        packets,
+    encrypt_batch_ref_into(
+        &packets,
         crypt,
         crypto_buf,
         has_encryption,
@@ -510,8 +498,35 @@ fn should_parallel_cfb_encrypt(
 /// Flush loops should reuse one `Vec<Bytes>` across cycles to avoid per-flush
 /// allocation of the result vector (P0.4). Contents are `Bytes` (refcounted);
 /// `out.clear()` drops refs but keeps the `Vec` capacity.
+///
+/// Takes `Vec<Bytes>` by value — the null path moves packets straight into
+/// `out` without cloning. Use [`encrypt_batch_ref_into`] when you already have
+/// a `&[Bytes]` slice and want to avoid the `to_vec()` allocation.
 pub fn encrypt_batch_into(
     packets: Vec<Bytes>,
+    crypt: &CryptEngine,
+    crypto_buf: &parking_lot::Mutex<CryptoBuf>,
+    has_encryption: bool,
+    allow_parallel: bool,
+    out: &mut Vec<Bytes>,
+) {
+    encrypt_batch_ref_into(
+        &packets,
+        crypt,
+        crypto_buf,
+        has_encryption,
+        allow_parallel,
+        out,
+    );
+}
+
+/// Same as [`encrypt_batch_into`] but takes `&[Bytes]` instead of `Vec<Bytes>`,
+/// avoiding the `to_vec()` allocation on the sync TX path (`encrypt_sync`).
+///
+/// In the null path, `Bytes` clones are cheap (refcount bumps) so the
+/// difference vs `encrypt_batch_into` is negligible.
+pub fn encrypt_batch_ref_into(
+    packets: &[Bytes],
     crypt: &CryptEngine,
     crypto_buf: &parking_lot::Mutex<CryptoBuf>,
     has_encryption: bool,
@@ -525,7 +540,7 @@ pub fn encrypt_batch_into(
     if let Some(aead) = crypt.as_aead() {
         // Reuse CryptoBuf.aead_buf across flush cycles (not just within a batch).
         let mut cb = crypto_buf.lock();
-        for data in &packets {
+        for data in packets {
             out.push(cb.seal_aead(aead, data));
         }
     } else if has_encryption {
@@ -541,7 +556,7 @@ pub fn encrypt_batch_into(
             should_parallel_cfb_encrypt(crypt, allow_parallel, packets.len(), total_bytes);
         if !use_parallel {
             let mut cb = crypto_buf.lock();
-            for data in &packets {
+            for data in packets {
                 out.push(cb.encrypt_cfb(data, crypt));
             }
         } else {
@@ -592,7 +607,8 @@ pub fn encrypt_batch_into(
         }
     } else {
         // null: Bytes pass straight through (no crypto header, no copy).
-        out.extend(packets);
+        // Clone is cheap — Bytes is refcounted.
+        out.extend(packets.iter().cloned());
     }
 }
 
@@ -636,7 +652,6 @@ mod tests {
     #[test]
     fn should_cpu_block_thresholds() {
         let tokio = OffloadProfile::Tokio;
-        let smol = OffloadProfile::Smol;
         let (none_crypt, _) = CryptEngine::select("none", b"");
         // Null cipher: never offload — "encrypt" is just pointer moves.
         assert!(!should_cpu_block_encrypt(
@@ -819,27 +834,6 @@ mod tests {
         assert!(should_cpu_block_decrypt(false, true, 4096, tokio));
         assert!(!should_cpu_block_decrypt(true, false, 511, tokio));
         assert!(should_cpu_block_decrypt(true, false, 512, tokio));
-
-        // Smol heavy-8 less eager.
-        assert!(
-            !should_cpu_block_encrypt(true, false, 1, 100, &xtea_crypt, smol),
-            "smol: 1 small pkt stays inline"
-        );
-        assert!(
-            !should_cpu_block_encrypt(true, false, 3, 1500, &xtea_crypt, smol),
-            "smol: 3 pkts under 2KiB may stay inline"
-        );
-        assert!(
-            should_cpu_block_encrypt(true, false, 4, 100, &xtea_crypt, smol),
-            "smol: 4 pkts offload"
-        );
-        assert!(
-            should_cpu_block_encrypt(true, false, 1, 2048, &xtea_crypt, smol),
-            "smol: 2KiB offload by bytes"
-        );
-        assert!(!should_cpu_block_decrypt(true, false, 512, smol));
-        assert!(!should_cpu_block_decrypt(true, false, 1023, smol));
-        assert!(should_cpu_block_decrypt(true, false, 1024, smol));
     }
 
     #[test]

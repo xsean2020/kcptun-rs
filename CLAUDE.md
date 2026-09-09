@@ -119,7 +119,7 @@ Hierarchical project maps live in `AGENTS.md` files. **Prefer these over full-re
 |------|------|
 | Session start / unfamiliar task | Root `AGENTS.md` first |
 | Working in a crate or subdirectory | That directory's `AGENTS.md` (and parent if linked) |
-| Nested modules (e.g. `kcrypt-rs/src/crypt`, `kio-rs/src/net`) | Nested `AGENTS.md` under that path |
+| Nested modules (e.g. `kcrypt-rs/src/crypt`, `knet-rs/src/net`) | Nested `AGENTS.md` under that path |
 | Structure or public API changed substantially | Update the nearest `AGENTS.md` (and root if workspace-level); keep `<!-- MANUAL: -->` sections |
 
 Rules for agents:
@@ -134,12 +134,12 @@ Tree (entry points):
 
 ```
 AGENTS.md
-├── kcp-rs/  kcrypt-rs/  smux-rs/  qpp-rs/  kio-rs/
+├── kcp-rs/  kcrypt-rs/  smux-rs/  qpp-rs/  knet-rs/
 ├── kcptun-client/  kcptun-server/
 ├── bench/  .cargo/
 ├── bugs/   — bug reports & postmortems (not under repo root)
 ├── tests/  — Go e2e reference bins only (no AGENTS.md)
-└── (nested) kcrypt-rs/src/crypt, kio-rs/src/{net,sync,task,time}, …
+└── (nested) kcrypt-rs/src/crypt, knet-rs/src/{net,sync,task,time}, …
 ```
 
 ### Commands
@@ -160,8 +160,8 @@ cargo test --release --package kcptun-server --test stress_test -- --nocapture -
 # Specific stress test
 cargo test --release --package kcptun-server --test stress_test -- test_multithread_100_connections -- --nocapture
 
-# Go↔Rust e2e interop test (tokio + smol; requires Go kcptun binaries)
-make e2e                # auto-builds release + release-smol, then runs test_e2e.sh
+# Go↔Rust e2e interop test (requires Go kcptun binaries)
+make e2e                # auto-builds release, then runs test_e2e.sh
 bash test_e2e.sh        # same, without auto-build
 
 # Lint (warnings = errors)
@@ -192,9 +192,9 @@ kcptun-rs/
 ├── kcrypt-rs/       — 13 block ciphers + AES-128-GCM (extracted from kcp-rs)
 ├── smux-rs/         — SMUX stream multiplexer (v1/v2)
 ├── qpp-rs/          — Quantum Permutation Pad obfuscation
-├── kio-rs/          — Async runtime + network I/O abstraction (tokio / smol)
-├── kcptun-client/   — Client binary (tokio / smol async)
-└── kcptun-server/   — Server binary (tokio / smol async)
+├── knet-rs/          — Async runtime + network I/O abstraction (tokio)
+├── kcptun-client/   — Client binary (tokio async)
+└── kcptun-server/   — Server binary (tokio async)
 ```
 
 Protocol stack (bottom→top): `UDP → BlockCrypt/FEC → KCP → Snappy → SMUX Session → SMUX Stream → TCP`
@@ -257,7 +257,7 @@ Protocol stack (bottom→top): `UDP → BlockCrypt/FEC → KCP → Snappy → SM
 
 Commits on `master` ahead of `origin` (newest last):
 
-1. `196408e` smol true-idle + MPMC `cpu_block` + no nested encrypt parallel  
+1. `196408e` true-idle + MPMC `cpu_block` + no nested encrypt parallel  
 2. `dc419b6` L3 3des flamegraph notes  
 3. `c3945e0` snmp_logger reads `DEFAULT_SNMP` (was always zeros)  
 4. `7420f3a` Go-compatible SNMP fields + **opt-in** collection (`snmp_enable` only if `--snmplog` + period>0)  
@@ -272,11 +272,55 @@ Also staged: move `BUGREPORT*.md` → `bugs/`.
 
 ### Go-compatible pprof from Rust
 
-Prefer `--pprof ADDR` + `go tool pprof` for human-readable stacks:
+Prefer `--pprof` + `go tool pprof` for human-readable stacks:
 
 ```bash
 bash bench/profile_rust_go_pprof.sh server 20
 go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-*.pb
 ```
 
-Build with `--features pprof` to enable the Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock). Use `--features pprof-deadlock` for deadlock detection.
+Standard binaries enable the Go-compatible pprof HTTP server feature by default; pass `--pprof` to listen on `:6060`. Use `--features pprof-deadlock` for deadlock detection.
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **kcptun-rs** (6212 symbols, 13722 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "master"})`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit changes without running `detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/kcptun-rs/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/kcptun-rs/clusters` | All functional areas |
+| `gitnexus://repo/kcptun-rs/processes` | All execution flows |
+| `gitnexus://repo/kcptun-rs/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->

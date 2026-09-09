@@ -144,6 +144,8 @@ pub struct TwofishCrypt {
     s: [[u32; 256]; 4],
     /// Subkeys
     k: [u32; 40],
+    /// Cached `E(GO_CFB_IV)` (first CFB-128 keystream block, per-key constant).
+    first_keystream: [u8; 16],
 }
 
 impl std::fmt::Debug for TwofishCrypt {
@@ -295,7 +297,18 @@ impl TwofishCrypt {
             }
         }
 
-        TwofishCrypt { s, k: subkeys }
+        let c = TwofishCrypt {
+            s,
+            k: subkeys,
+            first_keystream: [0u8; 16],
+        };
+        let mut b = [0u8; 16];
+        c.encrypt_block(&super::GO_CFB_IV, &mut b);
+        TwofishCrypt {
+            s: c.s,
+            k: c.k,
+            first_keystream: b,
+        }
     }
 
     /// g function: 4 table lookups + XOR (O(1) — pre-computed tables)
@@ -350,6 +363,11 @@ impl BlockCipher16 for TwofishCrypt {
     #[inline]
     fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]) {
         self.encrypt_block(inp, out);
+    }
+
+    #[inline]
+    fn cached_first_keystream(&self) -> Option<[u8; 16]> {
+        Some(self.first_keystream)
     }
 }
 

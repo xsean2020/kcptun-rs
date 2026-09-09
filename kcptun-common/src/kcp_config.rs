@@ -99,7 +99,7 @@ pub fn parse_kcp_mode(mode: &str) -> KcpMode {
 /// - Unknown / `"manual"` uses the explicit `nodelay`/`interval`/`resend`/`nc`.
 /// - `stream` is always `true` (kcptun SMUX stack).
 /// - FEC is enabled only when both `datashard` and `parityshard` are > 0
-///   (enforced later by `kcp_conn*` / KcpConn builder).
+///   (enforced later by `kcp_stream_*` / KcpStream builder).
 ///
 /// `conv` defaults to [`DEFAULT_CONV`] when callers pass that constant;
 /// use a non-default value for multi-peer servers that allocate per-peer conv.

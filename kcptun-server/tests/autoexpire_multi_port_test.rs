@@ -2,20 +2,15 @@
 //!
 //! Verifies in a single run:
 //!   1. Multi-port — the server listens on `-l :min-max` and the client dials
-//!      the whole range (`-r host:min-max --conn 2`), round-robining TCP
-//!      accepts across the KCP conns so both server ports carry traffic.
-//!   2. `--autoexpire` — after the tunnel goes idle, the client scavenger
-//!      (polling every 5s) detects `last_activity + (autoexpire+scavengettl)`
-//!      has passed and closes the expired session(s).
+//!      the whole range (`-r host:min-max --conn 2`) and selects a random port
+//!      for each KCP session.
+//!   2. `--autoexpire` — the client scavenger closes sessions after their
+//!      absolute `creation + autoexpire + scavengettl` deadline.
 //!
 //! Autoexpire is observed via the client's stderr log (the only external
 //! signal): "scavenger started: autoexpire=Ns, scavengettl=Ms" proves the flag
-//! was parsed and the scavenger enabled, and "scavenger: closing expired
-//! connection" proves it actually closed an idle session.
-//!
-//! Both sides use `--keepalive 300` because the client's idle timer resets on
-//! ANY inbound KCP segment (kcptun-client/src/main.rs:812); a default keepalive
-//! of 10s would refresh it every poll and autoexpire would never fire.
+//! was parsed and the scavenger enabled, and "scavenger: session closed due to
+//! ttl" proves it actually closed an expired session.
 //!
 //! Usage:
 //!   cargo build --workspace
@@ -182,8 +177,6 @@ fn test_autoexpire_and_multi_port() {
     thread::sleep(Duration::from_millis(500));
 
     // Server listens on a multi-port range.
-    // --keepalive 300: without it the server NOPs the client every 10s, which
-    // resets the client's last_activity and autoexpire never fires.
     let sv = Command::new(&find_bin("kcptun-server"))
         .args(&[
             "-t",
@@ -205,8 +198,6 @@ fn test_autoexpire_and_multi_port() {
             "2048",
             "--rcvwnd",
             "2048",
-            "--keepalive",
-            "300",
         ])
         .env("RUST_LOG", "")
         .stdout(Stdio::null())
@@ -215,9 +206,8 @@ fn test_autoexpire_and_multi_port() {
         .expect("srv");
     thread::sleep(Duration::from_secs(2));
 
-    // Client dials the whole range; --conn 2 round-robins accepts across the
-    // two KCP conns (one per server port). Stderr is captured for the
-    // scavenger log assertions below.
+    // Client dials the whole range; each of the two sessions randomly selects
+    // a configured server port. Stderr is captured for scavenger assertions.
     let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let mut cli = Command::new(&find_bin("kcptun-client"))
         .args(&[
@@ -240,8 +230,6 @@ fn test_autoexpire_and_multi_port() {
             "2048",
             "--rcvwnd",
             "2048",
-            "--keepalive",
-            "300",
             "--conn",
             "2",
             "--autoexpire",
@@ -274,37 +262,22 @@ fn test_autoexpire_and_multi_port() {
 
     // ── Phase 1: multi-port (server listening range + client remote range) ──
     // Each send_and_recv opens one TCP conn; the client's accept loop
-    // round-robins them across the 2 KCP conns, so round 1 hits srv_port_min
-    // and round 2 hits srv_port_max.
+    // round-robins them across the two KCP sessions.
     let data1 = make_payload(1, 4096);
     let resp1 = send_and_recv(cli_port, &data1, 30).expect("round1");
-    assert_eq!(
-        data1, resp1,
-        "multi-port: data mismatch through server port {}",
-        srv_port_min
-    );
-    println!(
-        "  multi-port: server port {} OK ({} bytes)",
-        srv_port_min,
-        data1.len()
-    );
+    assert_eq!(data1, resp1, "multi-port: first session data mismatch");
+    println!("  multi-port: first session OK ({} bytes)", data1.len());
 
     let data2 = make_payload(2, 8192);
     let resp2 = send_and_recv(cli_port, &data2, 30).expect("round2");
-    assert_eq!(
-        data2, resp2,
-        "multi-port: data mismatch through server port {}",
-        srv_port_max
-    );
+    assert_eq!(data2, resp2, "multi-port: second session data mismatch");
     println!(
-        "  multi-port: server port {} OK ({} bytes, round-robin)",
-        srv_port_max,
+        "  multi-port: second session OK ({} bytes, round-robin)",
         data2.len()
     );
 
     // ── Phase 2: --autoexpire ──
-    // Both conns are idle now; last_activity + (5 + 2)s elapses, then the
-    // scavenger (polling every 5s) closes them. Poll stderr for the two log
+    // creation + (5 + 2)s elapses, then the scavenger closes them. Poll for
     // lines proving the parameter took effect and the close actually happened.
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
@@ -312,7 +285,7 @@ fn test_autoexpire_and_multi_port() {
             let log = stderr_buf.lock().unwrap();
             (
                 log.contains("scavenger started: autoexpire=5s, scavengettl=2s"),
-                log.matches("scavenger: closing expired connection").count(),
+                log.matches("scavenger: session closed due to ttl").count(),
             )
         };
         if started && closes >= 1 {

@@ -3,8 +3,11 @@
 //! Checks QPPCount and key length for safe QPP configuration.
 //! Only available with the `qpp` feature.
 
-/// Minimum seed length for QPP (2^QUBITS = 256 bytes, matching Go qpp).
-const QPP_MIN_SEED_LENGTH: usize = 256;
+/// Go qpp's `QPPMinimumSeedLength(8)` result.
+const QPP_MIN_SEED_LENGTH: usize = 211;
+/// Go qpp's `QPPMinimumPads(8)` result (`ceil(211 / 32)`).
+const QPP_MIN_PADS: u16 = 7;
+const QPP_POWER: u64 = 8;
 
 /// Validate QPP parameters and return warnings for unsafe configurations.
 ///
@@ -15,7 +18,7 @@ const QPP_MIN_SEED_LENGTH: usize = 256;
 /// - QPPCount must be > 0 (fatal)
 /// - Key must be at least `QPP_MIN_SEED_LENGTH` bytes (warning)
 /// - QPPCount should meet minimum pad requirements (warning)
-/// - QPPCount should be prime relative to 256 (warning)
+/// - QPPCount should be coprime with the QPP power, 8 (warning)
 pub fn validate_qpp_params(count: u16, key: &[u8]) -> Result<Vec<String>, String> {
     if count == 0 {
         return Err("QPPCount must be greater than 0 when QPP is enabled".to_string());
@@ -31,18 +34,14 @@ pub fn validate_qpp_params(count: u16, key: &[u8]) -> Result<Vec<String>, String
         ));
     }
 
-    // Minimum pads check: with QUBITS=8, need at least a few pads for
-    // meaningful permutation diversity.
-    const MIN_PADS: u16 = 8;
-    if count < MIN_PADS {
+    if count < QPP_MIN_PADS {
         warnings.push(format!(
             "QPP Warning: QPPCount {}, required {} at least",
-            count, MIN_PADS
+            count, QPP_MIN_PADS
         ));
     }
 
-    // Prime check: GCD(count, 256) should be 1 for security.
-    if gcd(count as u64, 256) != 1 {
+    if gcd(count as u64, QPP_POWER) != 1 {
         warnings.push(format!(
             "QPP Warning: QPPCount {}, choose a prime number for security",
             count
@@ -67,7 +66,7 @@ mod tests {
 
     #[test]
     fn zero_count_is_fatal() {
-        let result = validate_qpp_params(0, &[0u8; 256]);
+        let result = validate_qpp_params(0, &[0u8; QPP_MIN_SEED_LENGTH]);
         assert!(result.is_err());
     }
 
@@ -81,7 +80,7 @@ mod tests {
 
     #[test]
     fn adequate_key_no_warnings() {
-        let result = validate_qpp_params(61, &[0u8; 256]);
+        let result = validate_qpp_params(61, &[0u8; QPP_MIN_SEED_LENGTH]);
         assert!(result.is_ok());
         let warnings = result.unwrap();
         assert!(warnings.is_empty());
@@ -89,7 +88,7 @@ mod tests {
 
     #[test]
     fn non_prime_warns() {
-        let result = validate_qpp_params(64, &[0u8; 256]); // 64 shares factor with 256
+        let result = validate_qpp_params(64, &[0u8; QPP_MIN_SEED_LENGTH]);
         assert!(result.is_ok());
         let warnings = result.unwrap();
         assert!(warnings.iter().any(|w| w.contains("prime")));
@@ -97,7 +96,7 @@ mod tests {
 
     #[test]
     fn too_few_pads_warns() {
-        let result = validate_qpp_params(3, &[0u8; 256]);
+        let result = validate_qpp_params(3, &[0u8; QPP_MIN_SEED_LENGTH]);
         assert!(result.is_ok());
         let warnings = result.unwrap();
         assert!(warnings.iter().any(|w| w.contains("required")));

@@ -24,6 +24,7 @@ use std::fmt;
 // ─── Submodules ────────────────────────────────────────────────────────
 mod aes_cfb;
 mod aes_gcm;
+mod aes_soft;
 mod blowfish;
 mod cast5_crypt;
 mod none;
@@ -95,6 +96,16 @@ pub trait AeadCrypt: Send + Sync + fmt::Debug {
     }
     /// Decrypt `[nonce][ciphertext+tag]`, returning plaintext or error.
     fn open(&self, data: &[u8]) -> Result<Vec<u8>, String>;
+    /// Decrypt in place: `buf[..n]` holds `[nonce][ciphertext+tag]`; on success
+    /// `buf[..returned]` holds the plaintext (no allocation).
+    ///
+    /// Default: fall back to `open` + copy back (one heap alloc per packet).
+    /// Implementations should override for the zero-alloc path.
+    fn open_in_place(&self, buf: &mut [u8], n: usize) -> Result<usize, String> {
+        let plain = self.open(&buf[..n])?;
+        buf[..plain.len()].copy_from_slice(&plain);
+        Ok(plain.len())
+    }
     fn name(&self) -> &'static str;
 }
 
@@ -132,6 +143,16 @@ pub trait BlockCipher16: Send + Sync {
             i += 16;
         }
         // Tail < 16B left as-is (caller handles padding semantics)
+    }
+
+    /// Precomputed `E(GO_CFB_IV)` — the first CFB-128 keystream block, which is
+    /// a per-key constant. CFB encrypt/decrypt both start every packet from
+    /// the fixed IV, so implementations that can cache this block (computed
+    /// once at construction) save one block-cipher call per packet. Return
+    /// `None` to keep the on-the-fly computation (default).
+    #[inline]
+    fn cached_first_keystream(&self) -> Option<[u8; 16]> {
+        None
     }
 }
 
@@ -242,7 +263,19 @@ pub fn cfb16_encrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
-    let mut tbl = GO_CFB_IV;
+    // First keystream block is E(GO_CFB_IV) — a per-key constant. Use the
+    // implementation's cached copy when available (saves one block call per
+    // packet), otherwise compute it as before.
+    let mut tbl = match c.cached_first_keystream() {
+        Some(k) => k,
+        None => {
+            let mut t = GO_CFB_IV;
+            let mut b = [0u8; 16];
+            c.encrypt_block(&mut b, &t);
+            t.copy_from_slice(&b);
+            t
+        }
+    };
     let mut i = 0;
     while i + 128 <= data.len() {
         for _ in 0..8 {
@@ -305,7 +338,17 @@ pub fn cfb16_decrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
-    let mut tbl = GO_CFB_IV;
+    // Mirror cfb16_encrypt: reuse the cached E(GO_CFB_IV) when provided.
+    let mut tbl = match c.cached_first_keystream() {
+        Some(k) => k,
+        None => {
+            let mut t = GO_CFB_IV;
+            let mut b = [0u8; 16];
+            c.encrypt_block(&mut b, &t);
+            t.copy_from_slice(&b);
+            t
+        }
+    };
     let mut i = 0;
     while i + 16 <= data.len() {
         let chunk = &mut data[i..i + 16];

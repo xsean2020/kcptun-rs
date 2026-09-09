@@ -4,17 +4,17 @@
 //! so users can just `open_stream()` / `accept()` and use the returned
 //! [`Stream`] with standard async I/O — no manual flush loop needed.
 //!
-//! ## Quick start (Builder, aligned with KcpConn)
+//! ## Quick start (Builder, aligned with KcpStream)
 //!
 //! Pass your transport — `SmuxConn` takes ownership and drives it in a
 //! background task. Chain config, then `.build().await`.
 //!
 //! ```ignore
 //! use smux_rs::{SmuxConn, Config};
-//! use kio::{AsyncReadExt, AsyncWriteExt};
+//! use knet::{AsyncReadExt, AsyncWriteExt};
 //!
 //! // Client
-//! let tcp = kio::TcpStream::connect("127.0.0.1:8080").await?;
+//! let tcp = knet::TcpStream::connect("127.0.0.1:8080").await?;
 //! let conn = SmuxConn::connect(tcp)
 //!     .version(2)
 //!     .keepalive(10)
@@ -30,7 +30,7 @@
 //! let conn = SmuxConn::serve(tcp).version(2).build().await?;
 //! loop {
 //!     let stream = conn.accept().await?;
-//!     kio::spawn_task(async move { /* handle */ });
+//!     knet::spawn_task(async move { /* handle */ });
 //! }
 //!
 //! // Full Config at once
@@ -53,7 +53,7 @@
 //! ```ignore
 //! let conn = SmuxConn::new(DEFAULT_CONFIG.clone(), true)?; // no transport yet
 //! let driver = conn.clone();
-//! kio::spawn_task(async move { let _ = driver.run(&mut tcp).await; });
+//! knet::spawn_task(async move { let _ = driver.run(&mut tcp).await; });
 //! ```
 //!
 //! You can also split the transport and use [`spawn`](Self::spawn) for
@@ -85,7 +85,7 @@ const REAP_LINGER: Duration = Duration::from_secs(30);
 /// `process_data` / `prepare_outbound_into` loop required.
 ///
 /// Prefer [`connect`](Self::connect) / [`serve`](Self::serve) builders (aligned
-/// with `KcpConn`). Low-level drivers remain available:
+/// with `KcpStream`). Low-level drivers remain available:
 ///
 /// - **[`run`](Self::run)**: single-task, takes `&mut T: AsyncRead + AsyncWrite`.
 /// - **[`spawn`](Self::spawn)**: two-task, separate read + write halves.
@@ -94,7 +94,7 @@ const REAP_LINGER: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct SmuxConn {
     session: Arc<Session>,
-    flush_notify: Arc<kio::Notify>,
+    flush_notify: Arc<knet::Notify>,
     /// Set to true once a driver task has been started (via run/spawn or
     /// the connect/serve builders / client/server wrappers). Prevents
     /// accidentally starting a second driver on the same connection.
@@ -118,7 +118,7 @@ impl SmuxConn {
     /// ```
     pub fn connect<T>(transport: T) -> SmuxConnBuilder<T>
     where
-        T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+        T: knet::AsyncRead + knet::AsyncWrite + Send + Unpin + 'static,
     {
         SmuxConnBuilder {
             transport,
@@ -136,7 +136,7 @@ impl SmuxConn {
     /// ```
     pub fn serve<T>(transport: T) -> SmuxConnBuilder<T>
     where
-        T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+        T: knet::AsyncRead + knet::AsyncWrite + Send + Unpin + 'static,
     {
         SmuxConnBuilder {
             transport,
@@ -164,7 +164,7 @@ impl SmuxConn {
         if !is_client {
             session.enable_accept();
         }
-        let flush_notify = Arc::new(kio::Notify::new());
+        let flush_notify = Arc::new(knet::Notify::new());
         Ok(Self {
             session,
             flush_notify,
@@ -179,7 +179,7 @@ impl SmuxConn {
     #[deprecated(note = "use SmuxConn::connect(transport).config(config).build().await")]
     pub fn client<T>(config: Config, transport: T) -> Result<Self, SessionError>
     where
-        T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+        T: knet::AsyncRead + knet::AsyncWrite + Send + Unpin + 'static,
     {
         SmuxConnBuilder {
             transport,
@@ -196,7 +196,7 @@ impl SmuxConn {
     #[deprecated(note = "use SmuxConn::serve(transport).config(config).build().await")]
     pub fn server<T>(config: Config, transport: T) -> Result<Self, SessionError>
     where
-        T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+        T: knet::AsyncRead + knet::AsyncWrite + Send + Unpin + 'static,
     {
         SmuxConnBuilder {
             transport,
@@ -255,7 +255,7 @@ impl SmuxConn {
     /// ```ignore
     /// let conn = Arc::new(SmuxConn::new(Config::default(), true)?);
     /// let driver = conn.clone();
-    /// kio::spawn_task(async move {
+    /// knet::spawn_task(async move {
     ///     let _ = driver.run(&mut tcp).await;
     /// });
     /// // Use conn.open_stream() here…
@@ -266,9 +266,9 @@ impl SmuxConn {
     /// [`spawn`](Self::spawn) with split read/write halves.
     pub async fn run<T>(&self, transport: &mut T) -> Result<(), SessionError>
     where
-        T: kio::AsyncRead + kio::AsyncWrite + Unpin,
+        T: knet::AsyncRead + knet::AsyncWrite + Unpin,
     {
-        use kio::{AsyncReadExt, AsyncWriteExt};
+        use knet::{AsyncReadExt, AsyncWriteExt};
 
         let mut read_buf = vec![0u8; 65536];
         let mut write_buf = BytesMut::with_capacity(65536);
@@ -280,7 +280,7 @@ impl SmuxConn {
             }
 
             // ── Read from transport (with short timeout) ──
-            match kio::timeout(
+            match knet::timeout(
                 Duration::from_millis(RUN_POLL_MS),
                 transport.read(&mut read_buf),
             )
@@ -355,27 +355,23 @@ impl SmuxConn {
     /// happen concurrently. The flush task also wakes on
     /// `flush_notify` (set by stream write / `SmuxIo::poll_write`) for near-instant flush.
     ///
-    /// Split a `kio::TcpStream` using your runtime's split function:
+    /// Split a `knet::TcpStream` using your runtime's split function:
     ///
     /// ```ignore
     /// // tokio
     /// let (read, write) = tokio::io::split(tcp);
     /// conn.spawn(read, write);
-    ///
-    /// // smol
-    /// let (read, write) = smol::io::split(tcp);
-    /// conn.spawn(read, write);
     /// ```
     pub fn spawn<R, W>(&self, mut read: R, mut write: W)
     where
-        R: kio::AsyncRead + Send + Unpin + 'static,
-        W: kio::AsyncWrite + Send + Unpin + 'static,
+        R: knet::AsyncRead + Send + Unpin + 'static,
+        W: knet::AsyncWrite + Send + Unpin + 'static,
     {
-        use kio::{AsyncReadExt, AsyncWriteExt};
+        use knet::{AsyncReadExt, AsyncWriteExt};
 
         // ── Read task ──
         let session = self.session.clone();
-        kio::spawn_task(async move {
+        knet::spawn_task(async move {
             let mut buf = vec![0u8; 65536];
             loop {
                 if session.is_closed() {
@@ -394,7 +390,7 @@ impl SmuxConn {
         // ── Flush + keepalive + reap task ──
         let session = self.session.clone();
         let flush_notify = self.flush_notify.clone();
-        kio::spawn_task(async move {
+        knet::spawn_task(async move {
             let mut buf = BytesMut::with_capacity(65536);
             let mut nop_buf = BytesMut::with_capacity(8);
             let mut health: u32 = 0;
@@ -405,8 +401,8 @@ impl SmuxConn {
                 }
 
                 // Wait for notify (stream wrote data) or 10 ms timeout.
-                let _ =
-                    kio::timeout(Duration::from_millis(RUN_POLL_MS), flush_notify.notified()).await;
+                let _ = knet::timeout(Duration::from_millis(RUN_POLL_MS), flush_notify.notified())
+                    .await;
 
                 buf.clear();
                 let ver = session.version();
@@ -455,6 +451,11 @@ impl SmuxConn {
         &self.session
     }
 
+    /// Get the flush notify handle (for creating [`SmuxIo`] wrappers).
+    pub fn flush_notify(&self) -> Arc<knet::Notify> {
+        self.flush_notify.clone()
+    }
+
     /// Close the connection and all streams.
     pub fn close(&self) {
         self.session.close();
@@ -465,7 +466,7 @@ impl SmuxConn {
 
 impl<T> SmuxConnBuilder<T>
 where
-    T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+    T: knet::AsyncRead + knet::AsyncWrite + Send + Unpin + 'static,
 {
     /// Replace the full SMUX [`Config`].
     pub fn config(mut self, cfg: Config) -> Self {
@@ -539,7 +540,7 @@ where
             return Err(SessionError::SessionClosed);
         }
         let driver = conn.clone();
-        kio::spawn_task(async move {
+        knet::spawn_task(async move {
             let _ = driver.run(&mut transport).await;
         });
         Ok(conn)
@@ -553,15 +554,10 @@ mod tests {
     use super::*;
     use crate::frame::{Cmd, FrameCodec};
     use crate::session::DEFAULT_CONFIG;
-    #[cfg(feature = "tokio")]
     use bytes::BytesMut;
-    #[cfg(feature = "tokio")]
     use std::pin::Pin;
-    #[cfg(feature = "tokio")]
     use std::sync::atomic::{AtomicBool, Ordering};
-    #[cfg(feature = "tokio")]
     use std::sync::{Arc, Mutex};
-    #[cfg(feature = "tokio")]
     use std::task::{Context, Poll};
 
     /// Verify that SmuxConn is Clone and shares the same session.
@@ -576,21 +572,20 @@ mod tests {
     }
 
     /// Builder chain sets Config fields without needing a real network.
-    #[cfg(feature = "tokio")]
     #[test]
     fn connect_builder_sets_config_fields() {
         // Dummy transport never used — we only inspect builder.config before build.
         struct Dummy;
-        impl kio::AsyncRead for Dummy {
+        impl knet::AsyncRead for Dummy {
             fn poll_read(
                 self: Pin<&mut Self>,
                 _cx: &mut Context<'_>,
-                _buf: &mut kio::ReadBuf<'_>,
+                _buf: &mut knet::ReadBuf<'_>,
             ) -> Poll<std::io::Result<()>> {
                 Poll::Pending
             }
         }
-        impl kio::AsyncWrite for Dummy {
+        impl knet::AsyncWrite for Dummy {
             fn poll_write(
                 self: Pin<&mut Self>,
                 _cx: &mut Context<'_>,
@@ -690,26 +685,23 @@ mod tests {
 
     // ─── Mock transport for run()/spawn() FIN marking tests ──────────────────
 
-    #[cfg(feature = "tokio")]
     struct MockTransport {
         written: Arc<Mutex<BytesMut>>,
         fail_next_write: Arc<AtomicBool>,
     }
 
-    #[cfg(feature = "tokio")]
-    impl kio::AsyncRead for MockTransport {
+    impl knet::AsyncRead for MockTransport {
         fn poll_read(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            _buf: &mut kio::ReadBuf<'_>,
+            _buf: &mut knet::ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
             // Never deliver data; causes the 10ms timeout in run() to fire and proceed to flush.
             Poll::Pending
         }
     }
 
-    #[cfg(feature = "tokio")]
-    impl kio::AsyncWrite for MockTransport {
+    impl knet::AsyncWrite for MockTransport {
         fn poll_write(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -734,14 +726,12 @@ mod tests {
     }
 
     /// A write-only half for testing spawn(). Returns Ok(0) on read side is separate.
-    #[cfg(feature = "tokio")]
     struct MockWriteHalf {
         written: Arc<Mutex<BytesMut>>,
         fail_next_write: Arc<AtomicBool>,
     }
 
-    #[cfg(feature = "tokio")]
-    impl kio::AsyncWrite for MockWriteHalf {
+    impl knet::AsyncWrite for MockWriteHalf {
         fn poll_write(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -767,15 +757,13 @@ mod tests {
 
     /// Reader that blocks forever (never returns) so the read task in spawn()
     /// keeps the session alive while we let the flush task reap and write FINs.
-    #[cfg(feature = "tokio")]
     struct BlockingReadHalf;
 
-    #[cfg(feature = "tokio")]
-    impl kio::AsyncRead for BlockingReadHalf {
+    impl knet::AsyncRead for BlockingReadHalf {
         fn poll_read(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            _buf: &mut kio::ReadBuf<'_>,
+            _buf: &mut knet::ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
             Poll::Pending
         }
@@ -810,17 +798,17 @@ mod tests {
             };
 
             let driver = conn.clone();
-            let handle = kio::spawn_task(async move {
+            let handle = knet::spawn_task(async move {
                 let _ = driver.run(&mut transport).await;
             });
 
             // Allow the first read-timeout + flush iteration to happen.
-            kio::sleep_ms(30).await;
+            knet::sleep_ms(30).await;
 
             // Close to unblock the driver loop.
             conn.close();
             // Give the task a moment to exit.
-            kio::sleep_ms(20).await;
+            knet::sleep_ms(20).await;
             drop(handle);
 
             let data = written.lock().unwrap().clone();
@@ -872,13 +860,13 @@ mod tests {
             };
 
             let driver = conn.clone();
-            let _handle = kio::spawn_task(async move {
+            let _handle = knet::spawn_task(async move {
                 let _ = driver.run(&mut transport).await;
             });
 
-            kio::sleep_ms(30).await;
+            knet::sleep_ms(30).await;
             conn.close();
-            kio::sleep_ms(20).await;
+            knet::sleep_ms(20).await;
 
             // Because we failed before extending the buffer in the mock, the FIN should not be present.
             let data = written.lock().unwrap().clone();
@@ -925,10 +913,10 @@ mod tests {
             conn.spawn(read_half, write_half);
 
             // Let the flush task run at least one iteration.
-            kio::sleep_ms(30).await;
+            knet::sleep_ms(30).await;
 
             conn.close();
-            kio::sleep_ms(20).await;
+            knet::sleep_ms(20).await;
 
             let data = written.lock().unwrap().clone();
             assert!(
@@ -979,9 +967,9 @@ mod tests {
 
             conn.spawn(read_half, write_half);
 
-            kio::sleep_ms(30).await;
+            knet::sleep_ms(30).await;
             conn.close();
-            kio::sleep_ms(20).await;
+            knet::sleep_ms(20).await;
 
             let data = written.lock().unwrap().clone();
             let mut codec = FrameCodec::new(65536);

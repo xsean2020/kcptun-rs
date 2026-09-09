@@ -10,12 +10,10 @@ Tests all cipher methods × compression on/off, comparing:
 Implementations:
   Go          tests/kcptun-go/{client,server}
   Rust-tokio  target/release/{kcptun-client,kcptun-server}
-  Rust-smol   target/smol-release/release/{kcptun-client,kcptun-server}
 
 Usage:
   python3 bench_rust_vs_go.py [--conn N] [--size S] [--timeout T] [--quick] [--runs N]
   python3 bench_rust_vs_go.py --rust-only   # only Rust-tokio
-  python3 bench_rust_vs_go.py --smol-only   # only Rust-smol
   python3 bench_rust_vs_go.py --go-only     # only Go
 
 Noise reduction:
@@ -486,41 +484,32 @@ def main():
     parser.add_argument('--timeout', type=int, default=30, help='per-connection timeout (s)')
     parser.add_argument('--quick', action='store_true', help='quick mode: fewer ciphers')
     parser.add_argument('--runs', type=int, default=0, help='repeat each config N times, report median (0=auto: 3 for --quick, 1 otherwise)')
-    parser.add_argument('--rust-only', action='store_true', help='only Rust-tokio (skip Go and Rust-smol)')
-    parser.add_argument('--smol-only', action='store_true', help='only Rust-smol (skip Go and Rust-tokio)')
-    parser.add_argument('--go-only', action='store_true', help='only Go (skip Rust-tokio and Rust-smol)')
+    parser.add_argument('--rust-only', action='store_true', help='only Rust-tokio (skip Go)')
+    parser.add_argument('--go-only', action='store_true', help='only Go (skip Rust-tokio)')
     args = parser.parse_args()
     runs = args.runs if args.runs > 0 else (3 if args.quick else 1)
 
     rust_server = os.path.join(REPO, 'target/release/kcptun-server')
     rust_client = os.path.join(REPO, 'target/release/kcptun-client')
-    smol_server = os.path.join(REPO, 'target/smol-release/release/kcptun-server')
-    smol_client = os.path.join(REPO, 'target/smol-release/release/kcptun-client')
     go_server = os.path.join(REPO, 'tests/kcptun-go/server')
     go_client = os.path.join(REPO, 'tests/kcptun-go/client')
 
-    test_rust = not args.go_only and not args.smol_only
-    test_smol = not args.go_only and not args.rust_only
-    test_go = not args.rust_only and not args.smol_only
+    test_rust = not args.go_only
+    test_go = not args.rust_only
 
     if test_rust:
         for p, n in [(rust_server, 'Rust-tokio server'), (rust_client, 'Rust-tokio client')]:
             if not os.path.exists(p):
                 log(f"ERROR: {n} not found at {p}")
                 test_rust = False
-    if test_smol:
-        for p, n in [(smol_server, 'Rust-smol server'), (smol_client, 'Rust-smol client')]:
-            if not os.path.exists(p):
-                log(f"ERROR: {n} not found at {p} (build with: make release-smol)")
-                test_smol = False
     if test_go:
         for p, n in [(go_server, 'Go server'), (go_client, 'Go client')]:
             if not os.path.exists(p):
                 log(f"ERROR: {n} not found at {p}")
                 test_go = False
 
-    if not test_rust and not test_smol and not test_go:
-        log("No binaries found. Build first: cargo build --release && make release-smol")
+    if not test_rust and not test_go:
+        log("No binaries found. Build first: cargo build --release")
         sys.exit(1)
 
     ciphers = ['null', 'aes-128', 'aes-128-gcm', 'salsa20', 'blowfish', 'sm4', '3des'] if args.quick else CIPHERS
@@ -531,13 +520,12 @@ def main():
     print(f"  Ciphers: {len(ciphers)} | Compression: on+off | Runs per config: {runs} | Implementations: ", end="")
     impls = []
     if test_rust: impls.append("Rust-tokio")
-    if test_smol: impls.append("Rust-smol")
     if test_go: impls.append("Go")
     print(" + ".join(impls))
     print("=" * 80)
 
     all_results = []
-    n_impls = (1 if test_rust else 0) + (1 if test_smol else 0) + (1 if test_go else 0)
+    n_impls = (1 if test_rust else 0) + (1 if test_go else 0)
     total_tests = len(ciphers) * len(COMP_MODES) * n_impls
     test_num = 0
 
@@ -554,23 +542,6 @@ def main():
                     label=f"Rust-tokio {config}", crypt=crypt, nocomp=nocomp, impl_name='rust') if runs > 1 else \
                     run_bench(rust_server, rust_client, False, args.conn, args.size,
                               args.timeout, f"Rust-tokio {config}", crypt, nocomp, 'rust')
-                if r:
-                    all_results.append(r)
-                    tp = r['throughput'] / 1024 / 1024
-                    lat = r.get('latency_avg', 0)
-                    ok = r['ok']
-                    log(f"  → {ok} ok, {tp:.1f} MB/s, {lat:.3f}s avg")
-                else:
-                    log(f"  → FAILED")
-
-            if test_smol:
-                test_num += 1
-                log(f"[{test_num}/{total_tests}] Rust-smol {config}")
-                r = _aggregate_runs_mean(run_bench, runs, server_bin=smol_server, client_bin=smol_client,
-                    is_go=False, conn=args.conn, size=args.size, timeout=args.timeout,
-                    label=f"Rust-smol {config}", crypt=crypt, nocomp=nocomp, impl_name='smol') if runs > 1 else \
-                    run_bench(smol_server, smol_client, False, args.conn, args.size,
-                              args.timeout, f"Rust-smol {config}", crypt, nocomp, 'smol')
                 if r:
                     all_results.append(r)
                     tp = r['throughput'] / 1024 / 1024
@@ -608,7 +579,7 @@ def main():
     print(header)
     print(f"  {'-'*28} {'-'*10} {'-'*4} {'-'*5} {'-'*7} {'-'*11} {'-'*13}")
 
-    impl_display = {'rust': 'Rust-tokio', 'smol': 'Rust-smol', 'go': 'Go'}
+    impl_display = {'rust': 'Rust-tokio', 'go': 'Go'}
     for r in all_results:
         tp = r['throughput'] / 1024 / 1024
         lat = r.get('latency_avg', 0)
@@ -628,24 +599,17 @@ def main():
         print("=" * 100)
 
         has_rust = 'rust' in impls_present
-        has_smol = 'smol' in impls_present
         has_go = 'go' in impls_present
 
         header = f"  {'Config':<24}"
         if has_rust: header += f" {'Tokio':>10}"
-        if has_smol: header += f" {'Smol':>10}"
         if has_go:   header += f" {'Go':>10}"
         if has_rust and has_go: header += f" {'T/Go':>7}"
-        if has_smol and has_go: header += f" {'S/Go':>7}"
-        if has_rust and has_smol: header += f" {'T/S':>7}"
         print(header)
         sep = f"  {'-'*24}"
         if has_rust: sep += f" {'-'*10}"
-        if has_smol: sep += f" {'-'*10}"
         if has_go:   sep += f" {'-'*10}"
         if has_rust and has_go: sep += f" {'-'*7}"
-        if has_smol and has_go: sep += f" {'-'*7}"
-        if has_rust and has_smol: sep += f" {'-'*7}"
         print(sep)
 
         def fmt_mb(r):
@@ -665,15 +629,11 @@ def main():
                 comp_label = "no-comp" if nocomp else "comp"
                 config = f"{crypt}/{comp_label}"
                 rust_r = next((r for r in all_results if r['crypt'] == crypt and r['nocomp'] == nocomp and r.get('impl') == 'rust'), None)
-                smol_r = next((r for r in all_results if r['crypt'] == crypt and r['nocomp'] == nocomp and r.get('impl') == 'smol'), None)
                 go_r = next((r for r in all_results if r['crypt'] == crypt and r['nocomp'] == nocomp and r.get('impl') == 'go'), None)
                 line = f"  {config:<24}"
                 if has_rust: line += f" {fmt_mb(rust_r)}"
-                if has_smol: line += f" {fmt_mb(smol_r)}"
                 if has_go:   line += f" {fmt_mb(go_r)}"
                 if has_rust and has_go: line += f" {fmt_ratio(rust_r, go_r)}"
-                if has_smol and has_go: line += f" {fmt_ratio(smol_r, go_r)}"
-                if has_rust and has_smol: line += f" {fmt_ratio(rust_r, smol_r)}"
                 print(line)
 
     # Save results as JSON

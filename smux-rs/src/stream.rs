@@ -36,13 +36,17 @@ struct BytesPool {
 
 impl BytesPool {
     fn new() -> Self {
-        BytesPool { buffers: Vec::with_capacity(POOL_MAX_BUFFERS) }
+        BytesPool {
+            buffers: Vec::with_capacity(POOL_MAX_BUFFERS),
+        }
     }
 
     /// Acquire a buffer from the pool, or allocate a fresh one.
     #[inline]
     fn acquire(&mut self) -> BytesMut {
-        self.buffers.pop().unwrap_or_else(|| BytesMut::with_capacity(POOL_BUF_SIZE))
+        self.buffers
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(POOL_BUF_SIZE))
     }
 
     /// Return a buffer to the pool for reuse (cleared, capacity retained).
@@ -166,12 +170,12 @@ pub struct Stream {
 
     // ── Async notification ──
     /// Wakes up a reader blocked in `read_async()`.
-    ch_reader_wakeup: kio::Notify,
+    ch_reader_wakeup: knet::Notify,
     /// Wakes up a writer blocked in `poll_write()` (v2 peer window).
-    ch_write_wakeup: kio::Notify,
+    ch_write_wakeup: knet::Notify,
     /// Optional flush-loop wake (SmuxConn / kcptun set this so writes flush ASAP).
     /// Low-level Session users may leave this `None`.
-    flush_notify: Mutex<Option<Arc<kio::Notify>>>,
+    flush_notify: Mutex<Option<Arc<knet::Notify>>>,
     /// Weak self-reference so a grace-expiry wakeup task can re-wake a reader.
     self_ref: Mutex<Option<std::sync::Weak<Stream>>>,
 }
@@ -207,8 +211,8 @@ impl Stream {
             pending_upd: AtomicBool::new(false),
             peer_consumed: AtomicU32::new(0),
             peer_window: AtomicU32::new(262144), // Go initialPeerWindow
-            ch_reader_wakeup: kio::Notify::new(),
-            ch_write_wakeup: kio::Notify::new(),
+            ch_reader_wakeup: knet::Notify::new(),
+            ch_write_wakeup: knet::Notify::new(),
             flush_notify: Mutex::new(None),
             self_ref: Mutex::new(None),
         }
@@ -223,7 +227,7 @@ impl Stream {
 
     /// Attach a flush-loop notifier so `poll_write` / shutdown wake the driver.
     #[inline]
-    pub fn set_flush_notify(&self, n: Arc<kio::Notify>) {
+    pub fn set_flush_notify(&self, n: Arc<knet::Notify>) {
         *self.flush_notify.lock() = Some(n);
     }
 
@@ -297,12 +301,6 @@ impl Stream {
     #[inline]
     pub fn mark_opened(&self) {
         self.opened.store(true, Ordering::Release);
-    }
-
-    /// Check if the stream has been opened.
-    #[inline]
-    pub fn is_opened(&self) -> bool {
-        self.opened.load(Ordering::Acquire)
     }
 
     /// Wake up any reader blocked in `read_async()` or async `read()`.
@@ -416,12 +414,12 @@ impl Stream {
                 // its stream faster than the sender's own flush can emit the
                 // remaining data (KCP congestion-window slow start means the
                 // tail can land 100–300 ms after the FIN). In the M1-A lib
-                // KcpConn path, the reader adds a `KCP → read_buf → reader →
+                // KcpStream path, the reader adds a `KCP → read_buf → reader →
                 // process_data` hop, which widens this window.
                 //
                 // CONSEQUENCE WITHOUT THE GRACE: the moment this reader sees
                 // `remote_closed && empty` it returned `Err(Closed)`, the
-                // caller's `kio::pipe` completed, and the still-in-transit data
+                // caller's `knet::pipe` completed, and the still-in-transit data
                 // tail was silently dropped (observed ~1/5 runs under
                 // `aes + FEC 10/3` for 200 KB transfers).
                 //
@@ -435,8 +433,8 @@ impl Stream {
                 if let Some(t) = closed_at {
                     if t.elapsed() < EOF_GRACE {
                         if let Some(w) = self.self_ref.lock().clone() {
-                            kio::spawn_task(async move {
-                                kio::sleep_ms(EOF_GRACE_MS).await;
+                            knet::spawn_task(async move {
+                                knet::sleep_ms(EOF_GRACE_MS).await;
                                 if let Some(s) = w.upgrade() {
                                     s.wakeup_reader();
                                 }
@@ -727,23 +725,10 @@ impl Stream {
         }
     }
 
-    /// Get the number of bytes read in total.
-    #[inline]
-    pub fn bytes_read_total(&self) -> u32 {
-        self.bytes_read.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of bytes written in total.
-    #[inline]
-    pub fn bytes_written_total(&self) -> u32 {
-        self.bytes_written.load(Ordering::Relaxed)
-    }
 }
-
 /// Shared read logic for `AsyncRead` impls on `Stream` (and Arc wrappers).
 ///
-/// Both tokio (via `ReadBuf`) and smol (via `&mut [u8]`) reduce to this
-/// after extracting the raw byte slice. Returns:
+/// tokio (via `ReadBuf`) reduces to this after extracting the raw byte slice. Returns:
 /// - `Ok(0)` → EOF (stream closed or peer sent FIN)
 /// - `Ok(n)` → read `n` bytes
 /// - `Err(_)` → connection reset
@@ -778,14 +763,13 @@ pub(crate) fn poll_read_into(
     }
 }
 
-// ─── kio::AsyncRead / AsyncWrite impls (standalone async support) ─────────
+// ─── knet::AsyncRead / AsyncWrite impls (standalone async support) ─────────
 
-#[cfg(feature = "tokio")]
-impl kio::AsyncRead for Stream {
+impl knet::AsyncRead for Stream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut kio::ReadBuf<'_>,
+        buf: &mut knet::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let space = buf.initialize_unfilled();
         match poll_read_into(&self, cx.waker(), space) {
@@ -800,8 +784,7 @@ impl kio::AsyncRead for Stream {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl kio::AsyncWrite for Stream {
+impl knet::AsyncWrite for Stream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -848,69 +831,6 @@ impl kio::AsyncWrite for Stream {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         debug!(
             "Stream::poll_shutdown: marking stream {} local_closed",
-            self.id
-        );
-        self.mark_local_closed();
-        self.notify_flush();
-        Poll::Ready(Ok(()))
-    }
-}
-
-#[cfg(feature = "smol")]
-impl kio::AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        poll_read_into(&self, cx.waker(), buf)
-    }
-}
-
-#[cfg(feature = "smol")]
-impl kio::AsyncWrite for Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.local_closed.load(Ordering::Acquire) {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "SMUX stream closed",
-            )));
-        }
-        // v2 write-side flow control: block when peer window is full.
-        let peer_win = self.peer_send_window();
-        if peer_win == 0 {
-            self.register_write_waker(cx.waker().clone());
-            if self.peer_send_window() == 0 {
-                return Poll::Pending;
-            }
-        }
-        match self.write(buf) {
-            Ok(n) => {
-                self.notify_flush();
-                Poll::Ready(Ok(n))
-            }
-            Err(StreamError::Closed) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "SMUX stream closed",
-            ))),
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "SMUX write error",
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        debug!(
-            "Stream::poll_close: marking stream {} local_closed",
             self.id
         );
         self.mark_local_closed();
@@ -1067,14 +987,14 @@ mod tests {
         stream.push_data(b"hello").unwrap();
         let mut buf = [0u8; 5];
         stream.read(&mut buf).unwrap();
-        assert_eq!(stream.bytes_read_total(), 5);
+        assert_eq!(stream.bytes_read.load(Ordering::Relaxed), 5);
         stream.write(b"world").unwrap();
         // bytes_written tracks on-wire bytes (Go numWritten) — only after drain.
-        assert_eq!(stream.bytes_written_total(), 0);
+        assert_eq!(stream.bytes_written.load(Ordering::Relaxed), 0);
         assert_eq!(stream.pending_send(), 5);
         let mut out = bytes::BytesMut::new();
         assert_eq!(stream.drain_send_max(&mut out, 64), 5);
-        assert_eq!(stream.bytes_written_total(), 5);
+        assert_eq!(stream.bytes_written.load(Ordering::Relaxed), 5);
         assert_eq!(&out[..], b"world");
     }
 
@@ -1098,12 +1018,12 @@ mod tests {
         let stream = Arc::new(Stream::new(1));
         let s = stream.clone();
         // Use std::thread instead of spawn_task to avoid executor lifecycle
-        // issues in tests (smol global executor doesn't shut down cleanly).
+        // issues in tests.
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
             s.push_data(b"hello async").unwrap();
         });
-        kio::block_on(async {
+        knet::block_on(async {
             let mut buf = [0u8; 32];
             let (n, _) = stream.read_async(&mut buf).await.unwrap();
             assert_eq!(n, 11);
@@ -1119,7 +1039,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             s.mark_remote_closed();
         });
-        kio::block_on(async {
+        knet::block_on(async {
             let mut buf = [0u8; 32];
             let result = stream.read_async(&mut buf).await;
             assert_eq!(result, Err(StreamError::Closed));
@@ -1135,7 +1055,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             s.mark_remote_closed();
         });
-        kio::block_on(async {
+        knet::block_on(async {
             let mut buf = [0u8; 32];
             let (n, _) = stream.read_async(&mut buf).await.unwrap();
             assert_eq!(n, 9);
@@ -1147,12 +1067,11 @@ mod tests {
     fn stream_poll_read_returns_data_via_trait() {
         let mut stream = Stream::new(1);
         stream.push_data(b"hello trait").unwrap();
-        kio::block_on(async {
-            use kio::AsyncReadExt;
+        knet::block_on(async {
             let mut buf = [0u8; 32];
             // &mut Stream implements AsyncRead via the blanket impl
             // for T: AsyncRead + Unpin.
-            let n = (&mut stream).read(&mut buf).await.unwrap();
+            let n = knet::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
             assert_eq!(n, 11);
             assert_eq!(&buf[..11], b"hello trait");
         });
@@ -1160,41 +1079,37 @@ mod tests {
 
     #[test]
     fn stream_poll_write_and_then_poll_read_shutdown() {
-        kio::block_on(async {
-            use kio::AsyncWriteExt;
+        knet::block_on(async {
+            use knet::AsyncWriteExt;
             let mut stream = Stream::new(1);
 
             // Write some data via AsyncWrite trait
-            let n = (&mut stream).write(b"hello world").await.unwrap();
+            let n = knet::AsyncWriteExt::write(&mut stream, b"hello world").await.unwrap();
             assert_eq!(n, 11);
 
             // Verify via the sync method
             assert_eq!(stream.pending_send(), 11);
 
             // Shutdown (half-close local side).
-            // tokio's AsyncWriteExt provides shutdown(); futures_lite (smol)
-            // uses close() for the same semantic.
-            #[cfg(feature = "tokio")]
+            // tokio's AsyncWriteExt provides shutdown().
             stream.shutdown().await.unwrap();
-            #[cfg(feature = "smol")]
-            kio::AsyncWriteExt::close(&mut stream).await.unwrap();
             assert!(stream.is_local_closed());
         });
     }
     #[test]
     fn set_flush_notify_wakes_on_async_write() {
-        kio::block_on(async {
-            use kio::AsyncWriteExt;
-            let notify = Arc::new(kio::Notify::new());
+        knet::block_on(async {
+            
+            let notify = Arc::new(knet::Notify::new());
             let mut stream = Stream::new(1);
             stream.set_flush_notify(notify.clone());
-            let waiter = kio::spawn_task(async move {
+            let waiter = knet::spawn_task(async move {
                 notify.notified().await;
             });
-            kio::sleep_ms(1).await;
-            let n = (&mut stream).write(b"ping").await.unwrap();
+            knet::sleep_ms(1).await;
+            let n = knet::AsyncWriteExt::write(&mut stream, b"ping").await.unwrap();
             assert_eq!(n, 4);
-            let _ = kio::timeout(std::time::Duration::from_millis(200), waiter).await;
+            let _ = knet::timeout(std::time::Duration::from_millis(200), waiter).await;
         });
     }
 }

@@ -9,8 +9,6 @@
 //! - **Zero-copy** segment parsing via `bytes::BytesMut`
 //! - **Zero-alloc** segment pooling with a `Vec`-backed free list
 //! - **Atomic SNMP counters** via `std::sync::atomic` with precise `Ordering`
-//! - **Cache-friendly** `#[repr(C)]` struct layouts aligned to 64-byte cache lines
-//! - **Pluggable** `BlockCrypt` trait for encryption at the segment level
 //! - **Reed-Solomon FEC** for forward error correction
 //!
 //! ## Encryption
@@ -36,24 +34,29 @@
     clippy::if_same_then_else,
 )]
 
+#[cfg(feature = "async")]
 pub mod config;
 pub mod fec;
 pub mod kcp;
 pub mod segment;
 pub mod snmp;
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 pub mod conn;
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 pub mod listener;
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
+pub mod sharded;
+
+#[cfg(feature = "async")]
 pub(crate) mod transport;
 
 #[cfg(test)]
 mod kcp_p999_optimizations_test;
 
+#[cfg(feature = "async")]
 pub use config::{KcpConfig, KcpMode, DEFAULT_CONV};
 pub use fec::{
     fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncoder, FEC_HEADER_SIZE,
@@ -63,11 +66,17 @@ pub use kcp::KCP;
 pub use segment::SegmentPool;
 pub use snmp::{add as snmp_add, enable as snmp_enable, store as snmp_store, DEFAULT_SNMP, SNMP};
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
-pub use conn::{KcpConn, KcpConnBuilder};
+#[cfg(feature = "async")]
+pub use conn::{KcpStream, KcpStreamBuilder};
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
-pub use listener::{KcpListener, KcpListenerBuilder, KcpTcpListener, KcpTcpListenerBuilder};
+#[cfg(feature = "async")]
+pub use listener::{KcpTcpListener, KcpTcpListenerBuilder};
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 pub use transport::PacketTransport;
+
+#[cfg(feature = "async")]
+pub use sharded::{
+    bind_listener, from_socket_listener, KcpListener, KcpListenerBuilder, WorkerPoolLimits,
+    WorkerPoolStats,
+};

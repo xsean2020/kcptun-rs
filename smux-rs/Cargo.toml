@@ -8,13 +8,13 @@ description = "SMUX stream multiplexer for kcptun"
 bytes = "1"
 log = "0.4"
 parking_lot = "0.12"
-kio-rs = { path = "../kio-rs", default-features = false }
+knet-rs = { path = "../knet-rs", default-features = false }
 thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive"] }
 
 [features]
 default = ["tokio"]
-tokio = ["kio-rs/tokio"]
-smol = ["kio-rs/smol"]
+tokio = []

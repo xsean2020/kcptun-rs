@@ -20,8 +20,8 @@ use smallvec::SmallVec;
 
 use crate::segment::SegmentPool;
 use crate::segment::{
-    Command, Segment, KCP_ASK_SEND, KCP_ASK_TELL, KCP_DEFAULT_WND, KCP_MAX_FRAG, KCP_OVERHEAD, MTU,
-    SSTHRESH_INIT,
+    Command, Segment, KCP_ASK_SEND, KCP_ASK_TELL, KCP_DEFAULT_WND, KCP_MAX_FRAG, KCP_OVERHEAD,
+    KCP_THRESHOLD_INIT, MTU,
 };
 use crate::snmp::{self, DEFAULT_SNMP};
 
@@ -46,9 +46,6 @@ pub(crate) const PROBE_INIT: u32 = 500;
 pub(crate) const PROBE_INIT_NODELAY: u32 = 50;
 /// Max probe interval (120s, matching Go)
 pub const IKCP_PROBE_LIMIT: u32 = 120000;
-/// Semantic alias for [`IKCP_PROBE_LIMIT`].
-pub const PROBE_LIMIT: u32 = IKCP_PROBE_LIMIT;
-
 /// After this many retransmits, mark the connection as dead.
 /// Matches Go `IKCP_DEADLINK`.
 const DEAD_LINK_RETRIES: u32 = 20;
@@ -186,6 +183,33 @@ fn itimediff(later: impl Into<u64>, earlier: impl Into<u64>) -> i32 {
     later.into().wrapping_sub(earlier.into()) as i32
 }
 
+/// Wall-clock ms since UNIX_EPOCH via a process-wide cached clock: one
+/// `SystemTime::now()` at first use, then `Instant::elapsed()` per call —
+/// removes the epoch-conversion syscall from the per-packet paths. Monotonic by
+/// construction (ignores wall-clock adjustments), which KCP/FEC timing only
+/// cares about via 32-bit `itimediff` gaps.
+/// pprof evidence: `Timespec::now` was 6.52% of CPU (1489ms/20s) from ~2000
+/// `SystemTime::now()` calls/sec across flush_data_only + input_no_flush +
+/// flush_input_batch + send_to_kcp paths (and one call per FEC encode before
+/// the clock was shared).
+#[inline]
+pub(crate) fn wall_ms() -> u64 {
+    use std::sync::OnceLock;
+    struct ClockOffset {
+        epoch_ms: u64,
+        instant: std::time::Instant,
+    }
+    static OFFSET: OnceLock<ClockOffset> = OnceLock::new();
+    let offset = OFFSET.get_or_init(|| ClockOffset {
+        epoch_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        instant: std::time::Instant::now(),
+    });
+    offset.epoch_ms + offset.instant.elapsed().as_millis() as u64
+}
+
 impl KCP {
     /// Create a new KCP instance.
     ///
@@ -213,7 +237,7 @@ impl KCP {
             rcv_wnd: KCP_DEFAULT_WND,
             rmt_wnd: KCP_DEFAULT_WND,
             cwnd: KCP_DEFAULT_WND, // Go: 0, but we follow C KCP (ikcp_create sets cwnd = IKCP_WND_SND)
-            ssthresh: SSTHRESH_INIT,
+            ssthresh: KCP_THRESHOLD_INIT,
             mss: mtu.saturating_sub(KCP_OVERHEAD as u32),
             mtu,
             rx_srtt: 0,
@@ -279,12 +303,6 @@ impl KCP {
         self.mtu
     }
 
-    /// Set the maximum segment size.
-    #[inline]
-    pub fn set_mss(&mut self, mss: u32) {
-        self.mss = mss;
-    }
-
     /// Set the send window size.
     #[inline]
     pub fn set_snd_wnd(&mut self, wnd: u32) {
@@ -343,7 +361,7 @@ impl KCP {
     ///
     /// A live peer replies with `WINS` (cmd 84), so a dialing side can observe
     /// that response to confirm reachability + conv match without sending user
-    /// data (used by [`crate::KcpConn`]'s connect-timeout first-packet wait).
+    /// data (used by [`crate::KcpStream`]'s connect-timeout first-packet wait).
     #[inline]
     pub fn request_probe(&mut self) {
         self.probe |= KCP_ASK_SEND;
@@ -578,6 +596,13 @@ impl KCP {
     }
 
     fn parse_fastack(&mut self, sn: u32, ts: u32) -> bool {
+        // Fast retransmit disabled: with `fastresend <= 0` the flush loop sets
+        // `resent = 0xFFFFFFFF`, so no fastack count can ever trigger a
+        // retransmit — skip the O(inflight) snd_buf scan entirely (every
+        // inbound ACK would otherwise walk the deque for nothing).
+        if self.fastresend <= 0 {
+            return false;
+        }
         if itimediff(sn, self.snd_una) < 0 || itimediff(sn, self.snd_nxt) >= 0 {
             return false;
         }
@@ -961,46 +986,6 @@ impl KCP {
         }
     }
 
-    /// Determine when `update()` should next be called.
-    /// Matches Go's `Check()` function.
-    pub fn check(&self, current: u32) -> u32 {
-        let mut ts_flush = self.ts_flush;
-        let mut tm_packet: i32 = 0x7fffffff;
-
-        if self.updated == 0 {
-            return current;
-        }
-
-        if itimediff(current, ts_flush) >= 10000 || itimediff(current, ts_flush) < -10000 {
-            ts_flush = current;
-        }
-
-        if itimediff(current, ts_flush) >= 0 {
-            return current;
-        }
-
-        let tm_flush = itimediff(ts_flush, current);
-
-        for seg in &self.snd_buf {
-            let diff = itimediff(seg.resendts, current);
-            if diff <= 0 {
-                return current;
-            }
-            if diff < tm_packet {
-                tm_packet = diff;
-            }
-        }
-
-        let mut minimal = tm_packet as u32;
-        if tm_packet >= tm_flush {
-            minimal = tm_flush as u32;
-        }
-        if minimal >= self.interval {
-            minimal = self.interval;
-        }
-        current.wrapping_add(minimal)
-    }
-
     /// Force-flush all pending data.
     ///
     /// Returns `next_update` — the milliseconds until the next meaningful
@@ -1012,7 +997,7 @@ impl KCP {
     }
 
     /// Flush WITHOUT emitting ACK segments (data / retransmit / window-probe
-    /// only). `KcpConn` uses this on the inline write path so writes cannot
+    /// only). `KcpStream` uses this on the inline write path so writes cannot
     /// consume ACKs before inbound processing or the protocol-deadline flush
     /// emits them in queue order.
     #[inline]
@@ -1055,6 +1040,9 @@ impl KCP {
         let flush_buf = |buf: &mut BytesMut, output: &mut Box<dyn FnMut(Bytes) + Send>| {
             if !buf.is_empty() {
                 let data = buf.split().freeze();
+                // split() moves the allocation out; re-reserve so the next
+                // packet encode does not pay a fresh malloc per output packet.
+                buf.reserve(mtu);
                 output(data);
             }
         };
@@ -1323,13 +1311,7 @@ impl KCP {
         self.snd_queue.len()
     }
 
-    /// Number of segments in the send buffer.
-    #[inline]
-    pub fn snd_buf_len(&self) -> usize {
-        self.snd_buf.len()
-    }
-
-    /// Number of segments in the receive queue.
+    /// Number of unacknowledged ACKs queued for the next flush.
     #[inline]
     pub fn acklist_len(&self) -> usize {
         self.acklist.len()
@@ -1338,7 +1320,7 @@ impl KCP {
     /// Whether the async driver still has protocol maintenance to schedule
     /// after sending the current output batch.
     #[inline]
-    #[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+    #[cfg(feature = "async")]
     pub(crate) fn needs_update(&self) -> bool {
         self.wait_send() > 0
             || !self.acklist.is_empty()
@@ -1350,12 +1332,6 @@ impl KCP {
     #[inline]
     pub fn pending_flush_flag(&self) -> u32 {
         self.pending_flush
-    }
-
-    /// Number of segments in the receive queue.
-    #[inline]
-    pub fn rcv_queue_len(&self) -> usize {
-        self.rcv_queue.len()
     }
 
     /// Check if there's data ready to receive.
@@ -1394,12 +1370,6 @@ impl KCP {
         self.rx_rto
     }
 
-    /// Get the current SRTT.
-    #[inline]
-    pub fn rx_srtt(&self) -> i32 {
-        self.rx_srtt
-    }
-
     /// Get the current congestion window.
     #[inline]
     pub fn cwnd(&self) -> u32 {
@@ -1418,44 +1388,15 @@ impl KCP {
     /// Callers that need the KCP 32-bit wire timestamp should truncate with
     /// `as u32` — `itimediff` handles wraparound correctly.
     ///
-    /// **Optimization**: Uses a cached offset between `SystemTime` (wall clock)
-    /// and `Instant` (monotonic) computed once at first call, then uses
-    /// `Instant::elapsed()` which is ~10x cheaper than `SystemTime::now()`
-    /// (avoids the epoch conversion syscall on every call). The returned value
-    /// is still wall-clock ms since UNIX_EPOCH, so wire compatibility is preserved.
-    /// pprof evidence: `Timespec::now` was 6.52% of CPU (1489ms/20s) from ~2000
-    /// `SystemTime::now()` calls/sec across flush_data_only + input_no_flush +
-    /// flush_input_batch + send_to_kcp paths.
+    /// **Optimization**: delegates to the shared cached clock [`wall_ms`].
     pub fn current_ms(&self) -> u64 {
-        use std::sync::OnceLock;
-        struct ClockOffset {
-            epoch_ms: u64,
-            instant: std::time::Instant,
-        }
-        static OFFSET: OnceLock<ClockOffset> = OnceLock::new();
-        let offset = OFFSET.get_or_init(|| {
-            let now_st = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            ClockOffset {
-                epoch_ms: now_st,
-                instant: std::time::Instant::now(),
-            }
-        });
-        offset.epoch_ms + offset.instant.elapsed().as_millis() as u64
+        wall_ms()
     }
 
     /// Get the maximum segment size.
     #[inline]
     pub fn mss(&self) -> u32 {
         self.mss
-    }
-
-    /// Get the remote window size.
-    #[inline]
-    pub fn rmt_wnd(&self) -> u32 {
-        self.rmt_wnd
     }
 
     /// Get the send window size.
@@ -1476,30 +1417,6 @@ impl KCP {
         &self.pool
     }
 
-    /// Reset the KCP state.
-    pub fn reset(&mut self) {
-        self.snd_queue.clear();
-        self.snd_buf.clear();
-        self.snd_nxt = 0;
-        self.snd_una = 0;
-        self.rcv_queue.clear();
-        self.rcv_buf.clear();
-        self.rcv_nxt = 0;
-        self.ts_flush = 0;
-        self.rx_rto = RTO_DEFAULT;
-        self.rx_srtt = 0;
-        self.rx_rttvar = 0;
-        self.cwnd = 0;
-        self.ssthresh = SSTHRESH_INIT;
-        self.probe = 0;
-        self.probe_wait = 0;
-        self.ts_probe = 0;
-        self.incr = 0;
-        self.state = 0;
-        self.pending_flush = 0;
-        self.acklist.clear();
-    }
-
     /// Get next sequence number.
     #[inline]
     pub fn snd_nxt(&self) -> u32 {
@@ -1510,12 +1427,6 @@ impl KCP {
     #[inline]
     pub fn snd_una(&self) -> u32 {
         self.snd_una
-    }
-
-    /// Get next expected receive sequence number.
-    #[inline]
-    pub fn rcv_nxt(&self) -> u32 {
-        self.rcv_nxt
     }
 }
 
@@ -1539,12 +1450,6 @@ pub enum KcpError {
     /// Invalid segment - unknown command byte.
     #[error("unknown command: 0x{0:02x}")]
     UnknownCommand(u8),
-    /// Generic invalid segment.
-    #[error("invalid segment")]
-    InvalidSegment,
-    /// Buffer too small for received data.
-    #[error("buffer too small")]
-    BufferTooSmall,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -1669,8 +1574,6 @@ mod tests {
 
         kcp.input_no_flush(&buf, true).unwrap();
         assert_ne!(kcp.pending_flush_flag(), 0);
-        kcp.reset();
-        assert_eq!(kcp.pending_flush_flag(), 0);
     }
 
     #[test]

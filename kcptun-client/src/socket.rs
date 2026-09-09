@@ -16,13 +16,13 @@ pub(crate) fn create_client_socket(
     tcp: bool,
     sockbuf: u32,
     dscp: u32,
-) -> anyhow::Result<Arc<kio::DatagramSocket>> {
+) -> anyhow::Result<Arc<knet::DatagramSocket>> {
     if tcp {
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("--tcp requires Linux (raw sockets + TCP_REPAIR)");
         #[cfg(target_os = "linux")]
         {
-            let conn = kio::tcpraw_dial(&remote).map_err(|e| {
+            let conn = knet::tcpraw_dial(&remote).map_err(|e| {
                 anyhow::anyhow!(
                     "tcpraw dial to {}: {} (needs Linux + CAP_NET_RAW/ADMIN, server --tcp up)",
                     remote,
@@ -34,11 +34,11 @@ pub(crate) fn create_client_socket(
                     log::warn!("SetDSCP({}) failed on tcpraw conn: {}", dscp, e);
                 }
             }
-            Ok(Arc::new(kio::DatagramSocket::TcpRaw(conn)))
+            Ok(Arc::new(knet::DatagramSocket::TcpRaw(conn)))
         }
     } else {
         let socket = create_client_udp_socket(remote, sockbuf, dscp)?;
-        Ok(Arc::new(kio::DatagramSocket::Udp(socket)))
+        Ok(Arc::new(knet::DatagramSocket::Udp(socket)))
     }
 }
 
@@ -47,28 +47,30 @@ pub(crate) fn create_client_udp_socket(
     remote_addr: SocketAddr,
     sockbuf: u32,
     dscp: u32,
-) -> std::io::Result<kio::UdpSocket> {
+) -> std::io::Result<knet::UdpSocket> {
     let domain = if remote_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-    let buf_size = if sockbuf > 0 {
-        sockbuf as usize
-    } else {
-        2 * 1024 * 1024
-    };
+    let buf_size = sockbuf as usize;
     let _ = socket.set_recv_buffer_size(buf_size);
     let _ = socket.set_send_buffer_size(buf_size);
     let _ = socket.set_reuse_address(true);
     if dscp > 0 {
-        let dscp_shifted = dscp << 2;
-        if let Err(e) = socket.set_tos(dscp_shifted) {
+        // Go: IPv4 → IP_TOS = dscp << 2; IPv6 → IPV6_TCLASS = dscp (no shift).
+        // socket2::set_tos maps to IP_TOS (IPv4) or IPV6_TCLASS (IPv6) on Linux.
+        let tos = if remote_addr.is_ipv4() {
+            dscp << 2
+        } else {
+            dscp
+        };
+        if let Err(e) = socket.set_tos(tos) {
             warn!("set_tos (DSCP) failed for client socket: {}", e);
         }
     }
     socket.connect(&remote_addr.into())?;
     socket.set_nonblocking(true)?;
-    kio::UdpSocket::from_std(socket.into())
+    knet::UdpSocket::from_std(socket.into())
 }

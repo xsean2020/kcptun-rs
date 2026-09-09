@@ -46,7 +46,7 @@
 | 13. 代理场景模拟 | 50并发×32KB (单 KCP), 抖动80×4KB-aes-压缩 | 32KB/4KB |
 | 14. 多线程完整性（核心） | 20/50 线程 × 4 尺寸 (1B/4KB/64KB/128KB) | 逐字节校验 |
 | 15. 单连接多轮 | 20/30 轮 × 混合尺寸 (1B~128KB) | 逐字节校验 |
-| 16. QPP 量子置换 | --qpp --qppcount 61 + 多 cipher/尺寸 | 4KB/16KB/64KB |
+| 16. QPP 量子置换 | --QPP --QPPCount 61 + 多 cipher/尺寸 | 4KB/16KB/64KB |
 | 17. 大数据传输 | 1MB/2MB + FEC | 1MB/2MB |
 | 18. 全双工双向 | 1MB/512KB 双向同时 | 逐字节校验 |
 | 19. --nc 1 无拥塞 | nc1 + 大窗 + 压缩 | 128KB/512KB/1MB |
@@ -77,7 +77,7 @@ normal, fast, fast2, fast3
 | `--mode` | fast | ✅ 4 种 | normal/fast/fast2/fast3 |
 | `--nocomp` | false (压缩开启) | ✅ on/off | Section 1/2/5/8/9/13/14/15/17/18/19/20/21/22 |
 | `--datashard/--parityshard` | 10/3 | ✅ 0/0 + 4/2 + 10/3 + 15/5 | Section 6/11/14/19/20/21/22 |
-| `--qpp/--qppcount` | off | ✅ --qpp 61 | Section 16 |
+| `--QPP/--QPPCount` | off | ✅ --QPP 61 | Section 16 |
 | `--conn` | 1 | ✅ 1/4 | Section 7/8/13/14/20/21 |
 | `--sndwnd/--rcvwnd` | 1024 | ✅ 32/32 ~ 1024/1024 | Section 7/17/18/19 |
 | `--nc` | 0 | ✅ --nc 1 | Section 19 |

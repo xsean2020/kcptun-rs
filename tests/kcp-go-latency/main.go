@@ -69,6 +69,8 @@ func tune(s *kcpgo.UDPSession) {
 	s.SetNoDelay(1, 10, 2, 1)
 	s.SetWindowSize(sndwnd, rcvwnd)
 	s.SetMtu(mtu)
+	s.SetStreamMode(true)
+	s.SetACKNoDelay(true)
 }
 
 // Echo loop: read one complete KCP message, write it back verbatim.
@@ -112,8 +114,8 @@ func runServer(args []string) {
 // requests/sec on a strict cadence (never waiting for a response), matches each
 // echo to its send time in arrival order, drops the warm-up phase, and collects
 // raw per-request latencies (µs) across the measurement phase. Returns
-// (latencies_us, measure_sends, measure_ok).
-func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Duration, size int) ([]float64, int, int, int) {
+// (latencies_us, measure_sends, measure_ok, shed, inflight_end).
+func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Duration, size int) ([]float64, int, int, int, int) {
 	interval := time.Duration(float64(time.Second) / float64(rps))
 	payload := make([]byte, size)
 	for i := range payload {
@@ -122,7 +124,8 @@ func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Durati
 	rx := make([]byte, size)
 	rxFilled := 0
 	var us []float64
-	warmupEnd := time.Now().Add(warmup)
+	scheduleStart := time.Now()
+	warmupEnd := scheduleStart.Add(warmup)
 	measureEnd := warmupEnd.Add(duration)
 	sends, ok, skipped := 0, 0, 0
 
@@ -134,31 +137,40 @@ func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Durati
 	// Sender runs in its own goroutine so a Write that blocks on a full send
 	// window cannot stop the reader — in an in-process echo topology a combined
 	// loop deadlocks outright, since the peer only drains once we read.
+	type request struct {
+		sentAt    time.Time
+		measuring bool
+	}
 	var mu sync.Mutex
-	var inFlight []time.Time
+	var inFlight []request
 	stop := make(chan struct{})
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
-		nextSend := time.Now()
+		nextSend := scheduleStart
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
+			if !nextSend.Before(measureEnd) {
+				return
+			}
 			if now := time.Now(); now.Before(nextSend) {
 				time.Sleep(nextSend.Sub(now))
 				continue
 			}
+			scheduledAt := nextSend
 			if _, err := client.Write(payload); err != nil {
 				return
 			}
 			sentAt := time.Now()
+			measuring := !scheduledAt.Before(warmupEnd)
 			mu.Lock()
-			inFlight = append(inFlight, sentAt)
-			if !sentAt.Before(warmupEnd) {
+			inFlight = append(inFlight, request{sentAt: sentAt, measuring: measuring})
+			if measuring {
 				sends++
 			}
 			nextSend = nextSend.Add(interval)
@@ -166,9 +178,9 @@ func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Durati
 			// compound without bound, whereas scheduler jitter does not, and
 			// folding the two together would discard throughput to measure an
 			// artifact. `skipped` keeps real drops visible.
-			if lag := time.Since(nextSend); lag > maxLag {
-				skipped++
-				nextSend = time.Now().Add(interval)
+			if now := time.Now(); now.Sub(nextSend) > maxLag {
+				skipped += countShedSlots(nextSend, now, warmupEnd, measureEnd, interval)
+				nextSend = now.Add(interval)
 			}
 			mu.Unlock()
 		}
@@ -184,10 +196,10 @@ func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Durati
 				rxFilled = 0
 				mu.Lock()
 				if len(inFlight) > 0 {
-					t0 := inFlight[0]
+					req := inFlight[0]
 					inFlight = inFlight[1:]
-					if !t0.Before(warmupEnd) {
-						us = append(us, float64(time.Since(t0).Microseconds()))
+					if req.measuring {
+						us = append(us, float64(time.Since(req.sentAt).Microseconds()))
 						ok++
 					}
 				}
@@ -207,7 +219,13 @@ func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Durati
 
 	mu.Lock()
 	defer mu.Unlock()
-	return us, sends, ok, skipped
+	inflightEnd := 0
+	for _, req := range inFlight {
+		if req.measuring {
+			inflightEnd++
+		}
+	}
+	return us, sends, ok, skipped, inflightEnd
 }
 
 // measureClosed runs the closed-loop concurrency model: maintain exactly
@@ -217,7 +235,7 @@ func measureOpen(client *kcpgo.UDPSession, rps int, warmup, duration time.Durati
 //
 // KCP is an ordered stream — responses arrive in send order, so we match
 // each echo to the oldest in-flight request (FIFO).
-func measureClosed(client *kcpgo.UDPSession, concurrency int, warmup, duration time.Duration, size int) ([]float64, int, int) {
+func measureClosed(client *kcpgo.UDPSession, concurrency int, warmup, duration time.Duration, size int) ([]float64, int, int, int) {
 	payload := make([]byte, size)
 	for i := range payload {
 		payload[i] = 0x5A
@@ -234,7 +252,7 @@ func measureClosed(client *kcpgo.UDPSession, concurrency int, warmup, duration t
 		// Fill up to `concurrency` in-flight requests.
 		for len(inFlight) < concurrency {
 			if _, err := client.Write(payload); err != nil {
-				return us, sends, ok
+				return us, sends, ok, countMeasuring(inFlight, warmupEnd)
 			}
 			sentAt := time.Now()
 			inFlight = append(inFlight, sentAt)
@@ -247,7 +265,7 @@ func measureClosed(client *kcpgo.UDPSession, concurrency int, warmup, duration t
 		_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, err := client.Read(rx[rxFilled:])
 		if err != nil {
-			return us, sends, ok
+			return us, sends, ok, countMeasuring(inFlight, warmupEnd)
 		}
 		if n == 0 {
 			continue
@@ -270,7 +288,34 @@ func measureClosed(client *kcpgo.UDPSession, concurrency int, warmup, duration t
 			break
 		}
 	}
-	return us, sends, ok
+	return us, sends, ok, countMeasuring(inFlight, warmupEnd)
+}
+
+func countShedSlots(firstSlot, now, warmupEnd, measureEnd time.Time, interval time.Duration) int {
+	upper := now.Add(time.Nanosecond)
+	if upper.After(measureEnd) {
+		upper = measureEnd
+	}
+	lower := firstSlot
+	if lower.Before(warmupEnd) {
+		delta := warmupEnd.Sub(lower)
+		steps := (delta + interval - time.Nanosecond) / interval
+		lower = lower.Add(steps * interval)
+	}
+	if !lower.Before(upper) {
+		return 0
+	}
+	return int((upper.Sub(lower) + interval - time.Nanosecond) / interval)
+}
+
+func countMeasuring(inFlight []time.Time, warmupEnd time.Time) int {
+	count := 0
+	for _, sentAt := range inFlight {
+		if !sentAt.Before(warmupEnd) {
+			count++
+		}
+	}
+	return count
 }
 
 func runBench(args []string) {
@@ -302,11 +347,15 @@ func runBench(args []string) {
 	}
 	tune(client)
 
-	us, sends, ok, skipped := measureOpen(client, *rps, time.Duration(*warmup)*time.Second, time.Duration(*duration)*time.Second, *size)
+	us, sends, ok, skipped, inflightEnd := measureOpen(client, *rps, time.Duration(*warmup)*time.Second, time.Duration(*duration)*time.Second, *size)
 	client.Close()
 
-	fmt.Fprintf(os.Stderr, "[go-go] warmup=%ds duration=%ds rps=%d measure_sends=%d measure_ok=%d shed=%d\n", *warmup, *duration, *rps, sends, ok, skipped)
-	report("go-go", sends, ok, *size, *rps, us, skipped)
+	actualRPS := 0
+	if *duration > 0 {
+		actualRPS = int(math.Round(float64(ok) / float64(*duration)))
+	}
+	fmt.Fprintf(os.Stderr, "[go-go] warmup=%ds duration=%ds rps=%d measure_sends=%d measure_ok=%d shed=%d inflight_end=%d\n", *warmup, *duration, actualRPS, sends, ok, skipped, inflightEnd)
+	report("go-go", sends, ok, *size, actualRPS, us, skipped, inflightEnd, false)
 }
 
 // runClosed runs the closed-loop concurrency benchmark: N in-flight requests,
@@ -345,7 +394,7 @@ func runClosed(args []string) {
 	}
 	tuneMtu(client)
 
-	us, sends, ok := measureClosed(client, *concurrency, time.Duration(*warmup)*time.Second, time.Duration(*duration)*time.Second, *size)
+	us, sends, ok, inflightEnd := measureClosed(client, *concurrency, time.Duration(*warmup)*time.Second, time.Duration(*duration)*time.Second, *size)
 	client.Close()
 
 	// Actual throughput = completed requests / measurement duration.
@@ -353,13 +402,13 @@ func runClosed(args []string) {
 	if *duration > 0 {
 		actualRPS = int(math.Round(float64(ok) / float64(*duration)))
 	}
-	fmt.Fprintf(os.Stderr, "[go-go] warmup=%ds duration=%ds concurrency=%d measure_sends=%d measure_ok=%d\n", *warmup, *duration, *concurrency, sends, ok)
-	report("go-go", sends, ok, *size, actualRPS, us, 0)
+	fmt.Fprintf(os.Stderr, "[go-go] warmup=%ds duration=%ds concurrency=%d measure_sends=%d measure_ok=%d shed=na inflight_end=%d\n", *warmup, *duration, *concurrency, sends, ok, inflightEnd)
+	report("go-go", sends, ok, *size, actualRPS, us, 0, inflightEnd, true)
 }
 
 // report computes percentiles over the microsecond samples and prints the
 // machine-readable RESULT line plus a human table.
-func report(combo string, samples, ok, size, rps int, us []float64, shed int) {
+func report(combo string, samples, ok, size, rps int, us []float64, shed, inflightEnd int, closed bool) {
 	if ok == 0 {
 		fmt.Fprintln(os.Stderr, "no successful samples")
 		os.Exit(1)
@@ -383,10 +432,14 @@ func report(combo string, samples, ok, size, rps int, us []float64, shed int) {
 	}
 	avg := sum / float64(n)
 
-	fmt.Printf("RESULT combo=%s samples=%d ok=%d shed=%d size=%d rps=%d p50_us=%.1f p90_us=%.1f p99_us=%.1f p999_us=%.1f avg_us=%.1f min_us=%.1f max_us=%.1f\n",
-		combo, samples, ok, shed, size, rps, p50, p90, p99, p999, avg, us[0], us[n-1])
-	fmt.Printf("  samples=%d ok=%d shed=%d payload=%dB rps=%d  p50=%.2fms p90=%.2fms p99=%.2fms p999=%.2fms avg=%.2fms min=%.2fms max=%.2fms\n",
-		samples, ok, shed, size, rps, p50/1000, p90/1000, p99/1000, p999/1000, avg/1000, us[0]/1000, us[n-1]/1000)
+	shedLabel := fmt.Sprintf("%d", shed)
+	if closed {
+		shedLabel = "na"
+	}
+	fmt.Printf("RESULT combo=%s samples=%d ok=%d shed=%s inflight_end=%d size=%d rps=%d p50_us=%.1f p90_us=%.1f p99_us=%.1f p999_us=%.1f avg_us=%.1f min_us=%.1f max_us=%.1f\n",
+		combo, samples, ok, shedLabel, inflightEnd, size, rps, p50, p90, p99, p999, avg, us[0], us[n-1])
+	fmt.Printf("  samples=%d ok=%d shed=%s inflight_end=%d payload=%dB rps=%d  p50=%.2fms p90=%.2fms p99=%.2fms p999=%.2fms avg=%.2fms min=%.2fms max=%.2fms\n",
+		samples, ok, shedLabel, inflightEnd, size, rps, p50/1000, p90/1000, p99/1000, p999/1000, avg/1000, us[0]/1000, us[n-1]/1000)
 }
 
 // runClient measures echo RTT against an external KCP echo server (e.g. the
@@ -418,9 +471,13 @@ func runClient(args []string) {
 	}
 	tune(client)
 
-	us, sends, ok, skipped := measureOpen(client, *rps, time.Duration(*warmup)*time.Second, time.Duration(*duration)*time.Second, *size)
+	us, sends, ok, skipped, inflightEnd := measureOpen(client, *rps, time.Duration(*warmup)*time.Second, time.Duration(*duration)*time.Second, *size)
 	client.Close()
 
-	fmt.Fprintf(os.Stderr, "[go-rust] warmup=%ds duration=%ds rps=%d measure_sends=%d measure_ok=%d shed=%d\n", *warmup, *duration, *rps, sends, ok, skipped)
-	report("go-rust", sends, ok, *size, *rps, us, skipped)
+	actualRPS := 0
+	if *duration > 0 {
+		actualRPS = int(math.Round(float64(ok) / float64(*duration)))
+	}
+	fmt.Fprintf(os.Stderr, "[go-rust] warmup=%ds duration=%ds rps=%d measure_sends=%d measure_ok=%d shed=%d inflight_end=%d\n", *warmup, *duration, actualRPS, sends, ok, skipped, inflightEnd)
+	report("go-rust", sends, ok, *size, actualRPS, us, skipped, inflightEnd, false)
 }

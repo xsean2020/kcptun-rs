@@ -4,9 +4,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::socket;
+
+pub(crate) type SessionRef = Arc<kcptun_common::KcptunSession>;
+pub(crate) type SessionPool = Arc<parking_lot::Mutex<Vec<SessionRef>>>;
 
 /// CLI-derived options retained for initial dial and reconnect.
 #[derive(Clone, Debug)]
@@ -37,7 +40,7 @@ pub(crate) async fn build_session(
     remote: SocketAddr,
     key: &[u8; 32],
     cfg: &ClientDialOptions,
-    socket: Arc<kio::DatagramSocket>,
+    socket: Arc<knet::DatagramSocket>,
 ) -> Result<kcptun_common::KcptunSession> {
     let params = kcptun_common::KcpCliParams {
         mode: cfg.mode.clone(),
@@ -60,61 +63,62 @@ pub(crate) async fn build_session(
         max_stream_buffer: cfg.streambuf,
         max_frame_size: cfg.framesize,
         keepalive_interval: cfg.keepalive,
-        keepalive_timeout: if cfg.keepalive == 0 {
-            0
-        } else {
-            cfg.keepalive.saturating_mul(3).max(1)
-        },
+        // Go's BuildSmuxConfig changes only the interval; timeout remains 30s.
+        keepalive_timeout: 30,
     };
     let config = kcptun_common::KcptunConfig {
         kcp: params.to_kcp_config(),
         smux,
         nocomp: cfg.nocomp,
         rate_limit: cfg.ratelimit,
-        offload_profile: match kio::runtime_kind() {
-            kio::RuntimeKind::Tokio => kcrypt_rs::OffloadProfile::Tokio,
-            kio::RuntimeKind::Smol => kcrypt_rs::OffloadProfile::Smol,
-        },
+        offload_profile: kcrypt_rs::OffloadProfile::Tokio,
     };
     kcptun_common::KcptunSession::connect(socket, remote, key, &cfg.crypt, &config).await
 }
 
-/// Check if a session has expired past its auto-expire + scavenge TTL.
+/// Check if a session has exceeded its auto-expire deadline.
+///
+/// Uses the session **creation time** (matching Go kcptun), NOT last
+/// activity.  Go sets `expiryDate = creation + autoexpire` and reconnects
+/// when `now > expiryDate`.  This is independent of keepalive — a session
+/// is replaced after `autoexpire` seconds regardless of traffic.
 pub(crate) fn is_session_expired(
+    session: &kcptun_common::KcptunSession,
+    autoexpire_secs: u64,
+) -> bool {
+    is_creation_expired_at(session.created_ms(), autoexpire_secs, knet::mono_ms())
+}
+
+/// Check if a session has exceeded its scavenger deadline.
+///
+/// Go scavenger deadline = `creation + autoexpire + scavengeTTL`.
+/// If the session is still alive at this point, force-close it.
+pub(crate) fn is_session_scavenge_expired(
     session: &kcptun_common::KcptunSession,
     autoexpire_secs: u64,
     scavengettl_secs: u64,
 ) -> bool {
-    is_activity_expired(
-        session.last_activity_ms(),
+    is_creation_scavenge_expired_at(
+        session.created_ms(),
         autoexpire_secs,
         scavengettl_secs,
+        knet::mono_ms(),
     )
 }
 
-/// Check if `last_activity_ms` is past the deadline.
-pub(crate) fn is_activity_expired(
-    last_activity_ms: u64,
-    autoexpire_secs: u64,
-    scavengettl_secs: u64,
-) -> bool {
-    is_activity_expired_at(
-        last_activity_ms,
-        autoexpire_secs,
-        scavengettl_secs,
-        kio::mono_ms(),
-    )
+/// Check if `created_ms + autoexpire` has passed at `now_ms`.
+pub(crate) fn is_creation_expired_at(created_ms: u64, autoexpire_secs: u64, now_ms: u64) -> bool {
+    now_ms > created_ms + autoexpire_secs * 1000
 }
 
-/// Check if `last_activity_ms` is past the deadline at `now_ms`.
-pub(crate) fn is_activity_expired_at(
-    last_activity_ms: u64,
+/// Check if `created_ms + autoexpire + scavengettl` has passed at `now_ms`.
+pub(crate) fn is_creation_scavenge_expired_at(
+    created_ms: u64,
     autoexpire_secs: u64,
     scavengettl_secs: u64,
     now_ms: u64,
 ) -> bool {
-    let deadline = last_activity_ms + (autoexpire_secs + scavengettl_secs) * 1000;
-    now_ms > deadline
+    now_ms > created_ms + (autoexpire_secs + scavengettl_secs) * 1000
 }
 
 /// Handle a single client connection: pipe between local TCP and SMUX stream
@@ -123,21 +127,20 @@ pub(crate) fn is_activity_expired_at(
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "qpp"), allow(unused_variables))]
 pub(crate) async fn handle_client(
-    local: kio::TcpStream,
+    local: knet::TcpStream,
     smux_stream: Arc<smux_rs::stream::Stream>,
     qpp_enabled: bool,
     qpp_key: Vec<u8>,
     qpp_count: u16,
     quiet: bool,
-    flush_notify: Arc<kio::Notify>,
+    flush_notify: Arc<knet::Notify>,
     closewait: u64,
 ) -> Result<()> {
     smux_stream.set_flush_notify(flush_notify.clone());
     let smux_async = smux_rs::SmuxIo::new(smux_stream.clone(), flush_notify);
 
-    // Use closewait (from --closewait) as the post-copy grace period.
-    // Matches Go kcptun semantics: after both sides reach EOF, wait closewait
-    // seconds before tearing down. closewait=0 means no wait (Go client default).
+    // Go starts closewait when either copy direction completes; the reverse
+    // direction remains active during that grace period.
     let pipe_result = if qpp_enabled {
         #[cfg(feature = "qpp")]
         {
@@ -190,16 +193,32 @@ pub(crate) async fn handle_client(
 /// Reconnect a dead session at the given index, returning true on success.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconnect_session(
-    conns: &Arc<parking_lot::Mutex<Vec<kcptun_common::KcptunSession>>>,
+    conns: &SessionPool,
+    tracked_sessions: Option<&SessionPool>,
     idx: usize,
-    remote_addrs: &[SocketAddr],
+    remote_addr: &str,
     key: &[u8; 32],
     session_cfg: &ClientDialOptions,
     tcp: bool,
     sockbuf: u32,
     dscp: u32,
 ) -> bool {
-    let remote = remote_addrs[idx % remote_addrs.len()];
+    let remote = match kcptun_common::random_remote_addr(remote_addr) {
+        Ok(remote) => {
+            debug!(
+                "reconnect idx={}: remote_addr=\"{}\" -> selected {}:{}",
+                idx,
+                remote_addr,
+                remote.ip(),
+                remote.port()
+            );
+            remote
+        }
+        Err(e) => {
+            log::error!("reconnect remote address resolution failed: {:#}", e);
+            return false;
+        }
+    };
     info!("connection {} is dead, reconnecting to {}...", idx, remote);
     let socket = match socket::create_client_socket(remote, tcp, sockbuf, dscp) {
         Ok(s) => s,
@@ -210,8 +229,11 @@ pub(crate) async fn reconnect_session(
     };
     match build_session(remote, key, session_cfg, socket).await {
         Ok(new_conn) => {
-            conns.lock()[idx] = new_conn;
-            kcp_rs::DEFAULT_SNMP.session_opened(true);
+            let new_conn = Arc::new(new_conn);
+            conns.lock()[idx] = new_conn.clone();
+            if let Some(tracked_sessions) = tracked_sessions {
+                tracked_sessions.lock().push(new_conn);
+            }
             info!("connection {} reconnected", idx);
             true
         }
@@ -229,18 +251,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_expired_when_recently_active() {
-        assert!(!is_activity_expired_at(1_000, 3600, 600, 1_001));
+    fn test_not_expired_when_within_autoexpire() {
+        // created at 1000ms, autoexpire=3600s, now=1001ms → not expired
+        assert!(!is_creation_expired_at(1_000, 3600, 1_001));
     }
 
     #[test]
-    fn test_is_expired_with_zero_autoexpire() {
-        assert!(is_activity_expired_at(1_000, 0, 0, 1_001));
+    fn test_expired_after_autoexpire() {
+        // created at 1000ms, autoexpire=0s, now=1001ms → expired
+        assert!(is_creation_expired_at(1_000, 0, 1_001));
     }
 
     #[test]
-    fn test_is_expired_respects_scavengettl() {
-        assert!(!is_activity_expired_at(1_000, 0, 3600, 1_001));
-        assert!(is_activity_expired_at(1_000, 0, 0, 1_001));
+    fn test_scavenge_not_expired_within_grace() {
+        // created at 1000ms, autoexpire=0, scavengettl=3600s, now=1001ms
+        assert!(!is_creation_scavenge_expired_at(1_000, 0, 3600, 1_001));
+    }
+
+    #[test]
+    fn test_scavenge_expired_after_grace() {
+        // created at 1000ms, autoexpire=0, scavengettl=0, now=1001ms
+        assert!(is_creation_scavenge_expired_at(1_000, 0, 0, 1_001));
     }
 }

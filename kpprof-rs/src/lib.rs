@@ -87,7 +87,7 @@
 //! #[cfg(feature = "pprof")]
 //! if let Some(ref addr) = cli.pprof {
 //!     let stop = stop_flag.clone();
-//!     kio::spawn_task(async move {
+//!     knet::spawn_task(async move {
 //!         let _ = kpprof::run_pprof(&addr, stop).await;
 //!     });
 //! }
@@ -196,6 +196,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+
+#[cfg(unix)]
 use pprof::protos::{self as protos, Message};
 
 // ─── Heap profiling (always compiled; zero-cost when sample_rate == 0) ───────
@@ -218,17 +220,18 @@ pub use deadlock::{dump_deadlocks, start_deadlock_detector};
 /// Listens on `addr` and serves `/debug/pprof/*` endpoints.
 /// Returns when `stop` is set to `true`.
 pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
-    use kio::AsyncReadExt;
+    use knet::AsyncReadExt;
 
     let socket_addr: SocketAddr = addr.parse().context("invalid pprof address")?;
-    let listener = kio::TcpListener::bind(socket_addr).await?;
+    let listener = knet::TcpListener::bind(socket_addr).await?;
     log::info!("pprof listening on http://{}/debug/pprof/", socket_addr);
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let accepted = kio::timeout(Duration::from_millis(500), listener.accept()).await;
+        let accepted = knet::timeout(Duration::from_millis(500), listener.accept()).await;
+        #[allow(unused_variables)]
         let (mut stream, peer) = match accepted {
             Ok(Ok(v)) => v,
             _ => continue,
@@ -242,7 +245,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             if filled >= buf.len() {
                 break;
             }
-            match kio::timeout(Duration::from_secs(2), stream.read(&mut buf[filled..])).await {
+            match knet::timeout(Duration::from_secs(2), stream.read(&mut buf[filled..])).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     filled += n;
@@ -293,7 +296,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             }
             while post_body.len() < content_length {
                 let mut tmp = [0u8; 4096];
-                match kio::timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
+                match knet::timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => post_body.extend_from_slice(&tmp[..n]),
                     _ => break,
@@ -332,6 +335,11 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         }
 
         // ── CPU profile ─────────────────────────────────────────────────
+        //
+        // pprof-rs relies on POSIX signals (SIGPROF/SIGALRM) + setitimer(2),
+        // which do not exist on Windows. On non-Unix platforms the CPU
+        // profile endpoint returns 501 Not Implemented.
+        #[cfg(unix)]
         if path == "/debug/pprof/profile" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
                 respond(
@@ -354,33 +362,34 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             }
             log::info!("pprof CPU profile {}s peer={}", seconds, peer);
 
-            let profile_result = kio::cpu_block(move || -> std::result::Result<Vec<u8>, String> {
-                let builder = pprof::ProfilerGuardBuilder::default().frequency(997);
-                #[cfg(any(
-                    target_arch = "x86_64",
-                    target_arch = "aarch64",
-                    target_arch = "riscv64",
-                    target_arch = "loongarch64"
-                ))]
-                let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
-                let guard = builder
-                    .build()
-                    .map_err(|e| format!("profiler start failed: {e}"))?;
-                std::thread::sleep(Duration::from_secs(seconds));
-                let report = guard
-                    .report()
-                    .build()
-                    .map_err(|e| format!("report build failed: {e}"))?;
-                let profile = report
-                    .pprof()
-                    .map_err(|e| format!("build pprof failed: {e}"))?;
-                let mut content = Vec::new();
-                profile
-                    .write_to_vec(&mut content)
-                    .map_err(|e| format!("encode pprof failed: {e}"))?;
-                Ok(content)
-            })
-            .await;
+            let profile_result =
+                knet::cpu_block(move || -> std::result::Result<Vec<u8>, String> {
+                    let builder = pprof::ProfilerGuardBuilder::default().frequency(997);
+                    #[cfg(any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64",
+                        target_arch = "loongarch64"
+                    ))]
+                    let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
+                    let guard = builder
+                        .build()
+                        .map_err(|e| format!("profiler start failed: {e}"))?;
+                    std::thread::sleep(Duration::from_secs(seconds));
+                    let report = guard
+                        .report()
+                        .build()
+                        .map_err(|e| format!("report build failed: {e}"))?;
+                    let profile = report
+                        .pprof()
+                        .map_err(|e| format!("build pprof failed: {e}"))?;
+                    let mut content = Vec::new();
+                    profile
+                        .write_to_vec(&mut content)
+                        .map_err(|e| format!("encode pprof failed: {e}"))?;
+                    Ok(content)
+                })
+                .await;
 
             let profile_bytes = match profile_result {
                 Ok(bytes) => bytes,
@@ -417,6 +426,20 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 profile_bytes.len(),
                 peer
             );
+            continue;
+        }
+
+        #[cfg(not(unix))]
+        if path == "/debug/pprof/profile" {
+            let msg = "CPU profiling not supported on this platform\npprof-rs requires POSIX signals (SIGPROF/SIGALRM)\n";
+            respond(
+                &mut stream,
+                "501 Not Implemented",
+                "text/plain; charset=utf-8",
+                "",
+                msg.as_bytes(),
+            )
+            .await;
             continue;
         }
 
@@ -801,13 +824,13 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
 /// `net/http/pprof`). `extra_headers` is inserted before Content-Length
 /// (e.g. `Content-Disposition: attachment; filename="profile"\r\n`).
 async fn respond(
-    stream: &mut kio::TcpStream,
+    stream: &mut knet::TcpStream,
     status: &str,
     ctype: &str,
     extra_headers: &str,
     body: &[u8],
 ) {
-    use kio::AsyncWriteExt;
+    use knet::AsyncWriteExt;
 
     let header = format!(
         "HTTP/1.1 {status}\r\n\
@@ -851,6 +874,7 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
 ///
 /// Used for Go runtime-only profile types (block, mutex, threadcreate, goroutine
 /// debug=0) so `go tool pprof` doesn't error when fetching them.
+#[cfg(unix)]
 fn empty_profile(sample_type: &str, sample_unit: &str) -> Vec<u8> {
     // string_table: ["", sample_type, sample_unit]
     // sample_type: [{ty: 1, unit: 2}]
@@ -874,6 +898,14 @@ fn empty_profile(sample_type: &str, sample_unit: &str) -> Vec<u8> {
         return Vec::new();
     }
     content
+}
+
+/// Non-Unix stub: returns empty Vec. pprof-rs protobuf types are unavailable
+/// on platforms without POSIX signals. The HTTP endpoints that call this will
+/// serve a 0-length gzipped body, which `go tool pprof` handles gracefully.
+#[cfg(not(unix))]
+fn empty_profile(_sample_type: &str, _sample_unit: &str) -> Vec<u8> {
+    Vec::new()
 }
 
 // ─── HTML index (Go-style) ───────────────────────────────────────────────────

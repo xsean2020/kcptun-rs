@@ -11,14 +11,14 @@ Rust port of Go [`github.com/xtaci/kcp-go/v5`](https://github.com/xtaci/kcp-go).
 - [Adding the Dependency](#adding-the-dependency)
 - [Quick Start](#quick-start)
   - [Sync KCP state machine](#sync-kcp-state-machine)
-  - [Async KcpConn](#async-kcpconn)
+  - [Async KcpStream](#async-kcpconn)
   - [Listen & connect (server / client)](#listen--connect-server--client)
 - [API Reference](#api-reference)
   - [KCP (state machine)](#kcp-state-machine)
   - [KcpConfig / KcpMode](#kcpconfig--kcpmode)
   - [Reed-Solomon FEC](#reed-solomon-fec)
   - [SNMP counters](#snmp-counters)
-  - [KcpConn (async)](#kcpconn-async)
+  - [KcpStream (async)](#kcpconn-async)
   - [PacketTransport](#packettransport)
 - [Configuration](#configuration)
 - [Wire Protocol](#wire-protocol)
@@ -55,11 +55,7 @@ Key design points:
 | Feature | Effect |
 |---------|--------|
 | *(default)* | Sync KCP state machine only — no async dependencies |
-| `async` | Alias → `async-tokio` |
-| `async-tokio` | `KcpConn` + `PacketTransport` on the tokio runtime (via `kio-rs`) |
-| `async-smol` | Same on the smol runtime (via `kio-rs`) — mutually exclusive with tokio |
-
-> `tokio` and `smol` are **mutually exclusive**. `kio-rs/build.rs` enforces this at compile time, so never enable both (no `--all-features`).
+| `async` | `KcpStream` + `PacketTransport` on the tokio runtime (via `knet-rs`) |
 
 ---
 
@@ -70,12 +66,11 @@ Key design points:
 # Sync KCP only (no async runtime pulled in)
 kcp-rs = { path = "../kcp-rs" }
 
-# Or with the async KcpConn wrapper (pick ONE runtime)
-kcp-rs = { path = "../kcp-rs", features = ["async-tokio"] }
-# kcp-rs = { path = "../kcp-rs", features = ["async-smol"] }
+# Or with the async KcpStream wrapper (tokio runtime)
+kcp-rs = { path = "../kcp-rs", features = ["async"] }
 ```
 
-If you use the async API you will usually also depend on [`kio-rs`](../kio-rs) for its `AsyncRead`/`AsyncWrite` traits, and on [`kcrypt-rs`](../kcrypt-rs) when you need encryption.
+If you use the async API you will usually also depend on [`knet-rs`](../knet-rs) for its `AsyncRead`/`AsyncWrite` traits, and on [`kcrypt-rs`](../kcrypt-rs) when you need encryption.
 
 ---
 
@@ -149,15 +144,15 @@ loop {
 
 > `KCP::update()` returns the milliseconds until the next meaningful event; use it to pace your timer. `KCP::check(current)` gives the same for "when to call update again".
 
-### Async KcpConn
+### Async KcpStream
 
-With `features = ["async-tokio"]` (or `async-smol`), [`KcpConn`](#kcpconn-async) wraps a UDP socket + KCP + background input/flush loops behind a `kio::AsyncRead + AsyncWrite` stream — treat it like a reliable TCP connection.
+With `features = ["async"]`, [`KcpStream`](#kcpconn-async) wraps a UDP socket + KCP + background input/flush loops behind a `knet::AsyncRead + AsyncWrite` stream — treat it like a reliable TCP connection.
 
 ```rust
-use kcp_rs::{KcpConn, KcpMode};
-use kio::{AsyncReadExt, AsyncWriteExt};
+use kcp_rs::{KcpStream, KcpMode};
+use knet::{AsyncReadExt, AsyncWriteExt};
 
-let conn = KcpConn::connect("127.0.0.1:29900")
+let conn = KcpStream::connect("127.0.0.1:29900")
     .mtu(1400)
     .fec(10, 3)                    // optional Reed-Solomon FEC 10 data + 3 parity
     .mode(KcpMode::Fast3)
@@ -175,10 +170,10 @@ For two sockets on the same machine (or a custom transport), build each end expl
 
 ```rust
 use std::sync::Arc;
-use kcp_rs::{KcpConn, KcpMode, PacketTransport};
+use kcp_rs::{KcpStream, KcpMode, PacketTransport};
 
-let conn_a = KcpConn::with_transport(
-    Arc::new(kio::DatagramSocket::Udp(sock_a)) as Arc<dyn PacketTransport>,
+let conn_a = KcpStream::with_transport(
+    Arc::new(knet::DatagramSocket::Udp(sock_a)) as Arc<dyn PacketTransport>,
     addr_b,               // remote address
 )
 .connected(true)          // socket was created via UdpSocket::connect
@@ -188,15 +183,15 @@ let conn_a = KcpConn::with_transport(
 .await?;
 ```
 
-> **Encryption** is deliberately *not* inside `KcpConn`. To add crypto, implement [`PacketTransport`](#packettransport) around your encrypted datagrams — the workspace provides `kcptun_common::CryptoTransport` for this. **Snappy** compression also stays outside KCP (session level), matching Go.
+> **Encryption** is deliberately *not* inside `KcpStream`. To add crypto, implement [`PacketTransport`](#packettransport) around your encrypted datagrams — the workspace provides `kcptun_common::CryptoTransport` for this. **Snappy** compression also stays outside KCP (session level), matching Go.
 
 ### Listen & connect (server / client)
 
-The server side uses [`KcpListener`](#kcpconn-async): bind one UDP socket, and `accept()` hands out a **per-peer** `KcpConn` — inbound datagrams are demultiplexed by source address. Client-side, `KcpConn::connect` dials the listener on a fresh ephemeral socket.
+The server side uses [`KcpListener`](#kcpconn-async): bind one UDP socket, and `accept()` hands out a **per-peer** `KcpStream` — inbound datagrams are demultiplexed by source address. Client-side, `KcpStream::connect` dials the listener on a fresh ephemeral socket.
 
 ```rust
-use kcp_rs::{KcpConn, KcpListener, KcpMode};
-use kio::{AsyncReadExt, AsyncWriteExt};
+use kcp_rs::{KcpStream, KcpListener, KcpMode};
+use knet::{AsyncReadExt, AsyncWriteExt};
 
 // ── Server: bind, then serve each accepted peer ──
 let listener = KcpListener::bind("0.0.0.0:29900")
@@ -207,8 +202,8 @@ let listener = KcpListener::bind("0.0.0.0:29900")
 
 loop {
     let (mut conn, peer) = listener.accept().await?;
-    kio::spawn_task(async move {
-        // `conn` is a per-peer KcpConn (AsyncRead + AsyncWrite)
+    knet::spawn_task(async move {
+        // `conn` is a per-peer KcpStream (AsyncRead + AsyncWrite)
         let mut buf = [0u8; 4096];
         loop {
             match conn.read(&mut buf).await {
@@ -222,7 +217,7 @@ loop {
 }
 
 // ── Client: dial the listener ──
-let conn = KcpConn::connect("127.0.0.1:29900")
+let conn = KcpStream::connect("127.0.0.1:29900")
     .conv(0xC0FFEE)
     .mode(KcpMode::Fast3)
     .build()
@@ -230,7 +225,7 @@ let conn = KcpConn::connect("127.0.0.1:29900")
 conn.write_all(b"hello").await?;
 ```
 
-`accept()` returns `(KcpConn, SocketAddr)` — the per-peer connection and the client's address. Multiple clients hitting the same listener each get their own `KcpConn`; `KcpListener::close()` stops new accepts without disturbing already-accepted connections.
+`accept()` returns `(KcpStream, SocketAddr)` — the per-peer connection and the client's address. Multiple clients hitting the same listener each get their own `KcpStream`; `KcpListener::close()` stops new accepts without disturbing already-accepted connections.
 
 ---
 
@@ -330,9 +325,9 @@ println!("{}", DEFAULT_SNMP);   // Display prints a kcp-go style CSV row
 
 Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don't need stats.
 
-### KcpConn (async)
+### KcpStream (async)
 
-`kcp_rs::KcpConn` (features `async-tokio` / `async-smol`) — a reliable stream over UDP with background input/flush loops. Implements `kio::AsyncRead + AsyncWrite`.
+`kcp_rs::KcpStream` (feature `async`) — a reliable stream over UDP with background input/flush loops. Implements `knet::AsyncRead + AsyncWrite`.
 
 | Method / builder | Description |
 |------------------|-------------|
@@ -346,7 +341,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `.fec(data, parity)` | Enable Reed-Solomon FEC (both `> 0`). |
 | `.config(KcpConfig)` | Apply a full config value. |
 | `.build().await` | Construct and start the background loops. |
-| `read` / `write_all` / `flush` | Standard async I/O (`kio::AsyncReadExt` / `AsyncWriteExt`). |
+| `read` / `write_all` / `flush` | Standard async I/O (`knet::AsyncReadExt` / `AsyncWriteExt`). |
 | `set_kcp_nodelay` / `set_kcp_window_size` / `set_kcp_mtu` / `set_kcp_stream_mode` / `set_kcp_acknodelay` | KCP-specific post-construction tuning (`set_kcp_*` prefix avoids collisions). |
 | `set_nodelay(bool)` / `nodelay()` | TCP-style Nagle toggle (`true` → KCP fast path) + getter. |
 | `set_read_timeout(Option<Duration>)` / `read_timeout()` | Read deadline (`TimedOut` after it elapses with no data). |
@@ -363,7 +358,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 
 ### KcpListener (async)
 
-`kcp_rs::KcpListener` (features `async-tokio` / `async-smol`) — server-side listener that binds **one** UDP socket and demultiplexes inbound datagrams by source address into per-peer [`KcpConn`]s. The full example lives in [Listen & connect](#listen--connect-server--client).
+`kcp_rs::KcpListener` (feature `async`) — server-side listener that binds **one** UDP socket and demultiplexes inbound datagrams by source address into per-peer [`KcpStream`]s. The full example lives in [Listen & connect](#listen--connect-server--client).
 
 | Method / builder | Description |
 |------------------|-------------|
@@ -374,7 +369,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `.fec(data, parity)` | Enable Reed-Solomon FEC on accepted conns (both `> 0`). |
 | `.config(KcpConfig)` | Apply a full config value. |
 | `.build().await` | Bind the socket, spawn the demux reader, return the listener. |
-| `accept()` | Await the next client — `io::Result<(KcpConn, SocketAddr)>` (per-peer conn + source addr). |
+| `accept()` | Await the next client — `io::Result<(KcpStream, SocketAddr)>` (per-peer conn + source addr). |
 | `accept_timeout(t)` | Await the next client within `t`, else `io::ErrorKind::TimedOut`. |
 | `try_accept()` | Non-blocking: `Ok(Some(conn))` if pending, `Ok(None)` otherwise. |
 | `take_error()` | Surface + clear the last demux-reader transport error. |
@@ -385,7 +380,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 
 ### PacketTransport
 
-The pluggable datagram layer under `KcpConn` — this is where crypto lives (never inside `KcpConn`).
+The pluggable datagram layer under `KcpStream` — this is where crypto lives (never inside `KcpStream`).
 
 ```rust
 pub trait PacketTransport: Send + Sync {
@@ -406,7 +401,7 @@ pub trait PacketTransport: Send + Sync {
 
 Built-in implementations:
 
-- `kio::DatagramSocket` — plain UDP (also `TcpRaw` on some platforms).
+- `knet::DatagramSocket` — plain UDP (also `TcpRaw` on some platforms).
 - `kcptun_common::CryptoTransport` — encrypts/decrypts (and offloads CPU-heavy crypto), then delegates to UDP.
 
 `send_urgent*` is the ACK path — crypto wrappers use a separate buffer here to avoid lock contention with the data path.
@@ -510,8 +505,7 @@ bash kcp-rs/test.sh
 This runs, in order:
 
 1. **Sync data-correctness** — `cargo test -p kcp-rs` (default features, no async)
-2. **Async integrity (tokio)** — `cargo test -p kcp-rs --features async-tokio`
-3. **Async integrity (smol)** — `cargo test -p kcp-rs --features async-smol`
+2. **Async integrity** — `cargo test -p kcp-rs --features async`
 
 ### Individual test targets
 
@@ -522,13 +516,12 @@ cargo test -p kcp-rs --test data_correctness
 # Sync: run just the loss test
 cargo test -p kcp-rs --test data_correctness reliable_delivery_with_20pct_loss
 
-# Async: KcpConn integrity over real localhost UDP
-cargo test -p kcp-rs --features async-tokio --test kcpconn_integrity
-cargo test -p kcp-rs --features async-smol  --test kcpconn_integrity
+# Async: KcpStream integrity over real localhost UDP
+cargo test -p kcp-rs --features async --test kcpconn_integrity
 
 # Full crate suite
 cargo test -p kcp-rs                    # sync
-cargo test -p kcp-rs --features async-tokio   # + async
+cargo test -p kcp-rs --features async   # + async
 ```
 
 ### What the tests verify
@@ -536,10 +529,8 @@ cargo test -p kcp-rs --features async-tokio   # + async
 | Test file | Verifies |
 |-----------|----------|
 | `tests/data_correctness.rs` | Byte-exact delivery (length + content + FNV-1a checksum) over a clean link, a 20%-loss link, and a loss+dup+reorder+delay link; FEC recovers a dropped data shard byte-exactly. |
-| `tests/kcpconn_integrity.rs` | Bidirectional byte-exact transfers through real `KcpConn` over localhost UDP, with and without FEC 10/3. |
+| `tests/kcpconn_integrity.rs` | Bidirectional byte-exact transfers through real `KcpStream` over localhost UDP, with and without FEC 10/3. |
 | `tests/kcpconn_listener.rs` | Server **listen** / client **connect**: accept echo round-trip, multi-peer demux, listener serves a fresh client after a close. |
-
-> `--all-features` is intentionally invalid here: `kio-rs` enforces tokio/smol mutual exclusion at build time.
 
 ---
 
@@ -547,12 +538,12 @@ cargo test -p kcp-rs --features async-tokio   # + async
 
 ```
 kcp-rs/
-├── Cargo.toml          — deps: bytes, parking_lot, crossbeam, reed-solomon-erasure, crc32fast; optional kio-rs
+├── Cargo.toml          — deps: bytes, parking_lot, crossbeam, reed-solomon-erasure, crc32fast; optional knet-rs
 ├── AGENTS.md           — AI-orientation map for this crate
-├── test.sh             — standalone test runner (sync + tokio + smol)
+├── test.sh             — standalone test runner (sync + async)
 ├── tests/
 │   ├── data_correctness.rs   — sync reliability + FEC data-correctness tests
-│   ├── kcpconn_integrity.rs  — async KcpConn integrity over localhost UDP
+│   ├── kcpconn_integrity.rs  — async KcpStream integrity over localhost UDP
 │   └── kcpconn_listener.rs   — server listen / client connect (accept, demux, reconnect)
 └── src/
     ├── lib.rs          — crate root + re-exports (large intentional clippy allow-list)
@@ -561,10 +552,10 @@ kcp-rs/
     ├── segment.rs      — 24-byte LE wire header, Command enum, SegmentPool
     ├── fec.rs          — FecEncoder / FecDecoder / fec_expand_packets / fec_kcp_from_recovered
     ├── snmp.rs         — global DEFAULT_SNMP atomic counters; snmp_enable / snmp_add / snmp_store
-    └── conn.rs         — (feature async-*) KcpConn + KcpConnBuilder + KcpListener + PacketTransport
+    └── conn.rs         — (feature async) KcpStream + KcpStreamBuilder + KcpListener + PacketTransport
 ```
 
-Data flow (async `KcpConn`):
+Data flow (async `KcpStream`):
 
 ```
 Write path:  AsyncWrite::poll_write → write_buf → flush loop
@@ -578,7 +569,7 @@ Read path:   PacketTransport::recv → [FEC decode] → KCP::input → recv_byte
 
 ### `send()` returns `Err(TooManyFragments)`
 
-A single `KCP::send` call cannot exceed `255` MSS-sized fragments (`KCP_MAX_FRAG`). Chunk large writes into `≤ (KCP_MAX_FRAG − 1) × MSS` bytes per call (the async `KcpConn` does this internally).
+A single `KCP::send` call cannot exceed `255` MSS-sized fragments (`KCP_MAX_FRAG`). Chunk large writes into `≤ (KCP_MAX_FRAG − 1) × MSS` bytes per call (the async `KcpStream` does this internally).
 
 ### Nothing arrives when I `recv()`
 
@@ -586,20 +577,12 @@ KCP only releases data once it is contiguous from `rcv_nxt`. If a segment is mis
 
 ### `KcpListener::accept()` never returns
 
-The listener only learns about a client when it receives that client's **first datagram**. A `KcpConn` sends nothing until there is data to send (or a window probe fires), so `accept()` blocks until the client writes. A silent client that never sends will never be accepted.
+The listener only learns about a client when it receives that client's **first datagram**. A `KcpStream` sends nothing until there is data to send (or a window probe fires), so `accept()` blocks until the client writes. A silent client that never sends will never be accepted.
 
 ### Congestion window caps throughput
 
 The default congestion window starts small (slow-start) and `sndwnd`/`rcvwnd` cap it. For bulk transfers bump `sndwnd`/`rcvwnd`, or set `nc=1` (no congestion control) — e.g. `KcpMode::Fast3` already sets `nc=1`.
 
-### Feature conflict on `tokio` + `smol`
-
-```
-[CRITICAL ERROR] Feature conflict: `tokio` and `smol` are mutually exclusive!
-```
-
-Enable exactly one runtime: `--features async-tokio` or `--features async-smol`. Never `--all-features`.
-
 ### Where is encryption?
 
-Deliberately not in this crate. Crypto lives in `kcrypt-rs`; wrap your datagrams with a `PacketTransport` (e.g. `kcptun_common::CryptoTransport`) beneath `KcpConn`. See [`kcrypt-rs/AGENTS.md`](../kcrypt-rs/AGENTS.md) for its API surface.
+Deliberately not in this crate. Crypto lives in `kcrypt-rs`; wrap your datagrams with a `PacketTransport` (e.g. `kcptun_common::CryptoTransport`) beneath `KcpStream`. See [`kcrypt-rs/AGENTS.md`](../kcrypt-rs/AGENTS.md) for its API surface.

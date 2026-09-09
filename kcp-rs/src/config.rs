@@ -1,6 +1,6 @@
 //! KCP configuration: plain data + apply via public set_* on [`KCP`].
 //!
-//! Always available (not gated on async). Async [`crate::conn::KcpConn`] reuses
+//! Always available (not gated on async). Async [`crate::conn::KcpStream`] reuses
 //! the same types.
 //!
 //! # Design
@@ -100,7 +100,7 @@ impl KCP {
     /// Apply a [`KcpConfig`] by calling public setters only.
     ///
     /// Does not change `conv`/`token` (fixed at [`KCP::new`]). FEC shard fields
-    /// are stored on async [`crate::KcpConn`] builders, not on bare `KCP`.
+    /// are stored on async [`crate::KcpStream`] builders, not on bare `KCP`.
     pub fn apply(&mut self, cfg: &KcpConfig) {
         self.set_mtu(cfg.mtu);
         self.set_snd_wnd(cfg.sndwnd);

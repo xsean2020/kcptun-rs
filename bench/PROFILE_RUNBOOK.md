@@ -59,7 +59,7 @@ go tool pprof -top -ignore="Inner::park" bench/profiles/rust-server-aes-*.pb
 
 ```bash
 # Start server with pprof HTTP endpoint
-./target/profiling/kcptun-server -l :29900 -t 127.0.0.1:8080 --key k --crypt aes --nocomp --pprof 127.0.0.1:6060
+./target/profiling/kcptun-server -l :29900 -t 127.0.0.1:8080 --key k --crypt aes --nocomp --pprof
 
 # Capture CPU profile
 curl -o cpu.pb 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20'

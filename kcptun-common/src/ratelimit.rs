@@ -1,17 +1,19 @@
 //! Token-bucket rate limiter for per-connection packet pacing.
 //!
 //! Matches Go kcptun's use of `golang.org/x/time/rate` applied in the KCP
-//! flush loop before `tx()`. Tokens refill at `rate` bytes/second; bursts up
-//! to `rate` bytes (1 second of capacity) are permitted. Zero rate = unlimited.
+//! flush loop before `tx()`. Tokens refill at `rate` bytes/second and use
+//! kcp-go's fixed `maxBatchSize * mtuLimit` burst. Zero rate = unlimited.
 
 use std::time::{Duration, Instant};
+
+const GO_RATE_LIMIT_BURST: f64 = 64.0 * 1500.0;
 
 /// A rate limiter that paces the caller without ever blocking a thread.
 ///
 /// Thread-safe (`Mutex`-protected). Designed for per-connection use in the
 /// KCP flush/send path. `acquire` never sleeps: it either consumes tokens and
 /// returns `Duration::ZERO`, or returns the wait needed without consuming.
-/// Callers in async contexts should `kio::sleep(wait).await` and re-acquire.
+/// Callers in async contexts should `knet::sleep(wait).await` and re-acquire.
 pub struct RateLimiter {
     inner: parking_lot::Mutex<Inner>,
 }
@@ -19,7 +21,7 @@ pub struct RateLimiter {
 struct Inner {
     /// Configured rate in bytes/sec. 0 = unlimited.
     rate: f64,
-    /// Burst size in bytes (typically == rate for 1s capacity).
+    /// Go kcp-go burst size (`maxBatchSize * mtuLimit` = 96,000 bytes).
     burst: f64,
     /// Current token balance (capped at burst).
     tokens: f64,
@@ -31,14 +33,14 @@ impl RateLimiter {
     /// Create a new rate limiter.
     ///
     /// `bytes_per_sec` — maximum sustained rate. 0 means no rate limit.
-    /// When non-zero, burst size is set equal to `bytes_per_sec` (matching Go).
+    /// The burst is fixed at 96,000 bytes, matching kcp-go.
     pub fn new(bytes_per_sec: u32) -> Self {
         let rate = bytes_per_sec as f64;
         RateLimiter {
             inner: parking_lot::Mutex::new(Inner {
                 rate,
-                burst: rate,
-                tokens: rate, // start full
+                burst: GO_RATE_LIMIT_BURST,
+                tokens: GO_RATE_LIMIT_BURST,
                 last: Instant::now(),
             }),
         }
@@ -49,7 +51,7 @@ impl RateLimiter {
     /// immediately (tokens consumed, or the batch exceeds the burst and is
     /// passed through un-paced, Go `ErrBurst` parity). Otherwise returns the
     /// time the caller must wait and does **not** consume tokens — the caller
-    /// should sleep asynchronously (e.g. `kio::sleep(wait).await`) and
+    /// should sleep asynchronously (e.g. `knet::sleep(wait).await`) and
     /// re-call `acquire`. `--ratelimit 0` (rate == 0) always grants
     /// immediately.
     pub fn acquire(&self, n: usize) -> Duration {
@@ -86,8 +88,8 @@ impl RateLimiter {
     pub fn set_rate(&self, bytes_per_sec: u32) {
         let mut inner = self.inner.lock();
         inner.rate = bytes_per_sec as f64;
-        inner.burst = inner.rate;
-        inner.tokens = inner.rate.min(inner.burst);
+        inner.burst = GO_RATE_LIMIT_BURST;
+        inner.tokens = inner.burst;
         inner.last = Instant::now();
     }
 
@@ -123,29 +125,27 @@ mod tests {
 
     #[test]
     fn small_burst_passes_immediately() {
-        let lim = RateLimiter::new(1_000_000); // 1 MB/s
-                                               // Should pass immediately since bucket starts full (1MB).
-        assert_eq!(lim.acquire(100_000), Duration::ZERO);
+        let lim = RateLimiter::new(1_000_000);
+        assert_eq!(lim.acquire(90_000), Duration::ZERO);
     }
 
     #[test]
     fn rate_limit_enforces_wait() {
-        let lim = RateLimiter::new(1_000_000); // 1 MB/s
-                                               // Drain the bucket (burst == rate == 1 MB).
-        assert_eq!(lim.acquire(1_000_000), Duration::ZERO);
+        let lim = RateLimiter::new(1_000_000);
+        assert_eq!(lim.acquire(GO_RATE_LIMIT_BURST as usize), Duration::ZERO);
         // Not enough tokens: returns a wait, does NOT consume. The wait can never
         // exceed the full deficit (tokens are never negative), so the upper bound
         // is deterministic regardless of how much time elapsed between acquires —
         // the old >=80ms floor was CI-load-sensitive.
-        let w1 = lim.acquire(100_000);
+        let w1 = lim.acquire(90_000);
         assert!(w1 > Duration::ZERO, "should not grant when bucket is empty");
         assert!(
-            w1 <= Duration::from_millis(100),
+            w1 <= Duration::from_millis(90),
             "wait {:?} exceeds full deficit",
             w1
         );
         // Tokens were NOT consumed by the failed acquire: the deficit persists.
-        let w2 = lim.acquire(100_000);
+        let w2 = lim.acquire(90_000);
         assert!(
             w2 > Duration::ZERO,
             "deficit must not be consumed on a non-granting acquire"
@@ -154,15 +154,13 @@ mod tests {
 
     #[test]
     fn oversized_batch_is_granted_immediately() {
-        // Go parity: rate.Limiter.WaitN returns ErrBurst for n > burst — it
-        // never blocks. A flush batch can exceed the burst (== rate, e.g.
-        // up to sndwnd*mtu), so acquire must grant immediately WITHOUT
+        // Go parity: rate.Limiter.WaitN returns ErrBurst for n > the fixed
+        // 96,000-byte burst, so acquire must grant immediately WITHOUT
         // consuming tokens, letting the caller's pacing loop break and the
         // batch go un-paced (no permanent stall).
-        let lim = RateLimiter::new(1024); // burst = 1024 bytes
-        assert_eq!(lim.acquire(10_000), Duration::ZERO); // n > burst, no wait
-                                                         // Tokens were NOT consumed: a second oversized acquire also grants.
-        assert_eq!(lim.acquire(10_000), Duration::ZERO);
+        let lim = RateLimiter::new(1024);
+        assert_eq!(lim.acquire(100_000), Duration::ZERO);
+        assert_eq!(lim.acquire(100_000), Duration::ZERO);
     }
 
     #[test]
@@ -170,7 +168,7 @@ mod tests {
         let lim = RateLimiter::new(1_000_000);
         lim.set_rate(2_000_000);
         assert_eq!(lim.rate(), 2_000_000);
-        assert_eq!(lim.acquire(2_000_000), Duration::ZERO); // burst = 2MB
+        assert_eq!(lim.acquire(GO_RATE_LIMIT_BURST as usize), Duration::ZERO);
     }
 
     #[test]

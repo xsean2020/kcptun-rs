@@ -1,4 +1,4 @@
-//! Encrypted packet transport and `KcpConn` construction helpers.
+//! Encrypted packet transport and `KcpStream` construction helpers.
 //!
 //! Protocol stack (matches Go kcp-go v5 / kcptun):
 //!
@@ -7,11 +7,11 @@
 //! outbound: KCP → FEC → encrypt → UDP
 //! ```
 //!
-//! Encryption lives **outside** [`kcp_rs::KcpConn`]: this module wraps a plain
-//! datagram socket and implements [`kcp_rs::PacketTransport`] so KcpConn talks
+//! Encryption lives **outside** [`kcp_rs::KcpStream`]: this module wraps a plain
+//! datagram socket and implements [`kcp_rs::PacketTransport`] so KcpStream talks
 //! to ciphertext transparently.
 //!
-//! Feature-gated on `tokio` / `smol` (needs kio + kcp-rs async).
+//! Feature-gated on `tokio` (needs knet + kcp-rs async).
 
 use std::io;
 use std::net::SocketAddr;
@@ -20,12 +20,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use kcp_rs::{KcpConfig, KcpConn, PacketTransport};
+use kcp_rs::{KcpConfig, KcpStream, PacketTransport};
 use kcrypt_rs::crypt::CryptEngine;
 use kcrypt_rs::wire::{
-    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null,
+    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, encrypt_batch_ref_into, inbound_null,
     should_cpu_block_encrypt, CryptoBuf, OffloadProfile,
 };
+
+use crate::RateLimiter;
 
 /// Default conversation ID used as CryptoBuf session_id seed (matches client).
 const DEFAULT_CONV: u32 = 0xDEAD_BEEF;
@@ -49,15 +51,22 @@ pub struct CryptoTransport {
     has_encryption: bool,
     data_crypto_buf: Arc<Mutex<CryptoBuf>>,
     ack_crypto_buf: Arc<Mutex<CryptoBuf>>,
+    /// Reusable output buffer for `encrypt_sync` — avoids per-flush `Vec<Bytes>`
+    /// allocation on the sync TX path. Guarded by `is_sending` CAS in
+    /// `drain_and_flush_tx`, so only one sender touches this at a time.
+    data_tx_buf: Mutex<Vec<Bytes>>,
     /// Runtime-shaped CPU offload profile (per-session, not global).
     offload_profile: OffloadProfile,
+    /// Go applies rate limiting after FEC and encryption, immediately before
+    /// the datagram batch is transmitted.
+    rate_limiter: RateLimiter,
 }
 
 impl CryptoTransport {
     /// Wrap `inner` with the given cipher method and raw 32-byte key material.
     ///
     /// `method` is the Go-compatible name (`"aes"`, `"null"`, `"aes-128-gcm"`, …).
-    pub fn new(inner: Arc<kio::DatagramSocket>, key: &[u8], method: &str) -> Self {
+    pub fn new(inner: Arc<knet::DatagramSocket>, key: &[u8], method: &str) -> Self {
         Self::with_transport(inner, key, method)
     }
 
@@ -81,13 +90,31 @@ impl CryptoTransport {
             ack_crypto_buf: Arc::new(Mutex::new(CryptoBuf::new(
                 (DEFAULT_CONV as u64) ^ ACK_SESSION_XOR,
             ))),
+            data_tx_buf: Mutex::new(Vec::new()),
             offload_profile: OffloadProfile::Tokio,
+            rate_limiter: RateLimiter::new(0),
         }
     }
 
     /// Set the runtime offload profile (defaults to Tokio).
     pub fn set_offload_profile(&mut self, profile: OffloadProfile) {
         self.offload_profile = profile;
+    }
+
+    /// Set the on-wire byte rate. Zero disables limiting.
+    pub fn set_rate_limit(&mut self, bytes_per_second: u32) {
+        self.rate_limiter = RateLimiter::new(bytes_per_second);
+    }
+
+    async fn wait_for_rate(&self, packets: &[Bytes]) {
+        let bytes = packets.iter().map(Bytes::len).sum();
+        loop {
+            let wait = self.rate_limiter.acquire(bytes);
+            if wait.is_zero() {
+                return;
+            }
+            knet::sleep(wait).await;
+        }
     }
 
     /// Access the underlying socket (diagnostics / local_addr).
@@ -147,7 +174,7 @@ impl CryptoTransport {
             let crypt = self.crypt.clone();
             let cb = crypto_buf.clone();
             let has_encryption = self.has_encryption;
-            kio::cpu_block(move || {
+            knet::cpu_block(move || {
                 encrypt_batch(packets, crypt.as_ref(), &cb, has_encryption, allow_parallel)
             })
             .await
@@ -175,18 +202,8 @@ impl CryptoTransport {
         }
         if self.crypt.is_aead() {
             let aead = self.crypt.as_aead().expect("is_aead");
-            match aead.open(&buf[..n]) {
-                Ok(plain) => {
-                    let len = plain.len();
-                    if len > buf.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "AEAD plaintext longer than recv buffer",
-                        ));
-                    }
-                    buf[..len].copy_from_slice(&plain);
-                    Ok(len)
-                }
+            match aead.open_in_place(buf, n) {
+                Ok(len) => Ok(len),
                 Err(_) => {
                     kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
                     Ok(0)
@@ -255,6 +272,45 @@ impl PacketTransport for CryptoTransport {
         }
     }
 
+    fn decrypt_packet_in_place(&self, buf: &mut [u8], n: usize) -> usize {
+        self.decrypt_in_place(buf, n).unwrap_or_default()
+    }
+
+    fn try_send_batch(&self, packets: &[Bytes]) -> io::Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        // Encrypt into the reusable `data_tx_buf` and send directly from it —
+        // no intermediate `Vec<Bytes>` allocation. The `is_sending` CAS in
+        // `drain_and_flush_tx` ensures single-owner access.
+        let mut buf = self.data_tx_buf.lock();
+        encrypt_batch_ref_into(
+            packets,
+            self.crypt.as_ref(),
+            &self.data_crypto_buf,
+            self.has_encryption,
+            false,
+            &mut buf,
+        );
+        self.inner.try_send_batch(&buf)
+    }
+
+    fn try_send_batch_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        let mut buf = self.data_tx_buf.lock();
+        encrypt_batch_ref_into(
+            packets,
+            self.crypt.as_ref(),
+            &self.data_crypto_buf,
+            self.has_encryption,
+            false,
+            &mut buf,
+        );
+        self.inner.try_send_batch_to(&buf, target)
+    }
+
     async fn recv_vec(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         loop {
             let n = self.inner.recv_vec(buf).await?;
@@ -305,7 +361,9 @@ impl PacketTransport for CryptoTransport {
             return Ok(());
         }
         let encrypted = self.encrypt_data(packets.to_vec()).await;
-        self.inner.send_batch(&encrypted).await
+        self.wait_for_rate(&encrypted).await;
+        let r = self.inner.send_batch(&encrypted).await;
+        r
     }
 
     async fn send_batch_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<()> {
@@ -313,6 +371,7 @@ impl PacketTransport for CryptoTransport {
             return Ok(());
         }
         let encrypted = self.encrypt_data(packets.to_vec()).await;
+        self.wait_for_rate(&encrypted).await;
         self.inner.send_batch_to(&encrypted, target).await
     }
 
@@ -321,6 +380,7 @@ impl PacketTransport for CryptoTransport {
             return Ok(());
         }
         let encrypted = self.encrypt_urgent(packets.to_vec()).await;
+        self.wait_for_rate(&encrypted).await;
         self.inner.send_urgent(&encrypted).await
     }
 
@@ -329,6 +389,7 @@ impl PacketTransport for CryptoTransport {
             return Ok(());
         }
         let encrypted = self.encrypt_urgent(packets.to_vec()).await;
+        self.wait_for_rate(&encrypted).await;
         self.inner.send_urgent_to(&encrypted, target).await
     }
 
@@ -338,16 +399,41 @@ impl PacketTransport for CryptoTransport {
 }
 
 /// Build the encrypted KCP layer over an existing datagram socket.
-pub(crate) async fn kcp_conn_with_socket(
-    socket: Arc<kio::DatagramSocket>,
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) async fn kcp_stream_with_socket(
+    socket: Arc<knet::DatagramSocket>,
     remote: SocketAddr,
     key: &[u8],
     crypt: &str,
     config: KcpConfig,
     connected: bool,
     offload_profile: OffloadProfile,
-) -> io::Result<KcpConn> {
-    kcp_conn_with_socket_options(
+) -> io::Result<KcpStream> {
+    kcp_stream_with_socket_rate_limited(
+        socket,
+        remote,
+        key,
+        crypt,
+        config,
+        connected,
+        offload_profile,
+        0,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn kcp_stream_with_socket_rate_limited(
+    socket: Arc<knet::DatagramSocket>,
+    remote: SocketAddr,
+    key: &[u8],
+    crypt: &str,
+    config: KcpConfig,
+    connected: bool,
+    offload_profile: OffloadProfile,
+    rate_limit: u32,
+) -> io::Result<KcpStream> {
+    kcp_stream_with_socket_options(
         socket,
         remote,
         key,
@@ -356,19 +442,22 @@ pub(crate) async fn kcp_conn_with_socket(
         connected,
         false,
         offload_profile,
+        rate_limit,
     )
     .await
 }
 
-pub(crate) async fn server_kcp_conn_with_socket(
-    socket: Arc<kio::DatagramSocket>,
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn server_kcp_stream_with_socket_rate_limited(
+    socket: Arc<knet::DatagramSocket>,
     peer: SocketAddr,
     key: &[u8],
     crypt: &str,
     config: KcpConfig,
     offload_profile: OffloadProfile,
-) -> io::Result<KcpConn> {
-    kcp_conn_with_socket_options(
+    rate_limit: u32,
+) -> io::Result<KcpStream> {
+    kcp_stream_with_socket_options(
         socket,
         peer,
         key,
@@ -377,13 +466,14 @@ pub(crate) async fn server_kcp_conn_with_socket(
         true,
         true,
         offload_profile,
+        rate_limit,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn kcp_conn_with_socket_options(
-    socket: Arc<kio::DatagramSocket>,
+async fn kcp_stream_with_socket_options(
+    socket: Arc<knet::DatagramSocket>,
     remote: SocketAddr,
     key: &[u8],
     crypt: &str,
@@ -391,11 +481,13 @@ async fn kcp_conn_with_socket_options(
     connected: bool,
     adopt_conv: bool,
     offload_profile: OffloadProfile,
-) -> io::Result<KcpConn> {
+    rate_limit: u32,
+) -> io::Result<KcpStream> {
     let mut ct = CryptoTransport::new(socket, key, crypt);
     ct.set_offload_profile(offload_profile);
+    ct.set_rate_limit(rate_limit);
     let transport: Arc<dyn PacketTransport> = Arc::new(ct);
-    let mut builder = KcpConn::with_transport(transport, remote)
+    let mut builder = KcpStream::with_transport(transport, remote)
         .connected(connected)
         .adopt_conv(adopt_conv)
         .config(config.clone());
@@ -405,17 +497,17 @@ async fn kcp_conn_with_socket_options(
     builder.build().await
 }
 
-#[cfg(test)]
-async fn test_kcp_conn(
-    socket: Arc<kio::DatagramSocket>,
+#[cfg(all(test, feature = "tokio"))]
+async fn test_kcp_stream(
+    socket: Arc<knet::DatagramSocket>,
     remote: SocketAddr,
     key: &[u8],
     crypt: &str,
     params: &crate::KcpCliParams,
-) -> io::Result<KcpConn> {
+) -> io::Result<KcpStream> {
     let config = params.to_kcp_config();
     // Client sockets are typically `connect()`ed to the remote.
-    kcp_conn_with_socket(
+    kcp_stream_with_socket(
         socket,
         remote,
         key,
@@ -429,7 +521,7 @@ async fn test_kcp_conn(
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -438,8 +530,8 @@ mod tests {
     #[tokio::test]
     async fn null_encrypt_passthrough() {
         // Build a dummy socket we won't actually send on — only exercise encrypt helpers.
-        let sock = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let inner = Arc::new(kio::DatagramSocket::Udp(sock));
+        let sock = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let inner = Arc::new(knet::DatagramSocket::Udp(sock));
         let ct = CryptoTransport::new(inner, b"unused-key-pad-to-32-bytes!!!!!", "null");
         assert!(!ct.has_encryption());
         let plain = vec![
@@ -455,8 +547,8 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn aes_cfb_roundtrip_via_crypto_bufs() {
-        let sock = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let inner = Arc::new(kio::DatagramSocket::Udp(sock));
+        let sock = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let inner = Arc::new(knet::DatagramSocket::Udp(sock));
         let key = b"0123456789abcdef0123456789abcdef";
         let ct = CryptoTransport::new(inner, key, "aes");
         assert!(ct.has_encryption());
@@ -477,8 +569,8 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn ack_and_data_bufs_are_independent() {
-        let sock = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let inner = Arc::new(kio::DatagramSocket::Udp(sock));
+        let sock = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let inner = Arc::new(knet::DatagramSocket::Udp(sock));
         let key = b"0123456789abcdef0123456789abcdef";
         let ct = CryptoTransport::new(inner, key, "aes");
 
@@ -495,8 +587,8 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn aead_roundtrip() {
-        let sock = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let inner = Arc::new(kio::DatagramSocket::Udp(sock));
+        let sock = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let inner = Arc::new(knet::DatagramSocket::Udp(sock));
         let key = b"0123456789abcdef0123456789abcdef";
         let ct = CryptoTransport::new(inner, key, "aes-128-gcm");
         assert!(ct.has_encryption());
@@ -514,23 +606,23 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kcp_conn_null_localhost_roundtrip() {
-        use kio::AsyncWriteExt;
+    async fn kcp_stream_null_localhost_roundtrip() {
+        use knet::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
-        // Bind two ports, connect both sides via kcp_conn_with_socket.
-        let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        // Bind two ports, connect both sides via kcp_stream_with_socket.
+        let a_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let b_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a_tmp.local_addr().unwrap();
         let addr_b = b_tmp.local_addr().unwrap();
         drop(a_tmp);
         drop(b_tmp);
 
-        let sock_a = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_a, addr_b).unwrap(),
+        let sock_a = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
         ));
-        let sock_b = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_b, addr_a).unwrap(),
+        let sock_b = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
         ));
 
         let cfg = KcpConfig {
@@ -539,7 +631,7 @@ mod tests {
             ..KcpConfig::default()
         };
 
-        let mut conn_a = kcp_conn_with_socket(
+        let mut conn_a = kcp_stream_with_socket(
             sock_a,
             addr_b,
             key,
@@ -550,7 +642,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut conn_b = kcp_conn_with_socket(
+        let mut conn_b = kcp_stream_with_socket(
             sock_b,
             addr_a,
             key,
@@ -576,22 +668,22 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kcp_conn_aes_localhost_roundtrip() {
-        use kio::AsyncWriteExt;
+    async fn kcp_stream_aes_localhost_roundtrip() {
+        use knet::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
-        let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let a_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let b_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a_tmp.local_addr().unwrap();
         let addr_b = b_tmp.local_addr().unwrap();
         drop(a_tmp);
         drop(b_tmp);
 
-        let sock_a = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_a, addr_b).unwrap(),
+        let sock_a = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
         ));
-        let sock_b = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_b, addr_a).unwrap(),
+        let sock_b = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
         ));
 
         let cfg = KcpConfig {
@@ -601,7 +693,7 @@ mod tests {
             ..KcpConfig::default()
         };
 
-        let mut conn_a = kcp_conn_with_socket(
+        let mut conn_a = kcp_stream_with_socket(
             sock_a,
             addr_b,
             key,
@@ -613,7 +705,7 @@ mod tests {
         .await
         .unwrap();
         let mut conn_b =
-            kcp_conn_with_socket(sock_b, addr_a, key, "aes", cfg, true, OffloadProfile::Tokio)
+            kcp_stream_with_socket(sock_b, addr_a, key, "aes", cfg, true, OffloadProfile::Tokio)
                 .await
                 .unwrap();
 
@@ -635,22 +727,22 @@ mod tests {
     /// Client-shaped dial helper roundtrip (null crypt, CLI params).
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn client_shaped_kcp_conn_roundtrip() {
-        use kio::AsyncWriteExt;
+    async fn client_shaped_kcp_stream_roundtrip() {
+        use knet::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
-        let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let a_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let b_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a_tmp.local_addr().unwrap();
         let addr_b = b_tmp.local_addr().unwrap();
         drop(a_tmp);
         drop(b_tmp);
 
-        let sock_a = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_a, addr_b).unwrap(),
+        let sock_a = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
         ));
-        let sock_b = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_b, addr_a).unwrap(),
+        let sock_b = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
         ));
 
         // Client-like defaults: fast3, FEC 10/3, acknodelay, rcvwnd 512.
@@ -666,11 +758,11 @@ mod tests {
             ..crate::KcpCliParams::default()
         };
 
-        let mut client = test_kcp_conn(sock_a, addr_b, key, "null", &params)
+        let mut client = test_kcp_stream(sock_a, addr_b, key, "null", &params)
             .await
             .unwrap();
         // The connected peer uses the same lower-layer dial helper.
-        let mut server = test_kcp_conn(sock_b, addr_a, key, "null", &params)
+        let mut server = test_kcp_stream(sock_b, addr_a, key, "null", &params)
             .await
             .unwrap();
 
@@ -698,21 +790,21 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dial_accept_aes_with_cli_params() {
-        use kio::AsyncWriteExt;
+        use knet::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
-        let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let a_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let b_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a_tmp.local_addr().unwrap();
         let addr_b = b_tmp.local_addr().unwrap();
         drop(a_tmp);
         drop(b_tmp);
 
-        let sock_a = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_a, addr_b).unwrap(),
+        let sock_a = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
         ));
-        let sock_b = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_b, addr_a).unwrap(),
+        let sock_b = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
         ));
 
         let params = crate::KcpCliParams {
@@ -732,10 +824,10 @@ mod tests {
         assert_eq!(cfg.mode, kcp_rs::KcpMode::Fast);
         assert_eq!(cfg.datashard, 0);
 
-        let mut a = test_kcp_conn(sock_a, addr_b, key, "aes", &params)
+        let mut a = test_kcp_stream(sock_a, addr_b, key, "aes", &params)
             .await
             .unwrap();
-        let mut b = test_kcp_conn(sock_b, addr_a, key, "aes", &params)
+        let mut b = test_kcp_stream(sock_b, addr_a, key, "aes", &params)
             .await
             .unwrap();
 
@@ -753,21 +845,20 @@ mod tests {
         b.close();
     }
 
-    /// M0.1 — the M1-A SMUX→KcpConn write path must sense backpressure:
+    /// M0.1 — the M1-A SMUX→KcpStream write path must sense backpressure:
     /// when the peer never ACKs, `wait_send` stays ≤ `snd_wnd` and repeated
     /// writes stall (Pending) instead of buffering unboundedly in `snd_queue`.
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kcp_conn_write_backpressure_bounds_inflight() {
-        use kio::AsyncWriteExt;
+    async fn kcp_stream_write_backpressure_bounds_inflight() {
 
         // Bind-then-drop a port so nothing listens on it: the peer never ACKs.
-        let tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let dead = tmp.local_addr().unwrap();
         drop(tmp);
 
-        let sock = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(SocketAddr::from(([127, 0, 0, 1], 0)), dead).unwrap(),
+        let sock = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(SocketAddr::from(([127, 0, 0, 1], 0)), dead).unwrap(),
         ));
         let key = b"0123456789abcdef0123456789abcdef";
         let cfg = KcpConfig {
@@ -777,7 +868,7 @@ mod tests {
             rcvwnd: 64,
             ..KcpConfig::default()
         };
-        let mut conn = kcp_conn_with_socket(
+        let conn = kcp_stream_with_socket(
             sock,
             dead,
             key,
@@ -793,7 +884,7 @@ mod tests {
         let mut accepted = 0usize;
         let mut stalled = false;
         for _ in 0..100 {
-            match kio::timeout(Duration::from_millis(200), conn.write_all(&chunk)).await {
+            match knet::timeout(Duration::from_millis(200), conn.write_all(&chunk)).await {
                 Ok(Ok(())) => accepted += chunk.len(),
                 Ok(Err(e)) => panic!("write error: {}", e),
                 Err(_) => {
@@ -830,15 +921,15 @@ mod tests {
     }
 
     #[cfg(feature = "tokio")]
-    async fn read_exact(conn: &mut KcpConn, buf: &mut [u8], limit: Duration) {
-        use kio::AsyncReadExt;
+    async fn read_exact(conn: &mut KcpStream, buf: &mut [u8], limit: Duration) {
+        use knet::AsyncReadExt;
         let deadline = std::time::Instant::now() + limit;
         let mut filled = 0usize;
         while filled < buf.len() {
             if std::time::Instant::now() > deadline {
                 panic!("timeout waiting for data, got {}/{}", filled, buf.len());
             }
-            match kio::timeout(Duration::from_millis(50), conn.read(&mut buf[filled..])).await {
+            match knet::timeout(Duration::from_millis(50), conn.read(&mut buf[filled..])).await {
                 Ok(Ok(0)) => panic!("unexpected EOF at {}", filled),
                 Ok(Ok(n)) => filled += n,
                 Ok(Err(e)) => panic!("read error: {}", e),
@@ -904,6 +995,35 @@ mod tests {
         fn local_addr(&self) -> io::Result<SocketAddr> {
             Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
         }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_counts_encrypted_wire_bytes() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let inner: Arc<dyn PacketTransport> = Arc::new(MockInner {
+            packets: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let mut transport = CryptoTransport::with_transport(inner, key, "aes");
+        transport.set_rate_limit(1_000);
+
+        // CFB adds a 20-byte wire header. Consume 95,990 of the fixed 96,000
+        // burst, then verify the next 100-byte plaintext packet is paced as
+        // 120 on-wire bytes (110-byte deficit => about 110 ms at 1 KB/s).
+        transport
+            .send_batch(&[Bytes::from(vec![0u8; 95_970])])
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        transport
+            .send_batch(&[Bytes::from(vec![0u8; 100])])
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "encrypted wire bytes were not rate-limited: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1));
     }
 
     #[cfg(feature = "tokio")]

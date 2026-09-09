@@ -6,9 +6,9 @@
 //! `--concurrency` switches each connection to its own closed loop.
 //!
 //! ```text
-//! cargo run -p kcp-rs --features async-tokio --example multi_conn_latency -- \
+//! cargo run -p kcp-rs --features async --example multi_conn_latency -- \
 //!     --connections 8 --rps 4000 --warmup 5 --duration 60
-//! cargo run -p kcp-rs --features async-smol --example multi_conn_latency -- \
+//! cargo run -p kcp-rs --features async --example multi_conn_latency -- \
 //!     --connections 8 --concurrency 32 --duration 60
 //! ```
 //!
@@ -18,7 +18,7 @@
 //! `p999_us` fields are success-only; offered-load percentiles include all
 //! planned measurement slots and represent shed slots as `+inf`.
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 mod benchmark {
     use std::collections::VecDeque;
     use std::env;
@@ -28,8 +28,8 @@ mod benchmark {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use kcp_rs::{KcpConn, KcpListener, KcpMode};
-    use kio::{AsyncReadExt, AsyncWriteExt};
+    use kcp_rs::{KcpListener, KcpMode, KcpStream};
+    use knet::AsyncReadExt;
 
     // Keep the same explicit profile as latency_p99.rs.  These are benchmark
     // settings, not changes to KcpConfig defaults or to wire behaviour.
@@ -137,8 +137,8 @@ mod benchmark {
     struct StartBarrier {
         total: usize,
         ready: AtomicUsize,
-        ready_notify: kio::Notify,
-        releases: Vec<Arc<kio::Notify>>,
+        ready_notify: knet::Notify,
+        releases: Vec<Arc<knet::Notify>>,
         window: parking_lot::Mutex<Option<RunWindow>>,
     }
 
@@ -147,8 +147,8 @@ mod benchmark {
             Arc::new(Self {
                 total,
                 ready: AtomicUsize::new(0),
-                ready_notify: kio::Notify::new(),
-                releases: (0..total).map(|_| Arc::new(kio::Notify::new())).collect(),
+                ready_notify: knet::Notify::new(),
+                releases: (0..total).map(|_| Arc::new(knet::Notify::new())).collect(),
                 window: parking_lot::Mutex::new(None),
             })
         }
@@ -243,7 +243,7 @@ mod benchmark {
     /// scheduler queueing and KCP send-window backpressure are included in the
     /// measured operation.
     async fn issue_write(
-        conn: &KcpConn,
+        conn: &KcpStream,
         payload: &[u8],
         in_flight: &Arc<parking_lot::Mutex<VecDeque<Instant>>>,
         metrics: &Metrics,
@@ -251,7 +251,7 @@ mod benchmark {
         planned_send: Instant,
     ) -> bool {
         in_flight.lock().push_back(planned_send);
-        match kio::timeout(OP_TIMEOUT, conn.write_all_shared(payload)).await {
+        match knet::timeout(OP_TIMEOUT, conn.write_all(payload)).await {
             Ok(Ok(())) => true,
             Ok(Err(_)) | Err(_) => {
                 // Remove the request that failed to enter KCP.  Older requests
@@ -264,15 +264,15 @@ mod benchmark {
         }
     }
 
-    async fn echo_loop(conn: KcpConn, size: usize, stop: Arc<AtomicBool>) {
-        let (mut reader, mut writer) = conn.into_split();
+    async fn echo_loop(conn: KcpStream, size: usize, stop: Arc<AtomicBool>) {
+        let (mut reader, writer) = conn.into_split();
         let mut buf = vec![0u8; size];
         while !stop.load(Ordering::Acquire) {
-            match kio::timeout(OP_TIMEOUT, reader.read_exact(&mut buf)).await {
+            match knet::timeout(OP_TIMEOUT, reader.read_exact(&mut buf)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) | Err(_) => break,
             }
-            match kio::timeout(OP_TIMEOUT, writer.write_all(&buf)).await {
+            match knet::timeout(OP_TIMEOUT, writer.write_all(&buf)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => break,
             }
@@ -281,14 +281,14 @@ mod benchmark {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_reader(
-        conn: KcpConn,
+        conn: KcpStream,
         size: usize,
         window: RunWindow,
         in_flight: Arc<parking_lot::Mutex<VecDeque<Instant>>>,
         latency_shard: Arc<parking_lot::Mutex<Vec<f64>>>,
         metrics: Metrics,
         sender_done: Arc<AtomicBool>,
-        ack_tx: Option<kio::Sender<()>>,
+        ack_tx: Option<knet::Sender<()>>,
     ) {
         let mut reader = conn.clone();
         let mut buf = vec![0u8; size];
@@ -302,7 +302,7 @@ mod benchmark {
                 break;
             }
             let timeout = remaining.min(OP_TIMEOUT);
-            match kio::timeout(timeout, reader.read_exact(&mut buf)).await {
+            match knet::timeout(timeout, reader.read_exact(&mut buf)).await {
                 Ok(Ok(_)) => {
                     let sent_at = in_flight.lock().pop_front();
                     if let Some(sent_at) = sent_at {
@@ -328,8 +328,8 @@ mod benchmark {
     }
 
     async fn run_open_worker(
-        conn: KcpConn,
-        receiver: kio::Receiver<Instant>,
+        conn: KcpStream,
+        receiver: knet::Receiver<Instant>,
         size: usize,
         window: RunWindow,
         latency_shard: Arc<parking_lot::Mutex<Vec<f64>>>,
@@ -343,7 +343,7 @@ mod benchmark {
         let sender_metrics = metrics.clone();
         let sender_metrics_task = sender_metrics.clone();
         let payload = vec![0x5Au8; size];
-        let sender = kio::spawn_task(async move {
+        let sender = knet::spawn_task(async move {
             let receiver = receiver;
             while let Ok(planned_send) = receiver.recv().await {
                 if !issue_write(
@@ -371,7 +371,7 @@ mod benchmark {
         });
 
         let reader_metrics = metrics.clone();
-        let reader = kio::spawn_task(run_reader(
+        let reader = knet::spawn_task(run_reader(
             conn.clone(),
             size,
             window,
@@ -391,7 +391,7 @@ mod benchmark {
     }
 
     async fn run_closed_worker(
-        conn: KcpConn,
+        conn: KcpStream,
         size: usize,
         concurrency: usize,
         window: RunWindow,
@@ -400,18 +400,18 @@ mod benchmark {
     ) {
         let until_start = window.start_at.saturating_duration_since(Instant::now());
         if !until_start.is_zero() {
-            kio::sleep(until_start).await;
+            knet::sleep(until_start).await;
         }
         let in_flight = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
         let sender_done = Arc::new(AtomicBool::new(false));
-        let (ack_tx, ack_rx) = kio::bounded::<()>(concurrency.max(1));
+        let (ack_tx, ack_rx) = knet::bounded::<()>(concurrency.max(1));
         let sender_conn = conn.clone();
         let sender_queue = in_flight.clone();
         let sender_done_c = sender_done.clone();
         let sender_metrics = metrics.clone();
         let sender_metrics_task = sender_metrics.clone();
         let payload = vec![0x5Au8; size];
-        let sender = kio::spawn_task(async move {
+        let sender = knet::spawn_task(async move {
             let ack_rx = ack_rx;
             for _ in 0..concurrency {
                 let planned_send = Instant::now();
@@ -433,7 +433,7 @@ mod benchmark {
             }
             while Instant::now() < window.measure_end {
                 let remaining = window.measure_end.saturating_duration_since(Instant::now());
-                match kio::timeout(remaining, ack_rx.recv()).await {
+                match knet::timeout(remaining, ack_rx.recv()).await {
                     Ok(Ok(())) => {
                         let planned_send = Instant::now();
                         record_offered(&sender_metrics_task, window, planned_send);
@@ -458,7 +458,7 @@ mod benchmark {
         });
 
         let reader_metrics = metrics.clone();
-        let reader = kio::spawn_task(run_reader(
+        let reader = knet::spawn_task(run_reader(
             conn.clone(),
             size,
             window,
@@ -534,19 +534,13 @@ mod benchmark {
         }
     }
 
-    #[cfg(feature = "async-tokio")]
-    async fn await_task<T>(task: kio::JoinHandle<T>) -> bool {
+    #[cfg(feature = "async")]
+    async fn await_task<T>(task: knet::JoinHandle<T>) -> bool {
         task.await.is_ok()
     }
 
-    #[cfg(feature = "async-smol")]
-    async fn await_task<T>(task: kio::JoinHandle<T>) -> bool {
-        task.await;
-        true
-    }
-
-    async fn wait_task<T>(task: kio::JoinHandle<T>, timeout: Duration, metrics: &Metrics) {
-        match kio::timeout(timeout, await_task(task)).await {
+    async fn wait_task<T>(task: knet::JoinHandle<T>, timeout: Duration, metrics: &Metrics) {
+        match knet::timeout(timeout, await_task(task)).await {
             Ok(true) => {}
             Ok(false) | Err(_) => record_task_failure(metrics),
         }
@@ -561,7 +555,7 @@ mod benchmark {
      * rejection itself increments shed.
      */
     async fn schedule_open(
-        senders: Vec<kio::Sender<Instant>>,
+        senders: Vec<knet::Sender<Instant>>,
         window: RunWindow,
         rps: u32,
         metrics: Metrics,
@@ -572,7 +566,7 @@ mod benchmark {
         while next_send < window.measure_end {
             let now = Instant::now();
             if now < next_send {
-                kio::sleep(next_send - now).await;
+                knet::sleep(next_send - now).await;
                 continue;
             }
             record_offered(&metrics, window, next_send);
@@ -630,7 +624,7 @@ mod benchmark {
         // listener has seen all N peers before the accept phase proceeds.
         let mut clients = Vec::with_capacity(args.connections);
         for _ in 0..args.connections {
-            let client = KcpConn::connect(address)
+            let client = KcpStream::connect(address)
                 .conv(CONV)
                 .mode(KcpMode::Fast3)
                 .mtu(MTU)
@@ -646,7 +640,7 @@ mod benchmark {
         let mut echo_tasks = Vec::with_capacity(args.connections);
         for _ in 0..args.connections {
             let (conn, _) = listener.accept_timeout(OP_TIMEOUT).await?;
-            echo_tasks.push(kio::spawn_task(echo_loop(
+            echo_tasks.push(knet::spawn_task(echo_loop(
                 conn,
                 args.size,
                 stop_echo.clone(),
@@ -662,7 +656,7 @@ mod benchmark {
             let metrics_c = metrics.clone();
             let latency_shard = metrics.shard(index);
             if args.concurrency > 0 {
-                workers.push(kio::spawn_task(async move {
+                workers.push(knet::spawn_task(async move {
                     let window = barrier_c.wait(index).await;
                     run_closed_worker(
                         conn,
@@ -675,9 +669,9 @@ mod benchmark {
                     .await;
                 }));
             } else {
-                let (sender, receiver) = kio::bounded::<Instant>(args.queue_depth);
+                let (sender, receiver) = knet::bounded::<Instant>(args.queue_depth);
                 dispatchers.push(sender);
-                workers.push(kio::spawn_task(async move {
+                workers.push(knet::spawn_task(async move {
                     let window = barrier_c.wait(index).await;
                     run_open_worker(conn, receiver, args.size, window, latency_shard, metrics_c)
                         .await;
@@ -694,7 +688,7 @@ mod benchmark {
         let run_timeout =
             window.measure_end.saturating_duration_since(Instant::now()) + JOIN_TIMEOUT;
         if args.concurrency == 0 {
-            let scheduler = kio::spawn_task(schedule_open(
+            let scheduler = knet::spawn_task(schedule_open(
                 dispatchers,
                 window,
                 args.rps,
@@ -773,7 +767,7 @@ mod benchmark {
         Ok(())
     }
 
-    #[cfg(feature = "async-tokio")]
+    #[cfg(feature = "async")]
     fn block_future(
         single: bool,
         future: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>,
@@ -785,19 +779,7 @@ mod benchmark {
                 .expect("failed to build current-thread runtime");
             runtime.block_on(future)
         } else {
-            kio::block_on(future)
-        }
-    }
-
-    #[cfg(feature = "async-smol")]
-    fn block_future(
-        single: bool,
-        future: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>,
-    ) -> io::Result<()> {
-        if single {
-            kio::block_on_local(future)
-        } else {
-            kio::block_on(future)
+            knet::block_on(future)
         }
     }
 
@@ -813,16 +795,16 @@ mod benchmark {
     }
 }
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 fn main() {
     benchmark::run();
 }
 
-#[cfg(not(any(feature = "async-tokio", feature = "async-smol")))]
+#[cfg(not(any(feature = "async", feature = "async")))]
 fn main() {
     eprintln!(
-        "error: this example requires `async-tokio` or `async-smol`, e.g.\n\
-         cargo run -p kcp-rs --features async-tokio --example multi_conn_latency"
+        "error: this example requires `async` or `async`, e.g.\n\
+         cargo run -p kcp-rs --features async --example multi_conn_latency"
     );
     std::process::exit(2);
 }

@@ -1,11 +1,11 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-28 | Updated: 2026-08-03 (production listener/session stack) -->
+<!-- Generated: 2026-07-28 | Updated: 2026-08-16 (tokio-only refactor) -->
 
 # kcptun-common
 
 ## Purpose
 
-Shared helpers for `kcptun-client` and `kcptun-server` so wire-compatible logic is not duplicated. Hosts the encrypted KCP transport factories and the shared full session composition (`KcpConn → Snappy → SMUX`).
+Shared helpers for `kcptun-client` and `kcptun-server` so wire-compatible logic is not duplicated. Hosts the encrypted KCP transport factories and the shared full session composition (`KcpStream → Snappy → SMUX`).
 
 ## Key Files
 
@@ -19,24 +19,22 @@ Shared helpers for `kcptun-client` and `kcptun-server` so wire-compatible logic 
 | `src/kcptun_listener.rs` | `KcptunListener`: encrypted shared-UDP listener with one recv demux and independent per-peer transports |
 | `src/snappy_frame.rs` | Session-level Snappy framing stream decoder |
 | `src/snappy_pipe.rs` | `SnappyPipe<T>` — `AsyncRead+AsyncWrite` Snappy session codec wrapping any transport (M0.4) |
-| `src/pipe.rs` | Idle-timeout bidirectional pipe (`kio::copy_bidirectional_idle`) |
+| `src/pipe.rs` | Go-compatible per-direction closeWait pipe (`knet::copy_bidirectional_postwait`) |
 | `src/snmp_log.rs` | Periodic SNMP CSV logger |
-| `src/kcp_transport.rs` | Lower layer only: `CryptoTransport` plus internal client/per-peer-server `KcpConn` assembly |
+| `src/kcp_transport.rs` | Lower layer only: `CryptoTransport` plus internal client/per-peer-server `KcpStream` assembly |
 | `src/qpp_port.rs` | QPP stream wrapper (feature `qpp`) |
 
 ## Features
 
 | Feature | Effect |
 |---------|--------|
-| `tokio` (default) | `kio-rs/tokio` + `kcp-rs/async-tokio` — pipe / snmp / CryptoTransport / KcptunSession / kcp_config |
-| `smol` | `kio-rs/smol` + `kcp-rs/async-smol` — same helpers, smol backend |
+| `tokio` (default) | `knet-rs` + `kcp-rs/async` — pipe / snmp / CryptoTransport / KcptunSession / kcp_config |
 | `qpp` | `qpp-rs` + `QPPPort` |
 
 Binaries must forward their runtime feature:
 
 ```toml
 tokio = [..., "kcptun-common/tokio"]
-smol  = [..., "kcptun-common/smol"]
 qpp   = ["dep:qpp-rs", "kcptun-common/qpp"]
 ```
 
@@ -53,26 +51,26 @@ qpp   = ["dep:qpp-rs", "kcptun-common/qpp"]
 **Status (Tasks 1–7):**
 
 - **Done:** `kcp_transport` owns only encrypted KCP construction; it does not own Snappy or SMUX.
-- **Done:** `KcptunSession::client/server` owns the shared Snappy+SMUX loops above an already-built `KcpConn`; both binaries and both transport modes use it.
-- **Done:** `KcptunListener` keeps exactly one shared-socket receiver, demultiplexes by peer, then wraps each private peer transport with `CryptoTransport` before building `KcpConn`.
+- **Done:** `KcptunSession::client/server` owns the shared Snappy+SMUX loops above an already-built `KcpStream`; both binaries and both transport modes use it.
+- **Done:** `KcptunListener` keeps exactly one shared-socket receiver, demultiplexes by peer, then wraps each private peer transport with `CryptoTransport` before building `KcpStream`.
 - UDP and raw TCP have no binary-local session or fallback path. They differ only in shared-socket demultiplexing requirements.
-- **Snappy stays outside KcpConn** (session-level over KCP user data).
+- **Snappy stays outside KcpStream** (session-level over KCP user data).
 
 ## For AI Agents
 
 - Prefer extending this crate over copying helpers into binaries.
-- `pipe` is **idle** timeout (Go `closeWait`), not total duration.
+- `pipe` starts a grace period when either copy direction completes, matching Go `closeWait`.
 - Do not change Snappy framing or PBKDF2 parameters (wire / key interop).
-- QPP AsyncRead/Write has separate tokio (`ReadBuf`) and smol (`&mut [u8]`) impls.
-- When wiring binaries to `KcpConn`, map CLI via `KcpCliParams` / `kcp_config_from`;
-  do **not** put Snappy or SMUX inside KcpConn.
+- QPP AsyncRead/Write uses tokio `ReadBuf`.
+- When wiring binaries to `KcpStream`, map CLI via `KcpCliParams` / `kcp_config_from`;
+  do **not** put Snappy or SMUX inside KcpStream.
 - Prefer `KcptunSession::connect` / `serve_transport` for complete sessions;
-  use `client/server` only when a role-specific `KcpConn` already exists.
+  use `client/server` only when a role-specific `KcpStream` already exists.
 
 ## Dependencies
 
 - Always: `kcp-rs`, `pbkdf2`, `sha1`, `snap`, `log`
-- With runtime feature: `kio-rs`, `anyhow`, `bytes`, `parking_lot`
+- With runtime feature: `knet-rs`, `anyhow`, `bytes`, `parking_lot`
 - Optional: `qpp-rs`
 
 <!-- MANUAL: -->

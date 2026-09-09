@@ -1,5 +1,93 @@
 # Hotspot notes
 
+## ✅ 2026-08-27: kcp-rs partial batch-send completion under 64 KiB concurrency
+
+Workload: release `multi_conn_latency`, 32 connections × 4 closed-loop requests,
+64 KiB payload, 2s warmup + 10s measurement on macOS loopback. Exact command:
+
+```bash
+/usr/bin/time -l ./multi_conn_latency --connections 32 --concurrency 4 \
+  --size 65536 --warmup 2 --duration 10 --rt multi
+```
+
+Root cause: both synchronous and async KCP TX paths treated any
+`try_send_batch` result greater than zero as if the whole batch had been sent.
+When the socket accepted only a prefix, the unsent suffix was dropped and KCP
+had to recover it via retransmission/RTO. The fix sends only the remaining
+suffix while retaining the single-sender token; FEC retries retain the original
+expanded wire batch so sequence numbers and FIFO order do not change. Sharded
+route drops now also return their receive buffers to the pool.
+
+Three-run release results (median unless noted):
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Actual throughput | 335.3 req/s (mean 325.6) | **631.8 req/s** (mean 599.9) | **+88.4% median; +84.2% mean** |
+| P50 | 231.4 ms | **140.5 ms** | **-39.3%** |
+| P90 | 852.4 ms | **400.1 ms** | **-53.1%** |
+| P99 | 2324.7 ms | **891.7 ms** | **-61.6%** |
+| P999 | 3934.0 ms | **2583.2 ms** | **-34.3%** |
+| Aggregate CPU/request | 2.226 ms | **2.089 ms** | **-6.2%** |
+| Max RSS | 55.9 MiB | 61.9 MiB | +10.7% |
+
+All six samples were valid with zero shed, incomplete requests, or task
+failures. Higher RSS reflects nearly twice as much completed traffic and more
+in-flight payload; this workload reported no worker-channel drops, so it does
+not exercise the overload-only buffer-recycle path.
+
+## ✅ 2026-08-14: goroutine raw-KCP closed-loop UDP full-duplex fix
+
+Workload: `latency_p99`, 8 request workers, concurrency 32, 26,624-byte
+payload, 2s warmup + 10s measurement on macOS loopback.
+
+Before the change, `sample` attributed 1,191 of the input loop's 2,529 samples
+to `cthread_yield`/`swtch_pri`: goroutine UDP send and receive shared the same
+`SpinMutex<mio::UdpSocket>`. The goroutine kio constructor also bypassed the
+shared socket2 setup, so it used the OS-default buffers and only emulated UDP
+`connect` in user space. SNMP showed zero retransmits, ruling out KCP loss/ACK
+inflation as the throughput gap.
+
+Changes:
+
+- duplicate the UDP kernel handle for sends, allowing send and receive to run
+  concurrently while the mio handle remains reactor-owned;
+- construct goroutine kio UDP sockets through the same 4 MB-buffered,
+  SO_REUSEADDR, kernel-connected `raw_udp` path as tokio and smol.
+
+Release closed-loop results:
+
+| Metric | Before (2 runs) | After (3 runs) | Change |
+|--------|-----------------|----------------|--------|
+| Throughput | mean 2,477 req/s (2,464–2,530) | mean **3,879 req/s** (3,777–3,948) | **+56.6%** |
+| P99 | 18.11 ms representative | 12.12–12.71 ms | about **-32%** |
+
+Relative to the original common-matrix goroutine result (2,424 req/s), the
+new three-run mean is +60.0%. The subsequent full 14-stage matrix reproduced
+the gain at 3,843 req/s (+58.5% versus 2,424; +21.7% versus Go). Fixed-rate
+500 req/s P99 remained stable (median 586 us across three focused runs; 618 us
+in the full matrix). A post-change profile no longer contains the socket-lock
+yield hotspot; dominant frames are `sendto`, `recvfrom`, `kevent`, and semaphore
+wait. No actionable scheduler/runtime leaf remains at >=5%.
+
+## ✅ 2026-08-14: goroutine Go-style lazy M lifecycle
+
+`GORUNTIME_WORKER_THREADS=4 ... profile_rust_go_pprof.sh client 10`
+(`rust-client-aes-20260814-060704.pb`, 600MB AES/nocomp):
+
+| Frame | Flat | Interpretation |
+|-------|------|----------------|
+| UDP `recv_from` | 21.92% | macOS UDP receive syscall |
+| goroutine UDP `send_to` | 20.88% | per-datagram send path |
+| reactor `poll_once` | 11.76% | per-P mio polling |
+| UDP socket `SpinMutex::lock` | 7.62% | shared socket serialization |
+| reactor wake | 7.15% | owner-P I/O wakeup |
+| `WorkSignal::notify_one` | 0.77% | M park/unpark signal |
+
+`wakep`/idle-P selection/worker creation do not appear as actionable leaves.
+The fixed-P, lazy-M lifecycle therefore adds no ≥5% scheduler hotspot; the
+remaining actionable scheduler-adjacent costs are existing per-packet reactor
+wake and UDP socket locking. Throughput during capture was 57.66 MB/s.
+
 ## ✅ 2026-08-05: kcp-rs 尾延迟优化后重新验证（当前 master，commits ae765aa7…4287a9bf）
 
 `CRYPT=null bash bench/profile_rust_go_pprof.sh server 20`（`rust-server-null-20260805-233001.pb`）：
@@ -241,3 +329,46 @@ These are secondary; P0+P1 already moved most scenarios past Go.
 6. **No actionable ≥~5% leaf** → stop coding; document here.
 
 Hard rules: wire compatibility; no congestion cheats; one class per change; shared `encrypt_batch`.
+
+## Goroutine closed-loop saturation (2026-08-14)
+
+Profiled with identical `workers=8`, `concurrency=32`, `payload=26624` on macOS.
+The dominant active frames in both runtimes are UDP syscalls and KCP; goroutine
+also paid for fresh-work stealing after every owner-affine I/O completion.
+
+Changes retained after A/B gates:
+
+- Share one fresh task per four spawns before a stackful G becomes P-affine.
+- P/M lifecycle remains lazy, while the configured P ceiling defaults to the
+  physical CPU count.
+- A P that already owns a reactor returns to I/O polling instead of scanning
+  every other P's fresh queue; non-I/O searching Ms still steal normally.
+- Connected UDP uses `recv`/`send` directly and a duplicated data-plane handle,
+  avoiding peer-address materialization and the reactor registration lock.
+- Canceled per-P timeout entries are pruned lazily; UDP readiness no longer
+  creates a redundant 10ms fallback timer on every drained burst.
+
+Rejected by measurement:
+
+- Darwin `sendmsg_x`: ABI/round-trip tests passed, but typical KCP flush batches
+  were too small and metadata setup erased the syscall saving.
+- Unconditional round-robin placement of all fresh Gs: violated reactor/fd
+  affinity and hung the closed-loop test.
+- Suppressing same-P waker notifications: correct in smoke tests but no stable
+  throughput improvement.
+- Directly migrating a suspended corosensei fiber after `WAITING → RUNNABLE`:
+  a minimal cross-thread resume test passed, but the release 64-connection I/O
+  benchmark crashed with `SIGSEGV` (exit 139). corosensei requires every value
+  retained on the suspended stack to be `Send`; the runtime's internal parking
+  path retains a `Yielder` reference, so a `Future: Send` bound alone is not a
+  sufficient proof. The experiment was fully reverted.
+
+Final full `run_p99.sh` result (`workers=8`, `concurrency=32`, 10s): goroutine
+4529 req/s versus Tokio 4838 (-6.4%), Smol 4475, and Go 3105. At fixed 500 RPS,
+goroutine P99 was 0.561ms versus Tokio 1.149ms and Go 0.708ms. At concurrency
+64, owner-pinned stackful Gs degrade materially (3699 req/s, P999 82.98ms).
+A later rollback-control run at the same 8-P / 64-connection shape completed at
+3807 req/s with P99/P999 of 23.65/25.24ms; it is a single short sample, not an
+accepted regression or gain. The next architectural gate for a pure stackful
+M:N design is a context backend whose suspended state and scheduler hand-off
+are explicitly cross-M safe; do not migrate the current corosensei fibers.

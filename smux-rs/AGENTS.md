@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-08-03 (legacy constructors deprecated; thiserror errors) -->
+<!-- Generated: 2026-07-22 | Updated: 2026-08-16 (tokio-only refactor) -->
 
 # smux-rs
 
@@ -11,8 +11,7 @@ SMUX stream multiplexer over a single async transport (typically KCP+Snappy). Ru
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Features `tokio` (default) / `smol` via `kio-rs`; deps `bytes`, `log`, `parking_lot` |
-| `build.rs` | Runtime feature glue if present |
+| `Cargo.toml` | Deps `knet-rs` (tokio), `bytes`, `log`, `parking_lot` |
 | `src/lib.rs` | Public re-exports: `Session`, `Stream`, `Frame`, `Config`, `SmuxConn`, `SmuxConnBuilder`, … |
 | `src/frame.rs` | 8B header codec; `Cmd`, `Frame`, `FrameCodec`; `FRAME_HEADER_SIZE=8`, `MAX_FRAME_SIZE` |
 | `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive, SYN queue |
@@ -30,30 +29,29 @@ None (flat `src/`).
 - `open_stream()` / `accept()` return `Arc<Stream>` which implements `AsyncRead`+`AsyncWrite` directly (no required `SmuxIo` wrapper).
 - Stream writes wake the driver via **`flush_notify`** set by SmuxConn; do not reintroduce KCP-specific `with_backpressure`.
 - Deprecated `client`/`server` remain as thin sync wrappers for older call sites.
-- Production kcptun binaries still drive **`Session` low-level** with custom flush loops; SmuxConn is library-ready for TCP or `KcpConn`-as-transport.
+- Production kcptun binaries still drive **`Session` low-level** with custom flush loops; SmuxConn is library-ready for TCP or `KcpStream`-as-transport.
 
 ## For AI Agents
 
 ### Working In This Directory
 
 - Frame layout: `ver(1)|cmd(1)|length(2 LE)|stream_id(4 LE)` + payload.
-- Features must match the binary: `tokio` XOR `smol` through `kio-rs`.
 - Session owns stream map and read loop; streams are half-close aware.
 - Keepalive via periodic ping frames — do not break idle timeout semantics expected by binaries.
 - Compression is **not** in this crate; binaries wrap transport with Snappy before/after SMUX.
-- **Do not restore `with_backpressure`.** KCP backpressure belongs on the transport / KcpConn layer, not SmuxIo.
+- **Do not restore `with_backpressure`.** KCP backpressure belongs on the transport / KcpStream layer, not SmuxIo.
 - **R4 lock model (`Stream`):** `recv: Mutex<RecvInner>` (state + recv queue + read_waker + local_closed_at) and `send: Mutex<SendInner>` (send queue + write_waker). If both locks are needed: **recv then send**. Take wakers under lock, **wake after release**. No legacy contiguous `recv_buf`; only `VecDeque<Bytes>`. Peer window / half-close flags stay atomic.
 
 ### Testing Requirements
 
-- `cargo test -p smux-rs --features tokio`
+- `cargo test -p smux-rs`
 - Interop: `bash test_e2e.sh` with smuxver matrix after frame/session changes
 - Stress: `make stress` exercises many concurrent streams
 
 ### Common Patterns
 
 ```rust
-// High-level Builder (recommended for standalone use; aligns with KcpConn):
+// High-level Builder (recommended for standalone use; aligns with KcpStream):
 use smux_rs::{SmuxConn, Config, DEFAULT_CONFIG};
 let conn = SmuxConn::connect(tcp)
     .version(2)
@@ -76,7 +74,7 @@ let session = Session::new_client(&Config { version: 2, ..DEFAULT_CONFIG.clone()
 
 ### Internal
 
-- `kio-rs` — AsyncRead/AsyncWrite, runtime features
+- `knet-rs` — AsyncRead/AsyncWrite, tokio runtime
 
 ### External
 

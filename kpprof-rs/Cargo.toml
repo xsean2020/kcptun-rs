@@ -8,13 +8,7 @@ description = "Go-compatible pprof HTTP server for kcptun-rs"
 name = "kpprof"
 
 [dependencies]
-kio-rs = { path = "../kio-rs", default-features = false }
-# Base pprof (all arches). Do NOT put `frame-pointer` here: that feature calls
-# `Profiler::is_blocklisted` unconditionally, but the method is only defined on
-# x86_64/aarch64/riscv64/loongarch64 — enabling it breaks armv7 cross-builds
-# (RT_PKGS always builds kpprof-rs). Host profiling still forces frame pointers
-# via RUSTFLAGS="-C force-frame-pointers=yes" on supported arches.
-pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"] }
+knet-rs = { path = "../knet-rs", default-features = false }
 backtrace = "0.3"
 log = "0.4"
 anyhow = "1"
@@ -22,9 +16,21 @@ mimalloc = { version = "0.1", default-features = false }
 parking_lot = "0.12"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# pprof-rs relies on POSIX signals (SIGPROF/SIGALRM) + setitimer(2) and pulls in
+# `nix`/`libc`/`findshlibs`, which do not compile on Windows. Gate the entire
+# crate to Unix-only targets. On non-Unix platforms, the HTTP server still runs
+# but CPU/heap profile endpoints return a "not supported" stub.
+[target.'cfg(unix)'.dependencies]
+# Base pprof (all arches). Do NOT put `frame-pointer` here: that feature calls
+# `Profiler::is_blocklisted` unconditionally, but the method is only defined on
+# x86_64/aarch64/riscv64/loongarch64 — enabling it breaks armv7 cross-builds
+# (RT_PKGS always builds kpprof-rs). Host profiling still forces frame pointers
+# via RUSTFLAGS="-C force-frame-pointers=yes" on supported arches.
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"] }
+
 # Enable frame-pointer only where pprof implements is_blocklisted. Cargo feature
 # unification merges this with the base dep above on those arches.
-[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))'.dependencies]
+[target.'cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))'.dependencies]
 pprof = { version = "0.15", default-features = false, features = ["frame-pointer"] }
 
 [features]
@@ -32,5 +38,4 @@ default = ["tokio"]
 # Deadlock detection (enables parking_lot deadlock_detection — has overhead)
 deadlock = ["parking_lot/deadlock_detection"]
 # Runtime pass-through (parent crate selects one)
-tokio = ["kio-rs/tokio"]
-smol = ["kio-rs/smol"]
+tokio = []

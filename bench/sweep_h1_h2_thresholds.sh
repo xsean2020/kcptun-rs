@@ -15,19 +15,16 @@ KEY="${KEY:-bench-key}"
 MODE="${MODE:-fast2}"
 SKIP_REBUILD="${SKIP_REBUILD:-0}"
 
-SMOL_S="$ROOT/target/smol-release/release/kcptun-server"
-SMOL_C="$ROOT/target/smol-release/release/kcptun-client"
 TOKIO_S="$ROOT/target/release/kcptun-server"
 TOKIO_C="$ROOT/target/release/kcptun-client"
 
 log() { echo "$*" | tee -a "$OUT/notes.md"; }
 
 if [ "$SKIP_REBUILD" != "1" ]; then
-  log "## rebuild release + smol"
+  log "## rebuild release"
   make release 2>&1 | tee "$OUT/build-tokio.log" | tail -3
-  make release-smol 2>&1 | tee "$OUT/build-smol.log" | tail -3
 fi
-for b in "$SMOL_S" "$SMOL_C" "$TOKIO_S" "$TOKIO_C"; do
+for b in "$TOKIO_S" "$TOKIO_C"; do
   [ -x "$b" ] || { log "missing $b"; exit 1; }
   log "bin $(ls -la "$b" | awk '{print $5,$6,$7,$8,$9}')"
 done
@@ -136,40 +133,31 @@ run_cfg() {
 
 echo "series,median_MBps,env" >"$OUT/medians.csv"
 
-log "## H2 baseline + compress threshold sweep (smol xor COMP)"
+log "## H2 baseline + compress threshold sweep (tokio xor COMP)"
 # baseline default (no env)
-run_cfg "smol-xor-comp-baseline" "$SMOL_S" "$SMOL_C" xor 0
-run_cfg "smol-xor-comp-16k" "$SMOL_S" "$SMOL_C" xor 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=16384
-run_cfg "smol-xor-comp-32k" "$SMOL_S" "$SMOL_C" xor 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=32768
-run_cfg "smol-xor-comp-48k" "$SMOL_S" "$SMOL_C" xor 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=49152
-# control: null comp should not regress badly at 16k
-run_cfg "smol-null-comp-baseline" "$SMOL_S" "$SMOL_C" null 0
-run_cfg "smol-null-comp-16k" "$SMOL_S" "$SMOL_C" null 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=16384
-# xor no-comp control
-run_cfg "smol-xor-nocomp-baseline" "$SMOL_S" "$SMOL_C" xor 1
-
-log "## H2 tokio xor comp (baseline vs 16k)"
 run_cfg "tokio-xor-comp-baseline" "$TOKIO_S" "$TOKIO_C" xor 0
 run_cfg "tokio-xor-comp-16k" "$TOKIO_S" "$TOKIO_C" xor 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=16384
+run_cfg "tokio-xor-comp-32k" "$TOKIO_S" "$TOKIO_C" xor 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=32768
+run_cfg "tokio-xor-comp-48k" "$TOKIO_S" "$TOKIO_C" xor 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=49152
+# control: null comp should not regress badly at 16k
+run_cfg "tokio-null-comp-baseline" "$TOKIO_S" "$TOKIO_C" null 0
+run_cfg "tokio-null-comp-16k" "$TOKIO_S" "$TOKIO_C" null 0 KCPTUN_COMPRESS_CPU_BLOCK_BYTES=16384
+# xor no-comp control
+run_cfg "tokio-xor-nocomp-baseline" "$TOKIO_S" "$TOKIO_C" xor 1
 
-log "## H1 smol xtea/cast5 no-comp heavy8 threshold sweep"
-run_cfg "smol-xtea-nocomp-h8-1-512" "$SMOL_S" "$SMOL_C" xtea 1
-run_cfg "smol-xtea-nocomp-h8-4-4096" "$SMOL_S" "$SMOL_C" xtea 1 \
+log "## H1 tokio xtea/cast5 no-comp heavy8 threshold sweep"
+run_cfg "tokio-xtea-nocomp-h8-1-512" "$TOKIO_S" "$TOKIO_C" xtea 1
+run_cfg "tokio-xtea-nocomp-h8-4-4096" "$TOKIO_S" "$TOKIO_C" xtea 1 \
   KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS=4 KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES=4096
-run_cfg "smol-xtea-nocomp-h8-8-8192" "$SMOL_S" "$SMOL_C" xtea 1 \
+run_cfg "tokio-xtea-nocomp-h8-8-8192" "$TOKIO_S" "$TOKIO_C" xtea 1 \
   KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS=8 KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES=8192
-run_cfg "smol-xtea-nocomp-h8-16-16384" "$SMOL_S" "$SMOL_C" xtea 1 \
+run_cfg "tokio-xtea-nocomp-h8-16-16384" "$TOKIO_S" "$TOKIO_C" xtea 1 \
   KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS=16 KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES=16384
 
-run_cfg "smol-cast5-nocomp-h8-1-512" "$SMOL_S" "$SMOL_C" cast5 1
-run_cfg "smol-cast5-nocomp-h8-4-4096" "$SMOL_S" "$SMOL_C" cast5 1 \
+run_cfg "tokio-cast5-nocomp-h8-1-512" "$TOKIO_S" "$TOKIO_C" cast5 1
+run_cfg "tokio-cast5-nocomp-h8-4-4096" "$TOKIO_S" "$TOKIO_C" cast5 1 \
   KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS=4 KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES=4096
-run_cfg "smol-cast5-nocomp-h8-8-8192" "$SMOL_S" "$SMOL_C" cast5 1 \
-  KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS=8 KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES=8192
-
-log "## H1 tokio xtea control (same thresholds)"
-run_cfg "tokio-xtea-nocomp-h8-1-512" "$TOKIO_S" "$TOKIO_C" xtea 1
-run_cfg "tokio-xtea-nocomp-h8-8-8192" "$TOKIO_S" "$TOKIO_C" xtea 1 \
+run_cfg "tokio-cast5-nocomp-h8-8-8192" "$TOKIO_S" "$TOKIO_C" cast5 1 \
   KCPTUN_HEAVY8_ENCRYPT_MIN_PKTS=8 KCPTUN_HEAVY8_ENCRYPT_MIN_BYTES=8192
 
 log ""

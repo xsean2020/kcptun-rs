@@ -13,9 +13,9 @@ Designed to measure P99/P999 latency through the full tunnel stack
 | Concurrent streams | 1, 10, 50, 100 | SMUX multiplexing contention |
 | Packet loss | 0%, 5%, 10% | Tunnel anti-loss value proposition |
 | Jitter | 0ms, 20ms, 50ms | Real-world network variation |
-| Runtime | tokio, smol | Dual-backend comparison |
+| Runtime | tokio | Executor scheduling and tail behavior |
 | Cipher | aes, sm4, xor, null | Crypto overhead impact |
-| Implementation | kcptun-rs (tokio), kcptun-rs (smol), Go kcptun (kcp-go v5) | Cross-language comparison |
+| Implementation | kcptun-rs (tokio), Go kcptun (kcp-go v5) | Cross-language comparison |
 
 ## Test Cases
 
@@ -186,6 +186,18 @@ Designed to measure P99/P999 latency through the full tunnel stack
 Same as TC-01, TC-02, TC-04, TC-05 but with `--no-default-features --features smol`.
 Measures the latency gap between tokio (work-stealing) and smol (lightweight) under tunnel load.
 
+### TC-11–TC-14: goroutine Runtime Variants
+
+Same as TC-01, TC-02, TC-04, TC-05 but built with
+`make release-goroutine`. These cases use the bounded-concurrency open-model
+probe, so scheduler contention is part of the measured tail. Set `PROBE=rust`
+to use the preferred standard-library worker probe. It reuses one TCP/SMUX
+stream per worker (avoiding ephemeral-port exhaustion) and reports
+worker-handoff delay separately from request RTT. For a Linux
+multi-P acceptance run, set both `CONN` and `SERVER_SHARDS` above one, e.g.
+`PROBE=rust CONN=8 SERVER_SHARDS=8 GORUNTIME_WORKER_THREADS=8 bash bench/tunnel_p99.sh TC-11`.
+The server's reuse-port shards own and register their UDP fds on their local P.
+
 ### TC-G1–TC-G3: Go kcptun Dedicated Comparison
 
 These test cases run **only Go kcptun** (no Rust comparison) to establish the Go baseline under tunnel stack conditions:
@@ -224,16 +236,17 @@ Tests should be run in this order to avoid warm-up effects carrying across runs:
 4. TC-08 (large packet, smol) — runtime comparison
 5. TC-03 (multi-stream) — contention
 6. TC-04 (5% loss) — ARQ latency
-7. TC-09 (5% loss, smol) — runtime comparison under loss
+7. TC-09 / TC-13 (5% loss, smol / goroutine) — runtime comparison under loss
 8. TC-05 (10% loss) — extreme stress
-9. TC-10 (10% loss, smol) — runtime comparison under extreme loss
-10. TC-06 (burst + 100 conn + 10% loss) — collapse test
+9. TC-10 / TC-14 (10% loss, smol / goroutine) — runtime comparison under extreme loss
+10. TC-11 / TC-12 (goroutine clean baselines) — scheduler comparison
+11. TC-06 (burst + 100 conn + 10% loss) — collapse test
 
 Each test case should be run **3 times** and the median reported. Discard outliers (>2× median).
 
 ## Prerequisites
 
-- Release binaries built: `make release` (tokio) and `make release-smol` (smol)
+- Release binaries built: `make release`, `make release-smol`, and `make release-goroutine`
 - `tc` (iproute2) installed for network impairment
 - Root/sudo access for `tc qdisc` commands
 - Loopback interface available (`lo`)
@@ -246,5 +259,15 @@ Each test case should be run **3 times** and the median reported. Discard outlie
 - Snappy compression **disabled** (`--nocomp`) for clean latency measurement; re-enable for production-representative tests
 - Crypto: AES-128-CFB (default) unless testing other ciphers
 - All measurements are **open-model** (fixed-rate sends, Coordinated Omission safe)
+- Before collecting a case, the runner requires an actual TCP → KCP/SMUX →
+  echo round trip; a listening local client socket alone is not readiness.
+- Rust probe RESULTs include `offered`, `sent`, `dropped`, and `driver_late`.
+  Compare percentiles only when `failed=0`, `dropped=0`, and probe scheduling
+  delay is reported alongside the result.
+- The probe starts RTT when the request coroutine runs, rather than when its
+  scheduler creates the task. For long connect-per-request measurements, record
+  a direct `echo_server.py` baseline on the same host: its event-loop and OS
+  scheduling pauses are a measurement floor, not tunnel latency. The RESULT
+  line reports these separately as `queue_p999_us` and `queue_max_us`.
 - Warmup: 30 seconds (excluded from metrics)
 - Measurement: 180 seconds per test case

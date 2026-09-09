@@ -2,7 +2,7 @@
 //!
 //! Historically `SmuxIo` also carried KCP send-window backpressure
 //! (`with_backpressure`). That coupling is removed: backpressure belongs on
-//! the transport (`KcpConn`), not SMUX. `SmuxIo` remains a convenience newtype
+//! the transport (`KcpStream`), not SMUX. `SmuxIo` remains a convenience newtype
 //! so standalone `SmuxConn` and call sites that already hold a flush notify
 //! can keep a small wrapper; prefer `Arc<Stream>` + `set_flush_notify` for new code.
 
@@ -15,12 +15,12 @@ use crate::stream::{poll_read_into, Stream, StreamError};
 
 /// Async I/O wrapper around an SMUX stream.
 ///
-/// Implements `kio::AsyncRead + AsyncWrite`. Writing notifies `flush_notify`
+/// Implements `knet::AsyncRead + AsyncWrite`. Writing notifies `flush_notify`
 /// so the session flush loop drains promptly.
 pub struct SmuxIo {
     stream: Arc<Stream>,
     /// Wake the flush loop immediately when new data is written.
-    flush_notify: Arc<kio::Notify>,
+    flush_notify: Arc<knet::Notify>,
 }
 
 impl SmuxIo {
@@ -31,7 +31,7 @@ impl SmuxIo {
     }
 
     /// Create a new `SmuxIo` that wakes `flush_notify` on write / shutdown.
-    pub fn new(stream: Arc<Stream>, flush_notify: Arc<kio::Notify>) -> Self {
+    pub fn new(stream: Arc<Stream>, flush_notify: Arc<knet::Notify>) -> Self {
         // Keep Stream's optional notify in sync so direct Stream async writes
         // (if any) also wake the same loop.
         stream.set_flush_notify(flush_notify.clone());
@@ -41,7 +41,7 @@ impl SmuxIo {
         }
     }
 
-    /// Shared `poll_write` logic for both tokio and smol backends.
+    /// Shared `poll_write` logic.
     #[inline]
     fn do_poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.stream.write(buf) {
@@ -63,12 +63,11 @@ impl SmuxIo {
 
 // ─── tokio AsyncRead / AsyncWrite ─────────────────────────────────────────────
 
-#[cfg(feature = "tokio")]
-impl kio::AsyncRead for SmuxIo {
+impl knet::AsyncRead for SmuxIo {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut kio::ReadBuf<'_>,
+        buf: &mut knet::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let space = buf.initialize_unfilled();
@@ -84,8 +83,7 @@ impl kio::AsyncRead for SmuxIo {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl kio::AsyncWrite for SmuxIo {
+impl knet::AsyncWrite for SmuxIo {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -102,46 +100,6 @@ impl kio::AsyncWrite for SmuxIo {
         let this = self.get_mut();
         log::debug!(
             "SmuxIo::poll_shutdown: marking stream {} local_closed",
-            this.stream.id()
-        );
-        this.stream.mark_local_closed();
-        this.flush_notify.notify_one();
-        Poll::Ready(Ok(()))
-    }
-}
-
-// ─── smol AsyncRead / AsyncWrite ──────────────────────────────────────────────
-
-#[cfg(feature = "smol")]
-impl kio::AsyncRead for SmuxIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        poll_read_into(&this.stream, cx.waker(), buf)
-    }
-}
-
-#[cfg(feature = "smol")]
-impl kio::AsyncWrite for SmuxIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.get_mut().do_poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        log::debug!(
-            "SmuxIo::poll_close: marking stream {} local_closed",
             this.stream.id()
         );
         this.stream.mark_local_closed();

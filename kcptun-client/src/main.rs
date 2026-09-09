@@ -45,5 +45,5 @@ fn rotate_log(log_path: &str, max_size: u64) {
 }
 
 fn main() -> Result<()> {
-    kio::block_on(app::async_main())
+    knet::block_on(app::async_main())
 }

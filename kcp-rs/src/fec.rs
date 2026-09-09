@@ -10,7 +10,6 @@ use reed_solomon_erasure::ReedSolomon;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::{HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// FEC header size (seqid + type = 6 bytes).
 pub const FEC_HEADER_SIZE: usize = 6;
@@ -24,11 +23,12 @@ const MAX_SHARD_SETS: u32 = 3;
 
 // ─── Utilities ───────────────────────────────────────────────────────────
 
+/// Wall-clock ms since UNIX_EPOCH — shared cached clock (`crate::kcp::wall_ms`),
+/// one `SystemTime::now()` at first use then `Instant::elapsed()` per call: no
+/// epoch-conversion syscall on the per-packet FEC encode path.
+#[inline]
 fn current_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::kcp::wall_ms() as i64
 }
 
 // ─── FEC Encoder ─────────────────────────────────────────────────────────
@@ -145,6 +145,12 @@ impl FecEncoder {
     /// Wrap a raw KCP segment: `[crypt_hdr?][fec 6][size 2][kcp]`, encode, return
     /// (data_packet, parity_packets). `header_offset` reserves crypt space (0 when
     /// crypto wraps the whole FEC frame — our session layout).
+    ///
+    /// Allocation note: `vec![0u8; n]` is `alloc_zeroed` (calloc) — the payload
+    /// region is fully overwritten below, and macOS/Linux allocators serve
+    /// calloc from pre-zeroed pages, so the full-frame zeroing is free. A/B
+    /// micro-benchmarks (examples/fec_encode_bench, since removed) showed no
+    /// win for with_capacity+resize+extend over this form; keep the calloc.
     pub fn wrap_kcp_packet(&mut self, kcp: &[u8], rto: u32) -> (Vec<u8>, Vec<Vec<u8>>) {
         let ho = self.header_offset;
         let mut pkt = vec![0u8; ho + FEC_HEADER_SIZE_PLUS_2 + kcp.len()];
@@ -173,9 +179,7 @@ impl FecEncoder {
                 self.shard_cache[i].truncate(max_sz);
             }
             // Zero-fill the buffer (required for RS encoding)
-            for b in &mut self.shard_cache[i] {
-                *b = 0;
-            }
+            self.shard_cache[i].fill(0);
         }
 
         // RS encode only payload region [payload_offset..max_sz] (matching Go)
@@ -190,6 +194,11 @@ impl FecEncoder {
             return Vec::new();
         }
 
+        // Copy each parity shard out. The `to_vec` allocates + copies once per
+        // parity packet; it cannot be avoided with `Vec<Vec<u8>>` output because
+        // `shard_cache[idx]` is recycled for the next group while the packet is
+        // still in flight (callers get ownership via `Bytes::from(Vec)` — a
+        // free move, no second copy).
         let mut result = Vec::with_capacity(self.parity_shards);
         for i in 0..self.parity_shards {
             let idx = self.data_shards + i;
@@ -505,7 +514,10 @@ impl FecDecoder {
                 return Vec::new();
             }
 
-            // Push packet (zero-copy: reference-counted slice, no to_vec alloc)
+            // Push packet. The `&[u8]` API forces one owned copy here — the
+            // burst-slot datagram buffers above are reused by the input loop
+            // and cannot be handed to the decoder. (Not zero-copy despite the
+            // buffer-reuse elsewhere.)
             shard.push(Bytes::copy_from_slice(pkt));
 
             // Try to recover when we have enough shards

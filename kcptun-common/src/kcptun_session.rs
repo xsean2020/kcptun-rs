@@ -27,23 +27,24 @@ pub struct KcptunConfig {
 /// This type owns the common KCP, Snappy, and SMUX scheduling so transport
 /// variants and binaries do not duplicate those loops.
 pub struct KcptunSession {
-    kcp: Arc<kcp_rs::KcpConn>,
+    kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
-    flush_notify: Arc<kio::Notify>,
+    flush_notify: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
-    _handles: Vec<kio::JoinHandle<()>>,
+    created_ms: u64,
+    _handles: Vec<knet::JoinHandle<()>>,
 }
 
 impl KcptunSession {
     /// Build a client session over an existing UDP or raw-TCP datagram socket.
     pub async fn connect(
-        socket: Arc<kio::DatagramSocket>,
+        socket: Arc<knet::DatagramSocket>,
         remote: std::net::SocketAddr,
         key: &[u8],
         crypt: &str,
         config: &KcptunConfig,
     ) -> Result<Self> {
-        let kcp = crate::kcp_transport::kcp_conn_with_socket(
+        let kcp = crate::kcp_transport::kcp_stream_with_socket_rate_limited(
             socket,
             remote,
             key,
@@ -51,9 +52,16 @@ impl KcptunSession {
             config.kcp.clone(),
             true,
             config.offload_profile,
+            config.rate_limit,
         )
         .await?;
-        Self::client(kcp, config)
+        Self::new(
+            kcp,
+            Arc::new(smux_rs::Session::new_client(&config.smux)?),
+            config.nocomp,
+            0,
+            true,
+        )
     }
 
     /// Build a server session over one accepted raw-TCP datagram socket.
@@ -63,61 +71,77 @@ impl KcptunSession {
     /// socket is already private to one peer, so it can directly adopt the
     /// conversation ID from its first valid packet.
     pub async fn serve_transport(
-        socket: Arc<kio::DatagramSocket>,
+        socket: Arc<knet::DatagramSocket>,
         peer: std::net::SocketAddr,
         key: &[u8],
         crypt: &str,
         config: &KcptunConfig,
     ) -> Result<Self> {
-        let kcp = crate::kcp_transport::server_kcp_conn_with_socket(
+        let kcp = crate::kcp_transport::server_kcp_stream_with_socket_rate_limited(
             socket,
             peer,
             key,
             crypt,
             config.kcp.clone(),
             config.offload_profile,
+            config.rate_limit,
         )
         .await?;
-        Self::server(kcp, config)
+        let smux = Arc::new(smux_rs::Session::new_server(&config.smux)?);
+        smux.enable_accept();
+        Self::new(kcp, smux, config.nocomp, 0, false)
     }
 
     /// Start a client-side session over an established KCP connection.
-    pub fn client(kcp: kcp_rs::KcpConn, config: &KcptunConfig) -> Result<Self> {
+    pub fn client(kcp: kcp_rs::KcpStream, config: &KcptunConfig) -> Result<Self> {
         Self::new(
             kcp,
             Arc::new(smux_rs::Session::new_client(&config.smux)?),
             config.nocomp,
             config.rate_limit,
+            true,
         )
     }
 
     /// Start a server-side session over an established KCP connection.
-    pub fn server(kcp: kcp_rs::KcpConn, config: &KcptunConfig) -> Result<Self> {
+    pub fn server(kcp: kcp_rs::KcpStream, config: &KcptunConfig) -> Result<Self> {
         let smux = Arc::new(smux_rs::Session::new_server(&config.smux)?);
         smux.enable_accept();
-        Self::new(kcp, smux, config.nocomp, config.rate_limit)
+        Self::new(kcp, smux, config.nocomp, config.rate_limit, false)
+    }
+
+    /// Start a server session whose packet transport already applies the
+    /// configured on-wire rate limit (the shared-UDP listener path).
+    pub fn server_with_limited_transport(
+        kcp: kcp_rs::KcpStream,
+        config: &KcptunConfig,
+    ) -> Result<Self> {
+        let smux = Arc::new(smux_rs::Session::new_server(&config.smux)?);
+        smux.enable_accept();
+        Self::new(kcp, smux, config.nocomp, 0, false)
     }
 
     fn new(
-        kcp: kcp_rs::KcpConn,
+        kcp: kcp_rs::KcpStream,
         smux: Arc<smux_rs::Session>,
         nocomp: bool,
         rate_limit: u32,
+        active_open: bool,
     ) -> Result<Self> {
         let kcp = Arc::new(kcp);
-        let flush_notify = Arc::new(kio::Notify::new());
+        let flush_notify = Arc::new(knet::Notify::new());
         let dead = Arc::new(AtomicBool::new(false));
         let compressor = Arc::new(Mutex::new(snap::write::FrameEncoder::new(Vec::new())));
         let limiter = Arc::new(RateLimiter::new(rate_limit));
         let handles = vec![
-            kio::spawn_task(read_loop(
+            knet::spawn_task(read_loop(
                 kcp.clone(),
                 smux.clone(),
                 flush_notify.clone(),
                 dead.clone(),
                 nocomp,
             )),
-            kio::spawn_task(write_loop(
+            knet::spawn_task(write_loop(
                 kcp.clone(),
                 smux.clone(),
                 compressor,
@@ -127,13 +151,16 @@ impl KcptunSession {
                 nocomp,
             )),
         ];
-        Ok(Self {
+        let session = Self {
             kcp,
             smux,
             flush_notify,
             dead,
+            created_ms: knet::mono_ms(),
             _handles: handles,
-        })
+        };
+        kcp_rs::DEFAULT_SNMP.session_opened(active_open);
+        Ok(session)
     }
 
     /// Open and queue a client-side SMUX stream.
@@ -168,13 +195,21 @@ impl KcptunSession {
     }
 
     /// Wake the shared SMUX writer.
-    pub fn flush_notify(&self) -> Arc<kio::Notify> {
+    pub fn flush_notify(&self) -> Arc<knet::Notify> {
         self.flush_notify.clone()
     }
 
     /// Latest KCP transport activity, using the monotonic clock.
     pub fn last_activity_ms(&self) -> u64 {
         self.kcp.last_activity_ms()
+    }
+
+    /// Monotonic timestamp in milliseconds when this session was created.
+    ///
+    /// Used by `--autoexpire` to compute an absolute expiry deadline from
+    /// creation time (matching Go kcptun), independent of keepalive activity.
+    pub fn created_ms(&self) -> u64 {
+        self.created_ms
     }
 
     /// Whether the KCP or SMUX session has failed or timed out.
@@ -195,17 +230,24 @@ impl KcptunSession {
     }
 }
 
+impl Drop for KcptunSession {
+    fn drop(&mut self) {
+        self.close();
+        kcp_rs::DEFAULT_SNMP.session_closed();
+    }
+}
+
 async fn read_loop(
-    kcp: Arc<kcp_rs::KcpConn>,
+    kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
-    flush: Arc<kio::Notify>,
+    flush: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     nocomp: bool,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut decoder = (!nocomp).then(crate::SnappyStreamDecoder::new);
     while !dead.load(Ordering::Acquire) && !smux.is_closed() && !kcp.is_closed() {
-        let n = match kcp.read_shared(&mut buf).await {
+        let n = match kcp.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) if kcp.is_closed() => break,
@@ -237,10 +279,10 @@ async fn read_loop(
 }
 
 async fn write_loop(
-    kcp: Arc<kcp_rs::KcpConn>,
+    kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
     compressor: Arc<Mutex<snap::write::FrameEncoder<Vec<u8>>>>,
-    flush: Arc<kio::Notify>,
+    flush: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     limiter: Arc<RateLimiter>,
     nocomp: bool,
@@ -258,7 +300,7 @@ async fn write_loop(
         if flush.has_pending() {
             flush.notified().await;
         } else {
-            let _ = kio::timeout(Duration::from_millis(IDLE_WAKE_MS), flush.notified()).await;
+            let _ = knet::timeout(Duration::from_millis(IDLE_WAKE_MS), flush.notified()).await;
         }
         if health == 0 {
             health = 50;
@@ -323,20 +365,23 @@ async fn write_loop(
                 }
             };
             Some(if kcrypt_rs::should_cpu_block_compress(plain_len) {
-                kio::cpu_block(encode).await
+                knet::cpu_block(encode).await
             } else {
                 encode()
             })
         };
         if let Some(packet) = packet.filter(|p| !p.is_empty()) {
+            // Compatibility fallback for callers that provide a pre-built
+            // KcpStream. Production client/server transports rate-limit the
+            // encrypted/FEC batch below KCP and pass a disabled limiter here.
             loop {
                 let wait = limiter.acquire(packet.len());
                 if wait.is_zero() {
                     break;
                 }
-                kio::sleep(wait).await;
+                knet::sleep(wait).await;
             }
-            if kcp.write_all_shared(&packet).await.is_err() {
+            if kcp.write_all(&packet).await.is_err() {
                 break;
             }
             smux.mark_fins_sent(&fin_ids);
@@ -346,7 +391,7 @@ async fn write_loop(
             // notify permit for the next iteration instead of imposing the
             // idle 2ms poll delay between chunks (a 128 KiB TCP write commonly
             // needs two iterations). Backpressure remains bounded by
-            // `write_all_shared`, which waits when the KCP window is full.
+            // `write_all`, which waits when the KCP window is full.
             if smux
                 .streams()
                 .lock()
@@ -365,22 +410,22 @@ async fn write_loop(
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
-    use kio::{AsyncReadExt, AsyncWriteExt};
+    use knet::{AsyncReadExt, AsyncWriteExt};
     use std::net::SocketAddr;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_client_server_session_roundtrip() {
-        let a = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let a = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let b = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a.local_addr().unwrap();
         let addr_b = b.local_addr().unwrap();
         drop(a);
         drop(b);
-        let socket_a = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_a, addr_b).unwrap(),
+        let socket_a = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
         ));
-        let socket_b = Arc::new(kio::DatagramSocket::Udp(
-            kio::UdpSocket::connect(addr_b, addr_a).unwrap(),
+        let socket_b = Arc::new(knet::DatagramSocket::Udp(
+            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
         ));
         let config = kcp_rs::KcpConfig {
             conv: 0x51_55_58,
@@ -412,7 +457,7 @@ mod tests {
 
         let server_task = {
             let server = server.clone();
-            kio::spawn_task(async move {
+            knet::spawn_task(async move {
                 let stream = server.accept().await.unwrap();
                 let mut stream = smux_rs::SmuxIo::new(stream, server.flush_notify());
                 let mut input = [0u8; 14];
@@ -425,7 +470,7 @@ mod tests {
         let mut stream = smux_rs::SmuxIo::new(stream, client.flush_notify());
         stream.write_all(b"common-session").await.unwrap();
         let mut output = [0u8; 12];
-        kio::timeout(Duration::from_secs(5), stream.read_exact(&mut output))
+        knet::timeout(Duration::from_secs(5), stream.read_exact(&mut output))
             .await
             .unwrap()
             .unwrap();
@@ -433,5 +478,256 @@ mod tests {
         server_task.await.unwrap();
         client.close();
         server.close();
+    }
+}
+
+/// Goroutine-specific latency regression for the complete KCP + SMUX session
+/// path. It deliberately opens a fresh SMUX stream per message, mirroring the
+/// proxy's TCP-accept path while excluding the outer TCP sockets. If this path
+/// regresses to the writer loop's 10ms idle wake, the assertion catches it
+/// before a full tunnel benchmark does.
+#[cfg(test)]
+mod goroutine_tests {
+    use super::*;
+    use knet::{AsyncReadExt, AsyncWriteExt};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn fresh_stream_echoes_do_not_wait_for_idle_flush_tick() {
+        const ROUNDS: usize = 32;
+        knet::block_on(async {
+            let a = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let b = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let addr_a = a.local_addr().unwrap();
+            let addr_b = b.local_addr().unwrap();
+            drop(a);
+            drop(b);
+            let socket_a = Arc::new(knet::DatagramSocket::Udp(
+                knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
+            ));
+            let socket_b = Arc::new(knet::DatagramSocket::Udp(
+                knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
+            ));
+            let session_config = KcptunConfig {
+                kcp: kcp_rs::KcpConfig {
+                    conv: 0x51_55_58,
+                    mode: kcp_rs::KcpMode::Fast3,
+                    datashard: 0,
+                    parityshard: 0,
+                    ..Default::default()
+                },
+                smux: smux_rs::Config {
+                    keepalive_interval: 0,
+                    keepalive_timeout: 0,
+                    ..smux_rs::DEFAULT_CONFIG.clone()
+                },
+                nocomp: true,
+                rate_limit: 0,
+                offload_profile: OffloadProfile::Tokio,
+            };
+            let key = b"0123456789abcdef0123456789abcdef";
+            let client = KcptunSession::connect(socket_a, addr_b, key, "null", &session_config)
+                .await
+                .unwrap();
+            let server = Arc::new(
+                KcptunSession::serve_transport(socket_b, addr_a, key, "null", &session_config)
+                    .await
+                    .unwrap(),
+            );
+            let server_task = {
+                let server = server.clone();
+                knet::spawn_task(async move {
+                    for _ in 0..ROUNDS {
+                        let stream = server.accept().await.unwrap();
+                        let mut stream = smux_rs::SmuxIo::new(stream, server.flush_notify());
+                        let mut byte = [0u8; 1];
+                        stream.read_exact(&mut byte).await.unwrap();
+                        stream.write_all(&byte).await.unwrap();
+                    }
+                })
+            };
+
+            let mut worst = Duration::ZERO;
+            let mut samples: Vec<Duration> = Vec::with_capacity(ROUNDS);
+            for value in 0..ROUNDS as u8 {
+                let started = std::time::Instant::now();
+                let stream = client.open_stream().unwrap();
+                let mut stream = smux_rs::SmuxIo::new(stream, client.flush_notify());
+                stream.write_all(&[value]).await.unwrap();
+                let mut echoed = [0u8; 1];
+                // Bounded read: an unbounded read_exact turned any lost-wake /
+                // starvation bug into a >60 s test hang instead of a fast panic.
+                knet::timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
+                    .await
+                    .expect("echo read timed out (stream write stalled)")
+                    .unwrap();
+                assert_eq!(echoed, [value]);
+                samples.push(started.elapsed());
+                worst = worst.max(started.elapsed());
+            }
+            server_task.await.unwrap();
+            client.close();
+            server.close();
+            // Regression guard for "writer waits for the idle flush tick":
+            // the MEDIAN must stay in the sub-millisecond notify path. The
+            // worst case on a loaded desktop can absorb one 10 ms idle tick
+            // through scheduler jitter alone (IDLE_WAKE_MS), so a hard worst
+            // bound only guards gross stalls, not the tick itself.
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            assert!(
+                median < Duration::from_millis(5),
+                "fresh stream echo median waited for idle flush tick: {median:?} (worst {worst:?})"
+            );
+            assert!(
+                worst < Duration::from_millis(50),
+                "fresh stream echo worst-case stall: {worst:?}"
+            );
+        });
+    }
+
+    /// Exercise the production forwarding shape end to end: a fresh local TCP
+    /// connection is piped to a fresh SMUX stream, the server side opens a
+    /// fresh target TCP connection and pipes it back to a TCP echo listener.
+    /// The lighter stream-only test above cannot catch a wake lost between the
+    /// two `copy_bidirectional` state machines.
+    #[test]
+    fn tcp_smux_tcp_proxy_does_not_wait_for_idle_ticks() {
+        const ROUNDS: usize = 16;
+        knet::block_on(async {
+            let a = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let b = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let addr_a = a.local_addr().unwrap();
+            let addr_b = b.local_addr().unwrap();
+            drop(a);
+            drop(b);
+            let socket_a = Arc::new(knet::DatagramSocket::Udp(
+                knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
+            ));
+            let socket_b = Arc::new(knet::DatagramSocket::Udp(
+                knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
+            ));
+            let session_config = KcptunConfig {
+                kcp: kcp_rs::KcpConfig {
+                    conv: 0x51_55_58,
+                    mode: kcp_rs::KcpMode::Fast3,
+                    datashard: 0,
+                    parityshard: 0,
+                    ..Default::default()
+                },
+                smux: smux_rs::Config {
+                    keepalive_interval: 0,
+                    keepalive_timeout: 0,
+                    ..smux_rs::DEFAULT_CONFIG.clone()
+                },
+                nocomp: true,
+                rate_limit: 0,
+                offload_profile: OffloadProfile::Tokio,
+            };
+            let key = b"0123456789abcdef0123456789abcdef";
+            let client = Arc::new(
+                KcptunSession::connect(socket_a, addr_b, key, "null", &session_config)
+                    .await
+                    .unwrap(),
+            );
+            let server = Arc::new(
+                KcptunSession::serve_transport(socket_b, addr_a, key, "null", &session_config)
+                    .await
+                    .unwrap(),
+            );
+
+            let target_listener = knet::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let target_addr = target_listener.local_addr().unwrap();
+            let target_task = knet::spawn_task(async move {
+                let mut handlers = Vec::with_capacity(ROUNDS);
+                for _ in 0..ROUNDS {
+                    let (mut target, _) = target_listener.accept().await.unwrap();
+                    handlers.push(knet::spawn_task(async move {
+                        let mut byte = [0u8; 1];
+                        target.read_exact(&mut byte).await.unwrap();
+                        target.write_all(&byte).await.unwrap();
+                    }));
+                }
+                for handler in handlers {
+                    handler.await.unwrap();
+                }
+            });
+
+            let server_task = {
+                let server = server.clone();
+                knet::spawn_task(async move {
+                    let mut handlers = Vec::with_capacity(ROUNDS);
+                    for _ in 0..ROUNDS {
+                        let stream = server.accept().await.unwrap();
+                        let notify = server.flush_notify();
+                        handlers.push(knet::spawn_task(async move {
+                            let mut target = knet::TcpStream::connect(target_addr.to_string())
+                                .await
+                                .unwrap();
+                            let mut smux = smux_rs::SmuxIo::new(stream, notify);
+                            crate::pipe(&mut target, &mut smux, 0).await.unwrap();
+                        }));
+                    }
+                    for handler in handlers {
+                        handler.await.unwrap();
+                    }
+                })
+            };
+
+            let local_listener = knet::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let local_addr = local_listener.local_addr().unwrap();
+            let client_task = {
+                let client = client.clone();
+                knet::spawn_task(async move {
+                    let mut handlers = Vec::with_capacity(ROUNDS);
+                    for _ in 0..ROUNDS {
+                        let (mut local, _) = local_listener.accept().await.unwrap();
+                        let stream = client.open_stream().unwrap();
+                        let notify = client.flush_notify();
+                        handlers.push(knet::spawn_task(async move {
+                            let mut smux = smux_rs::SmuxIo::new(stream, notify);
+                            crate::pipe(&mut local, &mut smux, 0).await.unwrap();
+                        }));
+                    }
+                    for handler in handlers {
+                        handler.await.unwrap();
+                    }
+                })
+            };
+
+            let mut worst = Duration::ZERO;
+            let mut samples: Vec<Duration> = Vec::with_capacity(ROUNDS);
+            for value in 0..ROUNDS as u8 {
+                let started = std::time::Instant::now();
+                let mut local = knet::TcpStream::connect(local_addr.to_string())
+                    .await
+                    .unwrap();
+                local.write_all(&[value]).await.unwrap();
+                let mut echoed = [0u8; 1];
+                local.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(echoed, [value]);
+                samples.push(started.elapsed());
+                worst = worst.max(started.elapsed());
+            }
+            client_task.await.unwrap();
+            server_task.await.unwrap();
+            target_task.await.unwrap();
+            client.close();
+            server.close();
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            assert!(
+                median < Duration::from_millis(5),
+                "full TCP/SMUX/TCP forwarding median waited for an idle tick: {median:?} (worst {worst:?})"
+            );
+            assert!(
+                worst < Duration::from_millis(50),
+                "full TCP/SMUX/TCP forwarding worst-case stall: {worst:?}"
+            );
+        });
     }
 }

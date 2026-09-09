@@ -17,7 +17,9 @@
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -38,6 +40,8 @@ thread_local! {
 }
 
 use parking_lot::Mutex;
+
+#[cfg(unix)]
 use pprof::protos::{self as protos, Message};
 
 // ─── Global sampling state ───────────────────────────────────────────────────
@@ -86,6 +90,7 @@ struct AllocSample {
     /// Raw stack addresses captured at sample time via `backtrace::trace()`.
     /// Symbolization is deferred to `build_profile()` to avoid `addr2line`
     /// `OnceCell` reentrant init panics in the allocator hot path.
+    #[cfg(unix)]
     addresses: Vec<usize>,
     /// Total bytes allocated at this stack.
     alloc_bytes: u64,
@@ -98,6 +103,7 @@ struct AllocSample {
 
 /// Structured frame info for Go pprof compatibility (filename + line).
 /// Resolved from raw addresses during `build_profile()`.
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 struct Frame {
     name: String,
@@ -109,6 +115,7 @@ struct Frame {
 /// Global sample map: stack_hash → sample.
 static SAMPLES: Mutex<Option<HashMap<u64, AllocSample>>> = Mutex::new(None);
 
+#[cfg(unix)]
 fn ensure_samples() -> HashMap<u64, AllocSample> {
     let mut guard = SAMPLES.lock();
     if guard.is_none() {
@@ -178,6 +185,7 @@ fn record_sample(is_alloc: bool, size: usize) {
     }
     let map = guard.as_mut().unwrap();
     let sample = map.entry(hash).or_insert_with(|| AllocSample {
+        #[cfg(unix)]
         addresses: addr_slice.to_vec(),
         alloc_bytes: 0,
         alloc_count: 0,
@@ -260,6 +268,7 @@ unsafe impl GlobalAlloc for ProfilingAllocator {
 ///
 /// This is called during `build_profile()`, NOT during `record_sample()`, to
 /// avoid `addr2line` `OnceCell` reentrant init panics in the allocator path.
+#[cfg(unix)]
 fn resolve_address(addr: usize) -> Frame {
     let mut name = "<unknown>".to_string();
     let mut filename = String::new();
@@ -289,6 +298,7 @@ fn resolve_address(addr: usize) -> Frame {
 ///
 /// These frames are captured by `backtrace::trace()` inside `record_sample()`
 /// and must be stripped so that the leaf frame is the actual allocation site.
+#[cfg(unix)]
 fn is_profiling_frame(name: &str) -> bool {
     // Match on substrings that cover both debug and release (mangled) names.
     // `record_sample` — the sampling function itself
@@ -308,6 +318,7 @@ fn is_profiling_frame(name: &str) -> bool {
 /// first few frames are always `record_sample` → `ProfilingAllocator::alloc`
 /// → … They must be stripped so `go tool pprof` attributes `flat` to the real
 /// caller, not to the profiler.
+#[cfg(unix)]
 fn skip_profiling_frames(frames: Vec<Frame>) -> Vec<Frame> {
     let mut iter = frames.into_iter();
     let mut skipped = Vec::new();
@@ -331,15 +342,31 @@ fn skip_profiling_frames(frames: Vec<Frame>) -> Vec<Frame> {
 // ─── pprof protobuf generation ───────────────────────────────────────────────
 
 /// Build a Go pprof protobuf for heap (inuse_space + alloc_space).
+#[cfg(unix)]
 pub fn build_heap_profile() -> Vec<u8> {
     build_profile(true)
 }
 
 /// Build a Go pprof protobuf for allocs (total alloc_space + alloc_objects).
+#[cfg(unix)]
 pub fn build_allocs_profile() -> Vec<u8> {
     build_profile(false)
 }
 
+/// Non-Unix stub: pprof-rs requires POSIX signals, so heap profiling is
+/// unavailable on Windows. Returns empty so the HTTP endpoint degrades
+/// gracefully.
+#[cfg(not(unix))]
+pub fn build_heap_profile() -> Vec<u8> {
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+pub fn build_allocs_profile() -> Vec<u8> {
+    Vec::new()
+}
+
+#[cfg(unix)]
 fn build_profile(heap: bool) -> Vec<u8> {
     let samples = ensure_samples();
 
@@ -569,7 +596,7 @@ fn build_profile(heap: bool) -> Vec<u8> {
     content
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod tests {
     use super::*;
     use pprof::protos::Message;

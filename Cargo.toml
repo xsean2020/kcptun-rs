@@ -4,7 +4,7 @@ members = [
     "kcrypt-rs",
     "smux-rs",
     "qpp-rs",
-    "kio-rs",
+    "knet-rs",
     "kpprof-rs",
     "kcptun-common",
     "kcptun-client",

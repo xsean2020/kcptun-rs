@@ -648,7 +648,7 @@ else:
 }
 
 # ─── QPP (Quantum Permutation Pad) 测试 ─────────────────────────────────────
-# 验证 --qpp --qppcount 在 SMUX stream 层的 obfuscation 不破坏数据完整性
+# 验证 Go 兼容的 --QPP --QPPCount 在 SMUX stream 层不破坏数据完整性
 # 参数: name  server_bin  server_args  client_bin  client_args  payload_size  timeout
 try_qpp() {
     local name="$1"
@@ -666,7 +666,7 @@ try_qpp() {
         FAIL=$((FAIL+1)); return
     fi
 
-    $server_bin -l "0.0.0.0:$S" -t "127.0.0.1:$E" --key "$KEY" --qpp --qppcount 61 $server_args 2>/dev/null &
+    $server_bin -l "0.0.0.0:$S" -t "127.0.0.1:$E" --key "$KEY" --QPP --QPPCount 61 $server_args 2>/dev/null &
     SERVER_PID=$!
     sleep 2
     if ! kill -0 $SERVER_PID 2>/dev/null; then
@@ -674,7 +674,7 @@ try_qpp() {
         cleanup; FAIL=$((FAIL+1)); return
     fi
 
-    $client_bin -l "127.0.0.1:$L" -r "127.0.0.1:$S" --key "$KEY" --qpp --qppcount 61 $client_args 2>/dev/null &
+    $client_bin -l "127.0.0.1:$L" -r "127.0.0.1:$S" --key "$KEY" --QPP --QPPCount 61 $client_args 2>/dev/null &
     CLIENT_PID=$!
     sleep 3
     if ! kill -0 $CLIENT_PID 2>/dev/null; then
@@ -1555,7 +1555,7 @@ run_suite() {
     # ═══════════════════════════════════════════════════════════════════════
     # Section 16: QPP (Quantum Permutation Pad) 数据完整性
     # ═══════════════════════════════════════════════════════════════════════
-    # --qpp 在 SMUX stream 层加一层置换混淆，验证不破坏数据完整性
+    # --QPP 在 SMUX stream 层加一层置换混淆，验证不破坏数据完整性
     # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo "${CYAN}── Section 16: QPP 量子置换混淆 ──${NC}"

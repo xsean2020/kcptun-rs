@@ -7,6 +7,257 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Refactored — `kcp-rs` conn module split: engine/facade layering (no behavior change)
+
+`kcp-rs/src/conn.rs` (3100+ lines mixing seven responsibilities) is split
+along the kernel-socket boundary; all `kcp_rs::conn::*` public paths are
+unchanged (pure code movement, verified by the full test suite and clippy):
+
+- `conn/raw_queue.rs` — `RawPacketQueue` (pending/spare wire-packet FIFO)
+  and the byte/entry-accounted read-prefetch buffer (`ReadBuffer`)
+- `conn/endpoint.rs` — the session engine: `SharedIoState` (the user-space
+  `struct sock`: transport + KCP lock + queues + notifies/wakers + windows)
+  plus the background input/flush loops and `input_with_optional_conv`
+- `conn/halves.rs` — `knet::AsyncRead`/`AsyncWrite` impls and the
+  tokio-style split halves (`ReadHalf`/`WriteHalf`/`Owned*`) with their
+  lifecycle guard
+- `conn.rs` — the `KcpStream` facade + `KcpStreamBuilder` + tests
+
+`listener.rs` (`KcpTcpListener`) is repositioned in its module docs as what
+it is structurally: a TCP **transport factory** (each accepted raw-TCP
+connection becomes one connected `KcpStream` over a `TcpRaw`
+`PacketTransport`), not a demux listener — the demux/accept listener is
+`sharded.rs`'s `KcpListener`.
+
+Gates: workspace tests 331 passed (only the pre-existing WIP
+`test_fast_retransmit_fires_on_duplicate_acks` failure), `cargo clippy
+-p kcp-rs --features async --all-targets -- -D warnings` clean, GitNexus
+`detect_changes` risk=low with zero affected processes.
+
+### Performance — table-based software AES for the CFB path (no-AES-NI hosts)
+
+`AesCfbCrypt` now selects its block-cipher backend at construction time:
+
+- Hardware AES present (AES-NI on x86_64, ARMv8 crypto on aarch64): the
+  `aes` crate, as before — the fixslice backend lowers to the hardware
+  instructions and remains the fastest path.
+- No hardware AES: a new Go-style T-table software backend
+  (`kcrypt-rs/src/crypt/aes_soft.rs`, encryption direction only — CFB-128
+  uses `E_k` for both encrypt and decrypt). CFB chains block-to-block
+  (`ksᵢ = E(ksᵢ₋₁)`), so the `aes` crate's batch-of-8 fixslice backend
+  cannot be amortized on this mode and a per-16-byte-block
+  `encrypt_block` call measured ~3× slower than tables. Go's `crypto/aes`
+  uses exactly this T-table fallback (`encryptBlockGo`) on such hosts, so
+  the table backend also restores parity with the wire-compat reference.
+
+Like Go's software fallback, T-tables are not constant-time (cache-timing
+side channel); the backend is selected only where the hardware path is
+unavailable, and the trade-off is documented in the module docs.
+
+Validation: FIPS-197 Appendix C.1/C.2/C.3 known-answer vectors; 192 random
+blocks cross-checked bit-identical against the `aes` crate for all three
+key lengths; CFB cross-backend roundtrip (crate-encrypt ↔ soft-decrypt and
+vice versa) proves the wire format is unchanged — Go interop is intact on
+both host classes.
+
+Measured on the 1-vCPU Linux VM (CentOS 7, no AES-NI/SSE4/AVX — software
+crypto on both sides), 200 MB × 3 rounds, median:
+aes-CFB Rust→Rust 4.41 → **16.0 MB/s (3.6×)**, and all four Go↔Rust paths
+now sit within Go's band (Rust→Rust 16.0 vs Go→Go 16.9; cross paths
+16.6–17.2). null-crypt regression unchanged (43.9 vs 43.8 baseline).
+Public API unchanged (`AesCfbCrypt::new` signature; kcrypt-rs is
+unpublished).
+
+### Removed — dead public API surface (GitNexus graph + compiler cross-verification)
+
+Sweep of symbols with zero call sites across the entire workspace (knowledge
+graph candidates validated textually; trait impls, dyn dispatch and same-file
+callers correctly excluded):
+
+- `kcp-rs` (published crate — **breaking**, version bumped 0.1.0 → **0.2.7**;
+  crates.io already carries up to 0.2.6):
+  - `KCP::snd_buf_len`, `KCP::rcv_queue_len`, `KCP::rx_srtt`, `KCP::rmt_wnd`,
+    `KCP::rcv_nxt` (Rust-only getters; flow-control fields remain internal)
+  - `KcpStream::set_kcp_nodelay` (4-knob form; use `KcpConfig::nodelay` +
+    `set_nodelay(bool)`) and `KcpStream::set_kcp_mtu`,
+    `KcpStream::set_kcp_stream_mode`, `KcpStream::set_kcp_acknodelay`
+  - `KcpTcpListener::accept_timeout`, `KcpTcpListener::take_error` (the
+    `KcpListener` equivalents are unaffected); removed the write-only
+    `last_error` field with them
+- `smux-rs`: `Stream::is_opened`, `Stream::bytes_read_total`,
+  `Stream::bytes_written_total`, `Session::codec`
+- `kcptun-common`: `SnappyPipe::get_ref`, `SnappyPipe::compress_enabled`
+
+Kept deliberately: test/exercise-verified API (`pending_flush_flag`,
+`snd_queue_len`, `acklist_len`, `rx_rto`, `pool`, `KcpStream::peek`,
+`set_kcp_window_size`, smux `pending_send`/`available`/`is_ready` family,
+`SnappyPipe::into_inner`) and trait-required impls.
+
+### Performance — KcpListener direct-worker topologies (Phase 1 + Phase 2)
+
+- **Phase 1 (all platforms):** the sharded worker's idle park moved from a
+  blocking crossbeam `recv_timeout` (which froze the worker's current-thread
+  tokio driver — and every flush-loop timer on the shard — for up to the park
+  timeout; pprof: `recv_deadline`+`wait_until` ≈ 7% CPU) to a tokio-aware
+  `async_channel` whose `recv().await` registers with the worker's own runtime
+  driver. The queue wait and the flush timers now share one epoll wait.
+- **Phase 2 (topology selection in `kcp-rs/src/sharded.rs`):** `KcpListener`
+  now picks its receive topology at build time:
+  - `worker_count == 1` (any platform): the sole worker drains the listener
+    socket directly inside its runtime (`recvmmsg` burst drain + `recv_from`
+    park) — no reader thread, no channel, no cross-thread hop.
+  - Linux fresh bind with N > 1 workers: one SO_REUSEPORT socket per worker
+    (`knet::UdpSocket::bind_reuseport`); the kernel's 4-tuple hash provides
+    per-flow session affinity, replacing the user-space reader + FNV routing.
+  - Shared/external sockets with N > 1 (incl. `KcpListener::from_socket`,
+    e.g. `kcptun-server` app-level shard sockets) keep the reader pipeline;
+    non-Linux fresh binds with N > 1 also fall back to it (SO_REUSEPORT does
+    not distribute UDP flows on macOS/Windows).
+- Direct workers park in `recv_from` raced against a
+  `knet::CancellationToken`, so `KcpListener::close()` wakes a parked worker
+  immediately instead of waiting for traffic (no timer polling while idle).
+- Session send path: direct workers send on their own socket (independent
+  send queues within the reuseport group); channel workers keep sharing the
+  listener socket.
+- New tests: `sharded::tests::direct_worker_echo` (end-to-end through the
+  direct event loop, 4 echo rounds) and `sharded::tests::close_wakes_direct_worker`.
+- Controlled A/B on the 1-vCPU Linux VM (sysctl `wakeup_granularity` 1ms,
+  2 interleaved rounds, `--mode self --rt single --size 512`), Phase 1 tree vs
+  Phase 1+2: open-model p99 −4~12%, closed-loop c32 throughput +4~6.6% with
+  p99 −6~8%; details in `docs/kcp-rs-optimization-2026-09-01.md` §9.
+- Analysis write-up: `docs/kcp-rs-optimization-2026-09-01.md` §9.
+
+### Performance — enable ARMv8 PMULL hardware GHASH for aes-128-gcm
+
+- `.cargo/config.toml` and `Makefile` (`profiling-bins`) now pass
+  `--cfg polyval_armv8` in addition to `aes_armv8` on aarch64. Previously only
+  AES used the ARMv8 Crypto Extensions while GHASH (GCM's polynomial multiply)
+  fell back to the `polyval` software backend, costing ~9.4% CPU and making
+  aes-128-gcm/no-comp throughput lag Go kcptun.
+- Controlled same-machine A/B (3 runs each, median): soft GHASH 82.37 MB/s →
+  hw pmull 103.08 MB/s (+25.1%), non-overlapping ranges. pprof confirms GHASH
+  9.42% → 2.78% after the fix.
+- Note: `RUSTFLAGS` env vars replace (not append) config.toml rustflags, so the
+  flag had to be added in both places or `make profile` builds silently reverted
+  to soft GHASH.
+- Analysis write-up: `docs/kcp-rs-optimization-2026-09-01.md`.
+
+### Tooling — fix `make profile` profiling pipeline
+
+- `profile` / `profile-mem` now depend on `profiling-bins`, so profiling never
+  silently falls back to stripped, frame-pointer-less release binaries.
+- `bench/profile_rust_go_pprof.sh`: added `NOCOMP=0` toggle so the Snappy
+  compression path can be profiled (previously `--nocomp` was hardcoded);
+  warn loudly when falling back to release binaries.
+- Dropped stale `SKIP_PROFILE_REBUILD` comment (the script never implemented it).
+- Note: `make profile client` is not a valid invocation — pass the side to the
+  script directly (`bash bench/profile_rust_go_pprof.sh client N`).
+
+### Performance — complete partial KCP batch sends without artificial loss
+
+- Treat `try_send_batch` / `try_send_batch_to` as a prefix-count contract in
+  both the synchronous sharded-worker path and async flush path. Partial sends
+  now continue with the exact unsent suffix while retaining the single-sender
+  token, preventing later KCP output from overtaking the batch.
+- Preserve the already-expanded FEC wire batch during async continuation so a
+  retry cannot allocate new FEC sequence numbers.
+- Recycle listener receive buffers when a sharded worker channel is full or
+  disconnected, bounding allocation churn during overload.
+- Added transport-level regression tests for ordinary and FEC partial sends.
+- In a 32-connection × 4-concurrency, 64 KiB closed-loop release benchmark,
+  three-run median throughput improved 335.3→631.8 req/s (+88.4%), P99 fell
+  2324.7→891.7 ms (-61.6%), and aggregate CPU/request fell 6.2%. Median max RSS
+  rose 55.9→61.9 MiB while completing nearly twice as much traffic.
+
+### Performance — isolate sharded KCP workers from the global Tokio runtime
+
+- Run each `KcpListener` shard on its already-dedicated OS thread with a
+  current-thread Tokio runtime. Previously, every shard performed its
+  synchronous channel park on the shared global runtime, so idle shards could
+  starve active echo and flush tasks for up to the 10ms park interval.
+- `KCPTUN_WORKER_THREADS` now selects the default `KcpListener` shard count;
+  an explicit Builder `worker_count(n)` still wins. The shared Tokio runtime
+  uses Tokio's system-derived default worker count.
+- The P99 harness now applies `KCP_BUSY_YIELDS=512` only to the standalone
+  Rust→Go request initiator. Rust↔Rust self mode and the Rust echo server use
+  the production event-driven setting because self mode cannot tune its two
+  endpoints independently.
+  At 500 RPS × 26,624 bytes in a 60s Go→Rust loopback run: P99 was 978µs,
+  P90 596µs, with no shed requests.
+
+### Performance — kcp-rs P99/P999 tail-latency regression fix (echo wakeup + worker channel drops)
+
+**Problem**: The 2026-08-19 arm64 latency report showed kcp-go→kcp-rs
+P99=52.5ms / P999=657ms / shed=1256 and kcp-rs↔kcp-rs P99=7.4ms — a severe
+regression versus the 2026-08-17 numbers. Root causes (verified via
+`--snmp --diag` + a new LISTENER channel_drops counter in the latency probe):
+the `57f6f08d` "tokio only" refactor removed the sync-echo fast path, leaving
+the echo hot path paying the tokio notify→wake→schedule→poll hop with
+`KCP_BUSY_YIELDS` left at its disabled default; and the `f00a48eb` time-budget
+requeue silently dropped datagrams via `try_send` on a full 256-slot worker
+channel (measured channel_drops=59 ≙ fast_retrans=59), whose recovery costs a
+30–200ms KCP RTO. At 500 RPS × 26624B the two compound into the known
+"single-task echo bistable collapse at RPS≥450".
+
+**Fix**:
+- `kcp-rs/src/sharded.rs`: `WORKER_CHANNEL_CAP` 256→2048 (absorbs ~170ms of
+  transient worker stall instead of ~21ms before dropping); time-budget
+  requeue now carries remaining peers in a local `deferred` vec processed at
+  the top of the next loop iteration — lossless, no channel round-trip.
+- `bench/run_p99.sh`: `KCP_BUSY_YIELDS=512` is limited to the standalone
+  Rust→Go request initiator (combo 3). Rust↔Rust self mode, the Rust echo
+  server, and closed-loop combos use the event-driven default because spinning
+  server readers measurably regresses tail latency and throughput.
+- `kcp-rs/examples/latency_p99.rs`: `--snmp` now also prints the listener's
+  channel_drops/session_drops/build_failures (diagnostic).
+
+**Original investigation results before the server-profile correction** (same
+arm64 machine, 60s runs): kcp-go→kcp-rs P99 52489→1479µs
+(36×), P999 657365→9505µs (69×), shed 1256→0; kcp-rs↔kcp-rs P99
+7441→2672µs; closed-loop throughput 8432→9022 req/s with P999 32694→20134µs.
+
+### Performance — kio-rs async connect + poll_fn copy fairness
+
+**Problem**: `TcpStream::connect` used `cpu_block` (the crypto/snappy thread
+pool) for blocking DNS resolution + TCP connect. Under connect storms to
+slow/unreachable targets, this starved crypto work. The tokio
+`copy_bidirectional` used `select!` with pre-loop `b.write(slice).await`;
+when the write was Pending (backpressure), the loop could not poll the
+other direction's read, starving reverse traffic.
+
+**Fix** (`kio-rs/src/{lib.rs,net/tokio.rs,net/smol.rs,net/mod.rs}`):
+- `TcpStream::connect`: replaced `cpu_block(|| DNS + blocking connect)` with
+  runtime-native async `TcpStream::connect()` (tokio `spawn_blocking` / smol
+  `unblock` — separate from the crypto pool). Numeric `SocketAddr` inputs
+  skip DNS entirely. Added explicit 10s connect timeout. Socket buffer
+  tuning (4 MB recv/send + `TCP_NODELAY`) moved to post-connect via
+  `socket2::SockRef`.
+- `cfg_copy_bidirectional` (tokio only): replaced `select!` + pre-loop
+  `.await` writes with `std::future::poll_fn` that polls both directions in a
+  single call. Uses single-write-per-poll (not `while` loop) to avoid
+  throughput regression while ensuring the reverse direction is polled even
+  when forward write is Pending. Matches the smol backend's pattern.
+- `raw_tcp_stream` marked `#[allow(dead_code)]` (retained for potential
+  blocking fallback paths).
+
+**Bugfix** (`kcptun-{server,client}/src/app.rs`):
+- pprof HTTP server address `:6060` → `0.0.0.0:6060` (Rust `SocketAddr`
+  requires `IP:port`; `:6060` failed to parse, making `--pprof` a no-op).
+
+**Verification** (direct A/B: `git stash` baseline vs optimized, single
+conn 8MB ABBA ×5):
+- 3des/no-comp: 17.7 → 17.3 MB/s (−2.4%, noise)
+- sm4/no-comp: 23.6 → 24.4 MB/s (+3.0%, improvement)
+- K2 bulk throughput (null): no regression
+- K3 reverse P50/P99/P999: restored to baseline after single-write optimization
+- `make gate`: 322 tests pass, clippy clean, fmt clean
+
+**pprof analysis** (null + aes cipher, 20s profiles):
+- No kio-rs leaf hotspot ≥5%. 61% CPU is macOS UDP syscalls (no sendmmsg).
+- kio `cfg_copy_bidirectional`: 0% flat, 5.71% cum (all in TCP I/O callees).
+- Remaining actionable hotspots are in kcp-rs (FEC) and kcrypt-rs (crypto),
+  not kio-rs.
+
 ### Performance — eliminate backpressure spawn_task for P999 tail latency
 
 **Root cause** (sustained-load pprof + 2-min latency probe): under backpressure
@@ -36,7 +287,7 @@ sub-millisecond path.
 ### Performance — tokio server ACK batching via batched peer-queue notify
 
 **Root cause** (`bench_rust_vs_go.py`, 4-conn concurrent bursts): the shared-UDP
-server reader (`KcpConn::spawn_listener_reader`) called `push_and_reuse()`,
+server reader (`KcpStream::spawn_listener_reader`) called `push_and_reuse()`,
 which `notify_one()`s the peer input loop **per datagram**. On tokio's
 multi-thread runtime the input loop woke eagerly mid-burst → 1-datagram bursts
 → `flush_input_batch` emitted **one ACK segment per data segment**. SNMP showed
@@ -67,7 +318,7 @@ and keeps its heavy-cipher lead (3des 1.43×, sm4 ~1.0×).
   exclusively; the prior binary-local session implementations, dispatcher,
   transport adapters, and rollback flags were removed.
 - Renamed the ambiguous common `session` module to `kcp_transport`: it only
-  builds the encrypted `KcpConn` lower layer, while `kcptun_session` owns the
+  builds the encrypted `KcpStream` lower layer, while `kcptun_session` owns the
   full Snappy + SMUX session.
 - Added `KcptunConfig` as the single complete KCP/SMUX/compression/rate-limit
   configuration passed to session and listener constructors.
@@ -75,8 +326,8 @@ and keeps its heavy-cipher lead (3des 1.43×, sm4 ~1.0×).
   modules without changing flags, defaults, or config merge precedence.
 - Added `KcptunListener`, which owns the sole receive loop for a shared server
   UDP socket, demultiplexes datagrams into per-peer transports, then applies
-  crypto before constructing independent `KcpConn` instances.
-- Server-side `KcpConn` adopts the Go client's conversation ID from the first
+  crypto before constructing independent `KcpStream` instances.
+- Server-side `KcpStream` adopts the Go client's conversation ID from the first
   valid decrypted KCP segment. SMUX window updates are emitted ahead of payload
   and FIN is deferred until queued stream/KCP data is drained, preventing large
   Go-client transfers from stalling or losing their tail.
@@ -219,7 +470,7 @@ tokio beats Go on P50 and P99 at both rates.
 - **`kio-rs`**: Added `yield_now()` to both tokio and smol backends.
 - **`latency_p99.rs`**: `run_open` rewritten as split sender/reader task design.
 - Removed unnecessary `flush().await` in `run_open` and `run_closed_loop`.
-- **`conn.rs`**: Added `Clone` for `KcpConn` (shares `Arc<KcpConnShared>`;
+- **`conn.rs`**: Added `Clone` for `KcpStream` (shares `Arc<SharedIoState>`;
   only original owns background tasks).
 
 ### Perf — SegmentPool: replace crossbeam SegQueue with Vec (eliminate per-segment atomics)
@@ -254,7 +505,7 @@ overhead (~10-20ns per segment on the hot path, ~500 segments/sec at
 Rust now beats Go by **5×** at RPS=300 on P50 and P99. At RPS=500,
 Rust completes ~420 RPS vs Go's ~150 RPS (2.8× higher throughput).
 
-### Perf — Raw KCP (`KcpConn`) latency optimization: chunked send + tighter backpressure
+### Perf — Raw KCP (`KcpStream`) latency optimization: chunked send + tighter backpressure
 
 Profiling with macOS `sample` at 256KB/RPS=500 revealed memory allocation
 (36% of CPU samples) and KCP mutex contention (15%) as the top bottlenecks,
@@ -317,7 +568,7 @@ and target (`-r localhost:… -l localhost:… -t localhost:…`) on both the
 experimental lib path and the legacy path; `parse_multi_port` hostname unit
 test; `make gate` green.
 
-### Fixed — M1-A lib KcpConn flaky tail-loss on large transfers (SMUX EOF grace)
+### Fixed — M1-A lib KcpStream flaky tail-loss on large transfers (SMUX EOF grace)
 
 Production path was unaffected (legacy inlined KCP loops are still the default);
 the fix targets the experimental `--experimental-lib-kcp` path and, transitively,
@@ -357,14 +608,14 @@ lost the tail. `cargo test --workspace` + `clippy -D warnings` green.
 ### Added — M1-A experimental library KCP stack (`--experimental-lib-kcp`, default off)
 
 - Client connections can be routed through the library stack
-  (`kcp_rs::KcpConn` + `CryptoTransport` + FEC) instead of the inlined
+  (`kcp_rs::KcpStream` + `CryptoTransport` + FEC) instead of the inlined
   UDP↔crypto↔FEC↔KCP loops, behind a `SessionHandle` trait so the accept loop /
-  scavenger dispatch to either the legacy `KcpConn` or the new `LibKcpConn`.
-- Two tasks (reader/writer) share the lib `KcpConn` via new `&self` async
+  scavenger dispatch to either the legacy `KcpStream` or the new `LibKcpStream`.
+- Two tasks (reader/writer) share the lib `KcpStream` via new `&self` async
   methods `read_shared` / `write_all_shared` — no shared Mutex, so a writer
   blocked on send-window backpressure never starves the reader (which keeps
   ACKing inbound data).
-- `KcpConn` write backpressure hardened (M0.1): `window_bytes = snd_wnd × MSS`
+- `KcpStream` write backpressure hardened (M0.1): `window_bytes = snd_wnd × MSS`
   cap on `write_buf` + partial writes + `backpressure_relieved()` wake.
 - Flag defaults off; tcpraw / multi-port fall back to the legacy path.
 
@@ -372,7 +623,7 @@ lost the tail. `cargo test --workspace` + `clippy -D warnings` green.
 
 - **`SnappyPipe<T>`** (`kcptun-common`) — Go-compatible snappy session codec as
   `AsyncRead + AsyncWrite` over any transport (compress / passthrough modes),
-  with KcpConn round-trip tests.
+  with KcpStream round-trip tests.
 - **`CryptoTransport` CPU-offload** — heavy-cipher encrypt batches now offload
   to `kio::cpu_block` (M0.2); the ACK/urgent path is forced inline so
   FEC-expanded ACK batches never take a blocking-pool hop.
@@ -809,7 +1060,7 @@ to Go peers could stall after ~256 KiB.
 
 #### P0.1–P0.2 Client encrypt parity + conditional `cpu_block`
 
-- **Client `KcpConn.crypt` / `aead`**: `Arc<Mutex<Box<dyn …>>>` → `Arc<dyn BlockCrypt>` /
+- **Client `KcpStream.crypt` / `aead`**: `Arc<Mutex<Box<dyn …>>>` → `Arc<dyn BlockCrypt>` /
   `Arc<dyn AeadCrypt>` (matches server). Encrypt/decrypt no longer take a Mutex on the hot path.
 - **Client flush encrypt**: uses `CryptoBuf::prepare_encrypt` + `thread::scope` parallel
   `crypt.encrypt` when ≥ 4 packets (same pattern as server).
@@ -941,7 +1192,7 @@ to Go peers could stall after ~256 KiB.
 #### Lock-free cipher storage
 
 - **Removed `Mutex` from `crypt` and `aead` fields** in both
-  `KcpServerSession` and `KcpConn`. `BlockCrypt::encrypt(&self)` and
+  `KcpServerSession` and `KcpStream`. `BlockCrypt::encrypt(&self)` and
   `decrypt(&self)` take `&self` — the cipher is stateless after
   construction, so `Mutex` was unnecessary contention. Changed from
   `Arc<std::sync::Mutex<Box<dyn BlockCrypt>>>` to `Arc<dyn BlockCrypt>`.

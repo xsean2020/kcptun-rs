@@ -24,31 +24,14 @@ use bytes::{BufMut, BytesMut};
 /// Maximum segment size (MTU-safe default).
 /// Matches Go kcp-go `IKCP_MTU_DEF = 1400`.
 pub const MTU: usize = 1400;
-/// Semantic alias for [`MTU`].
-pub const DEFAULT_MTU: usize = MTU;
-
 /// Overhead of the KCP header (24 bytes).
 pub const KCP_OVERHEAD: usize = 24;
-/// Semantic alias for [`KCP_OVERHEAD`].
-pub const HEADER_SIZE: usize = KCP_OVERHEAD;
-
 /// Default reliable window.
 /// Matches Go kcp-go `IKCP_WND_SND = 32` / `IKCP_WND_RCV = 32`.
 pub const KCP_DEFAULT_WND: u32 = 32;
-/// Semantic alias for [`KCP_DEFAULT_WND`].
-pub const DEFAULT_WINDOW: u32 = KCP_DEFAULT_WND;
-
-/// Maximum reliable window.
-pub const KCP_MAX_WND: u32 = 32768;
-/// Semantic alias for [`KCP_MAX_WND`].
-pub const MAX_WINDOW: u32 = KCP_MAX_WND;
-
 /// Maximum number of fragments per segment.
 /// Matches Go kcp-go limit of 255 (uint8 max).
 pub const KCP_MAX_FRAG: u32 = 255;
-/// Semantic alias for [`KCP_MAX_FRAG`].
-pub const MAX_FRAGMENTS: u32 = KCP_MAX_FRAG;
-
 /// KCP command codes.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,19 +64,10 @@ impl Command {
 /// our receive window opens up after being full.
 /// Matches the original KCP C define `IKCP_ASK_TELL = 2`.
 pub const KCP_ASK_TELL: u32 = 2;
-/// Semantic alias for [`KCP_ASK_TELL`].
-pub const ASK_TELL: u32 = KCP_ASK_TELL;
-
 /// Ask threshold for window probing.
 pub const KCP_ASK_SEND: u32 = 1;
-/// Semantic alias for [`KCP_ASK_SEND`].
-pub const ASK_SEND: u32 = KCP_ASK_SEND;
-
 /// Data segment is ready to send.
 pub const KCP_THRESHOLD_INIT: u32 = 2;
-/// Semantic alias for [`KCP_THRESHOLD_INIT`].
-pub const SSTHRESH_INIT: u32 = KCP_THRESHOLD_INIT;
-
 // ─── Segment ─────────────────────────────────────────────────────────────────
 
 /// A single KCP segment. Fields correspond directly to the wire header.
@@ -286,17 +260,6 @@ impl SegmentPool {
         }
     }
 
-    /// Preallocate segments to avoid runtime allocation spikes.
-    /// Call this during initialization for steady-state performance.
-    #[inline]
-    pub fn preallocate(&mut self, count: usize) {
-        let to_create = (self.inner.len() + count).min(self.max_capacity) - self.inner.len();
-        for _ in 0..to_create {
-            self.created += 1;
-            self.inner.push(Segment::with_capacity(MTU));
-        }
-    }
-
     /// Acquire a segment from the pool, or allocate a fresh one.
     #[inline]
     pub fn acquire(&mut self) -> Segment {
@@ -313,36 +276,6 @@ impl SegmentPool {
         // Avoid unbounded growth by dropping when at capacity.
         if self.inner.len() < self.max_capacity {
             self.inner.push(seg);
-        }
-    }
-
-    /// Batch acquire segments - reduces function call overhead when multiple
-    /// segments are needed at once (e.g., during burst processing).
-    #[inline]
-    pub fn acquire_batch(&mut self, count: usize, out: &mut Vec<Segment>) {
-        out.clear();
-        out.reserve(count);
-        for _ in 0..count {
-            out.push(self.acquire());
-        }
-    }
-
-    /// Batch release segments - more efficient than individual releases
-    /// for burst recycling.
-    #[inline]
-    pub fn release_batch(&mut self, mut segs: Vec<Segment>) {
-        if self.inner.len() + segs.len() <= self.max_capacity {
-            for seg in &mut segs {
-                seg.reset();
-            }
-            self.inner.extend(segs);
-        } else {
-            // Pool would overflow - only keep what fits
-            let keep_count = self.max_capacity.saturating_sub(self.inner.len());
-            for seg in segs.iter_mut().take(keep_count) {
-                seg.reset();
-            }
-            self.inner.extend(segs.into_iter().take(keep_count));
         }
     }
 

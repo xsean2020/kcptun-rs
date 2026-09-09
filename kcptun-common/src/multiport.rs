@@ -53,8 +53,22 @@ pub fn parse_multi_port(addr: &str) -> Result<Vec<SocketAddr>> {
         Ok(addrs)
     } else {
         let port: u16 = port_spec.parse()?;
+        if port == 0 {
+            anyhow::bail!("invalid port: 0");
+        }
         Ok(vec![resolve_one(host, port)?])
     }
+}
+
+/// Resolve a client destination and choose a cryptographically random port
+/// from its configured range, matching Go's per-dial selection.
+pub fn random_remote_addr(addr: &str) -> Result<SocketAddr> {
+    let addrs = parse_multi_port(addr)?;
+    let mut random = [0u8; 8];
+    getrandom::getrandom(&mut random)
+        .map_err(|error| anyhow::anyhow!("cannot obtain random remote port: {error}"))?;
+    let index = (u64::from_le_bytes(random) % addrs.len() as u64) as usize;
+    Ok(addrs[index])
 }
 
 #[cfg(test)]
@@ -95,6 +109,15 @@ mod tests {
         assert!(parse_multi_port("127.0.0.1:10-5").is_err());
         assert!(parse_multi_port("127.0.0.1:0-10").is_err());
         assert!(parse_multi_port("127.0.0.1:99999-99999").is_err());
+        assert!(parse_multi_port("127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn test_random_remote_addr_stays_in_range() {
+        for _ in 0..32 {
+            let addr = random_remote_addr("127.0.0.1:1000-1003").unwrap();
+            assert!((1000..=1003).contains(&addr.port()));
+        }
     }
 
     #[test]

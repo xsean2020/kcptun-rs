@@ -33,7 +33,7 @@ kpprof-rs is a standalone Rust library that:
 2. Spawns a lightweight HTTP server on a user-specified address, serving `/debug/pprof/*` endpoints.
 3. Emits profiles in Go's pprof protobuf format (application-level gzipped), so `go tool pprof` can consume them without any conversion.
 
-The crate depends on `kio-rs` for runtime-agnostic async I/O (tokio or smol), but has no coupling to any specific application protocol — it can be dropped into any Rust binary.
+The crate depends on `knet-rs` for tokio-based async I/O, but has no coupling to any specific application protocol — it can be dropped into any Rust binary.
 
 ---
 
@@ -41,11 +41,8 @@ The crate depends on `kio-rs` for runtime-agnostic async I/O (tokio or smol), bu
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `tokio` | ✅ | Use tokio runtime (via `kio-rs`) |
-| `smol`  | ❌ | Use smol runtime (via `kio-rs`) — mutually exclusive with `tokio` |
+| `tokio` | ✅ | Use tokio runtime (via `knet-rs`) |
 | `deadlock` | ❌ | Enable deadlock detection via `parking_lot::deadlock_detection` (adds runtime overhead) |
-
-> `tokio` and `smol` are mutually exclusive. Pick one.
 
 The consuming binary typically wraps these behind its own feature gates. For example, a binary might expose `pprof` (enables the dependency) and `pprof-deadlock` (enables `pprof` + `deadlock`).
 
@@ -62,7 +59,6 @@ kpprof-rs = { path = "...", optional = true, default-features = false }
 [features]
 pprof = ["dep:kpprof-rs"]
 pprof-deadlock = ["pprof", "kpprof-rs/deadlock"]
-tokio = ["kpprof-rs?/tokio"]   # or smol = ["kpprof-rs?/smol"]
 ```
 
 ### 2. Use the profiling allocator
@@ -132,7 +128,7 @@ cargo build --profile profiling --features pprof-deadlock -p my-binary
 
 ```bash
 cargo build --profile profiling --no-default-features \
-  --features smol,pprof -p my-binary
+  --features pprof -p my-binary
 ```
 
 ### Release build (symbols stripped)
@@ -415,7 +411,7 @@ Symbolization uses `backtrace::resolve()`, which works with debug info in the bi
 
 ```
 kpprof-rs/
-├── Cargo.toml          — features: tokio/smol/deadlock
+├── Cargo.toml          — features: tokio/deadlock
 └── src/
     ├── lib.rs           — run_pprof(), HTTP server, all route handlers
     ├── heap.rs          — ProfilingAllocator, build_heap_profile(), build_allocs_profile()
@@ -425,7 +421,7 @@ kpprof-rs/
 ### Crate dependency graph
 
 ```
-kpprof-rs ──► kio-rs  (feature: tokio | smol)
+kpprof-rs ──► knet-rs  (feature: tokio)
           ──► pprof (CPU profiling, protobuf-codec)
           ──► backtrace (stack capture + symbol resolution)
           ──► flate2 (gzip compression)

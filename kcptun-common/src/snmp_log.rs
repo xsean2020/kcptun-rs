@@ -5,27 +5,79 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use log::error;
+use log::{error, info};
 
-/// Expand strftime-style format specifiers in `path` using the current UTC time.
-///
-/// Supported specifiers: %Y (year), %m (month), %d (day), %H (hour),
-/// %M (minute), %S (second). Matches Go kcptun's `time.Now().Format(logfile)`
-/// behavior for SNMP log paths.
+/// Expand Go time-layout tokens using local time. Percent-style tokens remain
+/// supported as a Rust extension for existing configurations.
 fn expand_time_format(path: &str) -> String {
-    let now = SystemTime::now()
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    // Convert to UTC broken-down time using the civil calendar algorithm.
-    let (year, month, day, hour, minute, second) = civil_from_secs(secs);
+        .unwrap_or_default()
+        .as_secs();
+    expand_time_format_with_parts(path, local_time_parts(secs))
+}
 
-    path.replace("%Y", &format!("{:04}", year))
-        .replace("%m", &format!("{:02}", month))
-        .replace("%d", &format!("{:02}", day))
-        .replace("%H", &format!("{:02}", hour))
-        .replace("%M", &format!("{:02}", minute))
-        .replace("%S", &format!("{:02}", second))
+fn expand_time_format_with_parts(
+    path: &str,
+    (year, month, day, hour, minute, second): (i32, u32, u32, u32, u32, u32),
+) -> String {
+    let replacements = [
+        ("2006", format!("{year:04}")),
+        ("01", format!("{month:02}")),
+        ("02", format!("{day:02}")),
+        ("15", format!("{hour:02}")),
+        ("04", format!("{minute:02}")),
+        ("05", format!("{second:02}")),
+        ("%Y", format!("{year:04}")),
+        ("%m", format!("{month:02}")),
+        ("%d", format!("{day:02}")),
+        ("%H", format!("{hour:02}")),
+        ("%M", format!("{minute:02}")),
+        ("%S", format!("{second:02}")),
+    ];
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while !rest.is_empty() {
+        if let Some((token, value)) = replacements
+            .iter()
+            .find(|(token, _)| rest.starts_with(token))
+        {
+            out.push_str(value);
+            rest = &rest[token.len()..];
+        } else {
+            let ch = rest.chars().next().expect("non-empty string");
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+#[allow(deprecated)] // libc::time_t deprecated on musl 1.2.0; localtime_r requires it
+fn local_time_parts(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let raw = secs as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: localtime_r writes a complete `tm` to the supplied valid pointer.
+    let result = unsafe { libc::localtime_r(&raw, tm.as_mut_ptr()) };
+    if result.is_null() {
+        return civil_from_secs(secs);
+    }
+    // SAFETY: a non-null localtime_r result points to the initialized `tm`.
+    let tm = unsafe { tm.assume_init() };
+    (
+        tm.tm_year + 1900,
+        (tm.tm_mon + 1) as u32,
+        tm.tm_mday as u32,
+        tm.tm_hour as u32,
+        tm.tm_min as u32,
+        tm.tm_sec as u32,
+    )
+}
+
+#[cfg(not(unix))]
+fn local_time_parts(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    civil_from_secs(secs)
 }
 
 /// Simple civil calendar conversion from Unix seconds to (year, month, day, hour, min, sec).
@@ -54,10 +106,9 @@ fn civil_from_secs(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 
 /// Rust-only SNMP columns (not in Go `ToSlice` / CSV header).
 ///
-/// Written to a sidecar `<path>.rustobs` so H2 / offload investigations can
-/// read `EncryptInline` / `EncryptOffload` without changing Go-compatible CSV.
-const RUST_OBS_HEADER: &str =
-    "timestamp,EmptyFlush,EncryptInline,EncryptOffload,DecryptOffloadSkipped,WriteInlineSends,WriteFlushSends,InputUrgentSends";
+/// Written to a sidecar `<path>.rustobs` so write-path investigations can
+/// read inline-vs-flush send ratios without changing the Go-compatible CSV.
+const RUST_OBS_HEADER: &str = "timestamp,WriteInlineSends,WriteFlushSends";
 
 fn rust_obs_path(go_csv_path: &str) -> String {
     format!("{go_csv_path}.rustobs")
@@ -66,15 +117,10 @@ fn rust_obs_path(go_csv_path: &str) -> String {
 fn write_rust_obs_line(path: &str, ts: u64) {
     let snmp = &kcp_rs::DEFAULT_SNMP;
     let line = format!(
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{}",
         ts,
-        snmp.empty_flush.load(Ordering::Acquire),
-        snmp.encrypt_inline.load(Ordering::Acquire),
-        snmp.encrypt_offload.load(Ordering::Acquire),
-        snmp.decrypt_offload_skipped.load(Ordering::Acquire),
         snmp.write_inline_sends.load(Ordering::Acquire),
         snmp.write_flush_sends.load(Ordering::Acquire),
-        snmp.input_urgent_sends.load(Ordering::Acquire),
     );
     let mut f = match std::fs::OpenOptions::new()
         .create(true)
@@ -103,45 +149,10 @@ fn write_rust_obs_line(path: &str, ts: u64) {
 /// Periodically log KCP SNMP statistics to a CSV file.
 ///
 /// Also appends a Go-incompatible sidecar at `<path>.rustobs` with
-/// EmptyFlush / EncryptInline / EncryptOffload / DecryptOffloadSkipped
-/// (needed for encrypt offload ratio in H2 verification).
+/// WriteInlineSends / WriteFlushSends (write-path send-ratio observability).
 pub async fn snmp_logger(path: String, period: Duration, stop: Arc<AtomicBool>) {
-    kio::sleep_ms(period.as_millis() as u64).await;
-
-    // Expand time format specifiers in the path (matching Go's time.Now().Format).
-    let expanded_path = expand_time_format(&path);
-
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&expanded_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to open SNMP log file '{}': {}", expanded_path, e);
-            return;
-        }
-    };
-    let mut writer = std::io::BufWriter::new(file);
-
-    let headers = kcp_rs::SNMP::header();
-    if let Err(e) = writeln!(writer, "timestamp,{}", headers.join(",")) {
-        error!("SNMP log write error: {}", e);
-        return;
-    }
-    let _ = writer.flush();
-    // Bootstrap rustobs header early so short runs still have a parseable file.
-    {
-        let obs = rust_obs_path(&expanded_path);
-        let ts0 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        write_rust_obs_line(&obs, ts0);
-    }
-
     while !stop.load(Ordering::Relaxed) {
-        kio::sleep_ms(period.as_millis() as u64).await;
+        knet::sleep_ms(period.as_millis() as u64).await;
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -171,7 +182,7 @@ pub async fn snmp_logger(path: String, period: Duration, stop: Arc<AtomicBool>) 
         // Write header if file is empty or just created.
         if let Ok(meta) = f.metadata() {
             if meta.len() == 0 {
-                if let Err(e) = writeln!(f, "timestamp,{}", headers.join(",")) {
+                if let Err(e) = writeln!(f, "Unix,{}", headers.join(",")) {
                     error!("SNMP log write error: {}", e);
                 }
             }
@@ -181,6 +192,22 @@ pub async fn snmp_logger(path: String, period: Duration, stop: Arc<AtomicBool>) 
         }
 
         write_rust_obs_line(&rust_obs_path(&expanded_path), ts);
+    }
+}
+
+/// Log a Go-style KCP SNMP snapshot when SIGUSR1 is received.
+pub async fn snmp_signal_logger(stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        knet::sleep_ms(100).await;
+        if knet::sigusr1_received() {
+            let fields = kcp_rs::SNMP::header()
+                .into_iter()
+                .zip(kcp_rs::DEFAULT_SNMP.to_slice())
+                .map(|(name, value)| format!("{name}:{value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!("KCP SNMP:{{{fields}}}");
+        }
     }
 }
 
@@ -203,6 +230,19 @@ mod tests {
         let (y, m, d, h, min, s) = civil_from_secs(ts);
         assert_eq!((y, m, d), (2024, 6, 15));
         assert_eq!((h, min, s), (12, 30, 45));
+    }
+
+    #[test]
+    fn test_go_and_percent_time_layouts() {
+        let parts = (2024, 6, 15, 12, 30, 45);
+        assert_eq!(
+            expand_time_format_with_parts("snmp-20060102-150405.log", parts),
+            "snmp-20240615-123045.log"
+        );
+        assert_eq!(
+            expand_time_format_with_parts("snmp-%Y%m%d-%H%M%S.log", parts),
+            "snmp-20240615-123045.log"
+        );
     }
 
     #[test]

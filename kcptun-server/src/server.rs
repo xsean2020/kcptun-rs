@@ -19,9 +19,9 @@ pub(crate) async fn handle_stream(
     qpp_count: u16,
     quiet: bool,
     close_wait: u64,
-    flush_notify: Arc<kio::Notify>,
+    flush_notify: Arc<knet::Notify>,
 ) -> Result<()> {
-    let tcp = kio::TcpStream::connect(&target)
+    let tcp = knet::TcpStream::connect(&target)
         .await
         .with_context(|| format!("failed to connect to target {}", target))?;
 
@@ -97,7 +97,7 @@ pub(crate) fn spawn_session_stream_loop(
     close_wait: u64,
     udp_listener: Option<Arc<kcp_rs::KcpListener>>,
 ) {
-    kio::spawn_task(async move {
+    knet::spawn_task(async move {
         loop {
             let stream = match session.accept().await {
                 Ok(stream) => stream,
@@ -113,7 +113,7 @@ pub(crate) fn spawn_session_stream_loop(
             let target = target.clone();
             let qpp_key = qpp_key.clone();
             let notify = session.flush_notify();
-            kio::spawn_task(async move {
+            knet::spawn_task(async move {
                 if let Err(error) = handle_stream(
                     target,
                     stream,
@@ -135,6 +135,5 @@ pub(crate) fn spawn_session_stream_loop(
         if let Some(listener) = udp_listener {
             listener.remove_peer(peer);
         }
-        kcp_rs::DEFAULT_SNMP.session_closed();
     });
 }

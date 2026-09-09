@@ -110,6 +110,29 @@ impl AeadCrypt for Aes128GcmCrypt {
         Ok(buf)
     }
 
+    fn open_in_place(&self, buf: &mut [u8], n: usize) -> Result<usize, String> {
+        if n < NONCE_SZ + TAG_SZ {
+            return Err("AEAD data too short".into());
+        }
+        // Copy nonce/tag to the stack first: decrypt_in_place_detached needs
+        // `&mut buf[..]` for the ciphertext, so the slices can't borrow `buf`.
+        let mut nonce = [0u8; NONCE_SZ];
+        nonce.copy_from_slice(&buf[..NONCE_SZ]);
+        let mut tag = [0u8; TAG_SZ];
+        tag.copy_from_slice(&buf[n - TAG_SZ..n]);
+        let pt_len = n - NONCE_SZ - TAG_SZ;
+        self.cipher
+            .decrypt_in_place_detached(
+                GenericArray::from_slice(&nonce),
+                b"",
+                &mut buf[NONCE_SZ..n - TAG_SZ],
+                GenericArray::from_slice(&tag),
+            )
+            .map_err(|e| format!("AEAD decrypt failed: {:?}", e))?;
+        buf.copy_within(NONCE_SZ..n - TAG_SZ, 0);
+        Ok(pt_len)
+    }
+
     fn name(&self) -> &'static str {
         "aes-128-gcm"
     }
@@ -167,5 +190,27 @@ mod tests {
         let a = c.seal(b"x");
         let b = c.seal(b"x");
         assert_ne!(&a[..12], &b[..12]);
+    }
+
+    #[test]
+    fn open_in_place_roundtrip_and_tamper() {
+        let c = Aes128GcmCrypt::new(b"0123456789abcdef");
+        let pt = b"in-place aead roundtrip payload";
+        let sealed = c.seal(pt);
+
+        let mut buf = [0u8; 256];
+        buf[..sealed.len()].copy_from_slice(&sealed);
+        let n = c.open_in_place(&mut buf, sealed.len()).unwrap();
+        assert_eq!(n, pt.len());
+        assert_eq!(&buf[..n], pt);
+
+        // Tampered ciphertext must fail auth (and not panic).
+        let mut tampered = [0u8; 256];
+        tampered[..sealed.len()].copy_from_slice(&sealed);
+        tampered[sealed.len() - 1] ^= 0xFF;
+        assert!(c.open_in_place(&mut tampered, sealed.len()).is_err());
+
+        // Too-short input must error without panic.
+        assert!(c.open_in_place(&mut buf, NONCE_SZ).is_err());
     }
 }

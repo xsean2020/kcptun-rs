@@ -3,60 +3,45 @@
 # Workspace members:
 #   kcp-rs        — KCP reliable UDP transport protocol
 #   kcrypt-rs     — Shared block/AEAD cipher library (extracted from kcp-rs)
-#   smux-rs       — SMUX stream multiplexer (tokio / smol dual-track)
+#   smux-rs       — SMUX stream multiplexer
 #   qpp-rs        — Quantum Permutation Pad encryption
-#   kio-rs        — Async runtime + network I/O abstraction (tokio / smol)
-#   kpprof-rs     — Go-compatible pprof (net/http/pprof) server: CPU + heap/allocs + goroutine + deadlock (opt-in via --features pprof / pprof-deadlock)
-#   kcptun-client — Client binary (tokio / smol)
-#   kcptun-server — Server binary (tokio / smol)
+#   knet-rs       — Tokio-based network I/O extensions (mmsg, tcpraw, cpu_block)
+#   kpprof-rs     — Go-compatible pprof server: CPU + heap/allocs + goroutine + deadlock (default; deadlock opt-in)
+#   kcptun-client — Client binary
+#   kcptun-server — Server binary
 #
-# Runtime feature selection:
-#   Native (x86_64 / Apple Silicon):  tokio (default)  — high-concurrency servers
-#   ARM (armv7 / aarch64-linux):      smol  (default)  — lightweight / embedded
+# Runtime: tokio (single runtime, no feature flags needed)
 #
 # Targets:
-#   build          - Native debug build (tokio)
-#   build-smol     - Native debug build (smol)
-#   build-tokio    - Alias for build
-#   release        - Native release build (tokio, optimized + stripped)
-#   release-smol   - Native release build (smol)
+#   build          - Native debug build
+#   release        - Native release build (optimized + stripped)
 #
-#   build-armv7    - ARMv7 debug build (smol, minimal: no QPP for smallest size)
-#   build-armv7-tokio - ARMv7 debug build (tokio)
-#   build-armv7-full - ARMv7 debug build (smol + QPP)
-#   release-armv7  - ARMv7 release build (smol, minimal, opt-level=s)
-#   release-armv7-tokio - ARMv7 release build (tokio, opt-level=s)
-#   release-armv7-full - ARMv7 release build (smol + QPP, opt-level=s)
+#   build-armv7    - ARMv7 debug build (tokio, minimal: no QPP for smallest size)
+#   build-armv7-full - ARMv7 debug build (tokio + QPP)
+#   release-armv7  - ARMv7 release build (tokio, minimal, opt-level=s)
+#   release-armv7-full - ARMv7 release build (tokio + QPP, opt-level=s)
 #
-#   build-arm64    - ARM64 debug build (smol, minimal)
-#   build-arm64-tokio - ARM64 debug build (tokio)
-#   build-arm64-full - ARM64 debug build (smol + QPP)
-#   release-arm64  - ARM64 release build (smol, minimal, opt-level=s)
-#   release-arm64-tokio - ARM64 release build (tokio, opt-level=s)
-#   release-arm64-full - ARM64 release build (smol + QPP, opt-level=s)
+#   build-arm64    - ARM64 debug build (tokio, minimal)
+#   build-arm64-full - ARM64 debug build (tokio + QPP)
+#   release-arm64  - ARM64 release build (tokio, minimal, opt-level=s)
+#   release-arm64-full - ARM64 release build (tokio + QPP, opt-level=s)
 #
 #   linux          - Linux x86_64 release (musl, for testing from macOS)
 #   linux-aarch64  - Linux aarch64 release (musl)
 #   linux-full     - Linux x86_64 + QPP
 #   linux-aarch64-full - Linux aarch64 + QPP
 #
-#   test           - Run all unit tests (tokio)
-#   test-smol      - Run unit tests (smol)
-#   test-both      - Run unit tests on both backends
-#   stress         - Run stress tests (requires release build, tokio)
+#   test           - Run all unit tests
+#   stress         - Run stress tests (requires release build)
 #
-#   clippy         - Run clippy (tokio, warnings = errors)
-#   clippy-smol    - Run clippy (smol, warnings = errors)
-#   clippy-both    - Run clippy on both backends
+#   clippy         - Run clippy (warnings = errors)
 #   fmt            - Format all Rust source code
-#   check          - Fast type check (tokio)
-#   check-smol     - Fast type check (smol)
-#   check-both     - Fast type check on both backends
+#   check          - Fast type check
 #   gate           - Run pre-commit gate: fmt --check + test + clippy
 #   doc            - Generate documentation
 #   size           - Show release binary sizes
 #
-#   bench          - Run Go vs Rust-Tokio vs Rust-Smol benchmark
+#   bench          - Run Go vs Rust benchmark
 #   check-deps     - Check for unused dependencies (requires cargo-udeps)
 #   targets        - List all supported build targets
 #   install-cross  - Install cross-compilation toolchains (rustup)
@@ -72,9 +57,9 @@ UNAME_M := $(shell uname -m)
 # Use all available CPUs for build parallelism
 NUM_JOBS := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# Packages that need runtime feature selection (tokio / smol)
-# kcp-rs, kcrypt-rs, qpp-rs are runtime-agnostic — built normally with workspace.
-RT_PKGS := -p kcptun-client -p kcptun-server -p kio-rs -p smux-rs -p kpprof-rs
+# Packages that have optional features (qpp, pprof)
+# kcp-rs, kcrypt-rs, qpp-rs, knet-rs are runtime-agnostic — built normally with workspace.
+FEAT_PKGS := -p kcptun-client -p kcptun-server
 
 # ---------------------------------------------------------------------------
 # Cross-compilation targets
@@ -242,37 +227,30 @@ define require-linux-aarch64-cc
 endef
 
 .PHONY: all \
-	gate \        build build-smol build-tokio release release-smol release-tokio \
-        build-armv7 build-armv7-tokio build-armv7-full release-armv7 release-armv7-tokio release-armv7-full \
-        build-arm64 build-arm64-tokio build-arm64-full release-arm64 release-arm64-tokio release-arm64-full \
-        linux linux-aarch64 linux-full linux-aarch64-full \
-        test test-smol test-both stress e2e check-all \
-        clippy clippy-smol clippy-both fmt check check-smol check-both doc size \
-        bench profile profile-mem profile-go profile-rust-go \
-        targets install-cross clean distclean
+	gate build release \
+	build-armv7 build-armv7-full release-armv7 release-armv7-full \
+	build-arm64 build-arm64-full release-arm64 release-arm64-full \
+	linux linux-aarch64 linux-full linux-aarch64-full \
+	test stress e2e check-all \
+	clippy fmt check doc size \
+	bench profile profile-mem profile-go profile-rust-go profiling-bins \
+	targets install-cross clean distclean
 
 all: build
 
 # ---------------------------------------------------------------------------
 # build / release (native)
 # ---------------------------------------------------------------------------
-# Native default: tokio. Use build-smol for smol backend.
-build build-tokio:
+build:
 	$(CARGO) build --workspace -j $(NUM_JOBS)
 
-build-smol:
-	$(CARGO) build $(RT_PKGS) --no-default-features --features smol -j $(NUM_JOBS) --target-dir target/smol
-
-release release-tokio:
+release:
 	$(CARGO) build --workspace --release -j $(NUM_JOBS)
-
-release-smol:
-	$(CARGO) build $(RT_PKGS) --no-default-features --features smol --release -j $(NUM_JOBS) --target-dir target/smol-release
 
 # ---------------------------------------------------------------------------
 # Cross-compilation: ARMv7
 # ---------------------------------------------------------------------------
-# ARM default: smol (lightweight). Use *-tokio targets for tokio backend.
+# ARM builds use tokio (single runtime). Minimal = no QPP for smaller size.
 # Auto-selects glibc (armv7-unknown-linux-gnueabihf) or musl
 # (armv7-unknown-linux-musleabihf) based on which C compiler is on PATH.
 #
@@ -287,48 +265,34 @@ release-smol:
 # ---------------------------------------------------------------------------
 build-armv7:
 	$(require-armv7-cc)
-	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (smol, debug)..."
-	@$(armv7-env) $(CARGO) build $(RT_PKGS) --no-default-features --features smol --target $(ARMV7_TARGET) -j $(NUM_JOBS)
-	@echo "==> Binaries at target/$(ARMV7_TARGET)/debug/{kcptun-client,kcptun-server}"
-
-build-armv7-tokio:
-	$(require-armv7-cc)
 	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (tokio, debug)..."
 	@$(armv7-env) $(CARGO) build --workspace --target $(ARMV7_TARGET) -j $(NUM_JOBS)
 	@echo "==> Binaries at target/$(ARMV7_TARGET)/debug/{kcptun-client,kcptun-server}"
 
 release-armv7:
 	$(require-armv7-cc)
-	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (smol, release, opt-level=s)..."
-	@$(armv7-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
-	@ls -lh target/$(ARMV7_TARGET)/release/kcptun-client target/$(ARMV7_TARGET)/release/kcptun-server
-	@echo "==> Binaries at target/$(ARMV7_TARGET)/release/{kcptun-client,kcptun-server}"
-
-release-armv7-tokio:
-	$(require-armv7-cc)
 	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (tokio, release, opt-level=s)..."
 	@$(armv7-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build --workspace --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARMV7_TARGET)/release/kcptun-client target/$(ARMV7_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARMV7_TARGET)/release/{kcptun-client,kcptun-server}"
 
-# Full variants (smol + QPP) — for when Quantum Permutation Pad obfuscation is needed on ARM
+# Full variants (tokio + QPP) — for when Quantum Permutation Pad obfuscation is needed on ARM
 build-armv7-full:
 	$(require-armv7-cc)
-	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (smol + qpp, debug)..."
-	@$(armv7-env) $(CARGO) build $(RT_PKGS) --no-default-features --features "smol,qpp" --target $(ARMV7_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (tokio + qpp, debug)..."
+	@$(armv7-env) $(CARGO) build --workspace --features qpp --target $(ARMV7_TARGET) -j $(NUM_JOBS)
 	@echo "==> Binaries at target/$(ARMV7_TARGET)/debug/{kcptun-client,kcptun-server}"
 
 release-armv7-full:
 	$(require-armv7-cc)
-	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (smol + qpp, release, opt-level=s)..."
-	@$(armv7-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build $(RT_PKGS) --no-default-features --features "smol,qpp" --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARMV7_TARGET) via $(ARMV7_CC) (tokio + qpp, release, opt-level=s)..."
+	@$(armv7-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build --workspace --features qpp --release --target $(ARMV7_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARMV7_TARGET)/release/kcptun-client target/$(ARMV7_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARMV7_TARGET)/release/{kcptun-client,kcptun-server}"
 
 # ---------------------------------------------------------------------------
 # Cross-compilation: ARM64
 # ---------------------------------------------------------------------------
-# ARM default: smol (lightweight). Use *-tokio targets for tokio backend.
 # Auto-selects glibc (aarch64-unknown-linux-gnu) or musl
 # (aarch64-unknown-linux-musl) based on which C compiler is on PATH.
 #
@@ -339,41 +303,28 @@ release-armv7-full:
 # ---------------------------------------------------------------------------
 build-arm64:
 	$(require-arm64-cc)
-	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (smol, debug)..."
-	@$(arm64-env) $(CARGO) build $(RT_PKGS) --no-default-features --features smol --target $(ARM64_TARGET) -j $(NUM_JOBS)
-	@echo "==> Binaries at target/$(ARM64_TARGET)/debug/{kcptun-client,kcptun-server}"
-
-build-arm64-tokio:
-	$(require-arm64-cc)
 	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (tokio, debug)..."
 	@$(arm64-env) $(CARGO) build --workspace --target $(ARM64_TARGET) -j $(NUM_JOBS)
 	@echo "==> Binaries at target/$(ARM64_TARGET)/debug/{kcptun-client,kcptun-server}"
 
 release-arm64:
 	$(require-arm64-cc)
-	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (smol, release, opt-level=s)..."
-	@$(arm64-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
-	@ls -lh target/$(ARM64_TARGET)/release/kcptun-client target/$(ARM64_TARGET)/release/kcptun-server
-	@echo "==> Binaries at target/$(ARM64_TARGET)/release/{kcptun-client,kcptun-server}"
-
-release-arm64-tokio:
-	$(require-arm64-cc)
 	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (tokio, release, opt-level=s)..."
 	@$(arm64-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build --workspace --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARM64_TARGET)/release/kcptun-client target/$(ARM64_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARM64_TARGET)/release/{kcptun-client,kcptun-server}"
 
-# Full variants (smol + QPP) — for when Quantum Permutation Pad obfuscation is needed on ARM
+# Full variants (tokio + QPP)
 build-arm64-full:
 	$(require-arm64-cc)
-	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (smol + qpp, debug)..."
-	@$(arm64-env) $(CARGO) build $(RT_PKGS) --no-default-features --features "smol,qpp" --target $(ARM64_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (tokio + qpp, debug)..."
+	@$(arm64-env) $(CARGO) build --workspace --features qpp --target $(ARM64_TARGET) -j $(NUM_JOBS)
 	@echo "==> Binaries at target/$(ARM64_TARGET)/debug/{kcptun-client,kcptun-server}"
 
 release-arm64-full:
 	$(require-arm64-cc)
-	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (smol + qpp, release, opt-level=s)..."
-	@$(arm64-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build $(RT_PKGS) --no-default-features --features "smol,qpp" --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(ARM64_TARGET) via $(ARM64_CC) (tokio + qpp, release, opt-level=s)..."
+	@$(arm64-env) CARGO_PROFILE_RELEASE_OPT_LEVEL=s $(CARGO) build --workspace --features qpp --release --target $(ARM64_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(ARM64_TARGET)/release/kcptun-client target/$(ARM64_TARGET)/release/kcptun-server
 	@echo "==> Binaries at target/$(ARM64_TARGET)/release/{kcptun-client,kcptun-server}"
 
@@ -382,30 +333,30 @@ release-arm64-full:
 # ---------------------------------------------------------------------------
 linux:
 	$(require-linux-x86-cc)
-	@echo "==> Cross-compiling for $(LINUX_X86_TARGET) via $(LINUX_X86_CC) (smol, release)..."
-	@$(linux-x86-env) $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(LINUX_X86_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(LINUX_X86_TARGET) via $(LINUX_X86_CC) (tokio, release)..."
+	@$(linux-x86-env) $(CARGO) build --workspace --release --target $(LINUX_X86_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(LINUX_X86_TARGET)/release/kcptun-client target/$(LINUX_X86_TARGET)/release/kcptun-server || true
 	@echo "==> Linux x86_64 binaries at target/$(LINUX_X86_TARGET)/release/{kcptun-client,kcptun-server}"
 
 linux-aarch64:
 	$(require-linux-aarch64-cc)
-	@echo "==> Cross-compiling for $(LINUX_AARCH64_TARGET) via $(LINUX_AARCH64_CC) (smol, release)..."
-	@$(linux-aarch64-env) $(CARGO) build $(RT_PKGS) --no-default-features --features smol --release --target $(LINUX_AARCH64_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(LINUX_AARCH64_TARGET) via $(LINUX_AARCH64_CC) (tokio, release)..."
+	@$(linux-aarch64-env) $(CARGO) build --workspace --release --target $(LINUX_AARCH64_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(LINUX_AARCH64_TARGET)/release/kcptun-client target/$(LINUX_AARCH64_TARGET)/release/kcptun-server || true
 	@echo "==> Linux aarch64 binaries at target/$(LINUX_AARCH64_TARGET)/release/{kcptun-client,kcptun-server}"
 
 # Full (with QPP)
 linux-full:
 	$(require-linux-x86-cc)
-	@echo "==> Cross-compiling for $(LINUX_X86_TARGET) via $(LINUX_X86_CC) (smol + qpp, release)..."
-	@$(linux-x86-env) $(CARGO) build $(RT_PKGS) --no-default-features --features "smol,qpp" --release --target $(LINUX_X86_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(LINUX_X86_TARGET) via $(LINUX_X86_CC) (tokio + qpp, release)..."
+	@$(linux-x86-env) $(CARGO) build --workspace --features qpp --release --target $(LINUX_X86_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(LINUX_X86_TARGET)/release/kcptun-client target/$(LINUX_X86_TARGET)/release/kcptun-server || true
 	@echo "==> Linux x86_64 (+QPP) at target/$(LINUX_X86_TARGET)/release/{kcptun-client,kcptun-server}"
 
 linux-aarch64-full:
 	$(require-linux-aarch64-cc)
-	@echo "==> Cross-compiling for $(LINUX_AARCH64_TARGET) via $(LINUX_AARCH64_CC) (smol + qpp, release)..."
-	@$(linux-aarch64-env) $(CARGO) build $(RT_PKGS) --no-default-features --features "smol,qpp" --release --target $(LINUX_AARCH64_TARGET) -j $(NUM_JOBS)
+	@echo "==> Cross-compiling for $(LINUX_AARCH64_TARGET) via $(LINUX_AARCH64_CC) (tokio + qpp, release)..."
+	@$(linux-aarch64-env) $(CARGO) build --workspace --features qpp --release --target $(LINUX_AARCH64_TARGET) -j $(NUM_JOBS)
 	@ls -lh target/$(LINUX_AARCH64_TARGET)/release/kcptun-client target/$(LINUX_AARCH64_TARGET)/release/kcptun-server || true
 	@echo "==> Linux aarch64 (+QPP) at target/$(LINUX_AARCH64_TARGET)/release/{kcptun-client,kcptun-server}"
 
@@ -429,47 +380,37 @@ install-cross:
 targets:
 	@echo "kcptun-rs build targets:"
 	@echo ""
-	@echo "  Native (default: tokio):"
-	@echo "    make build              — debug build (tokio)"
-	@echo "    make build-smol         — debug build (smol)"
-	@echo "    make release            — release build (tokio, LTO, stripped)"
-	@echo "    make release-smol       — release build (smol, LTO, stripped)"
+	@echo "  Native (tokio):"
+	@echo "    make build              — debug build"
+	@echo "    make release            — release build (LTO, stripped)"
 	@echo ""
-	@echo "  ARMv7 (default: smol; auto-detects glibc or musl C toolchain):"
-	@echo "    make build-armv7        — debug build (smol)"
-	@echo "    make build-armv7-tokio  — debug build (tokio)"
-	@echo "    make build-armv7-full   — debug build (smol + qpp)"
-	@echo "    make release-armv7      — release build (smol)"
-	@echo "    make release-armv7-tokio — release build (tokio)"
-	@echo "    make release-armv7-full — release build (smol + qpp)"
+	@echo "  ARMv7 (tokio; auto-detects glibc or musl C toolchain):"
+	@echo "    make build-armv7        — debug build (tokio, minimal)"
+	@echo "    make build-armv7-full   — debug build (tokio + qpp)"
+	@echo "    make release-armv7      — release build (tokio, minimal)"
+	@echo "    make release-armv7-full — release build (tokio + qpp)"
 	@echo "    currently: $(ARMV7_TARGET) via $(ARMV7_CC)"
 	@echo ""
-	@echo "  ARM64 (default: smol; auto-detects glibc or musl C toolchain):"
-	@echo "    make build-arm64        — debug build (smol)"
-	@echo "    make build-arm64-tokio  — debug build (tokio)"
-	@echo "    make build-arm64-full   — debug build (smol + qpp)"
-	@echo "    make release-arm64      — release build (smol)"
-	@echo "    make release-arm64-tokio — release build (tokio)"
-	@echo "    make release-arm64-full — release build (smol + qpp)"
+	@echo "  ARM64 (tokio; auto-detects glibc or musl C toolchain):"
+	@echo "    make build-arm64        — debug build (tokio, minimal)"
+	@echo "    make build-arm64-full   — debug build (tokio + qpp)"
+	@echo "    make release-arm64      — release build (tokio, minimal)"
+	@echo "    make release-arm64-full — release build (tokio + qpp)"
 	@echo "    currently: $(ARM64_TARGET) via $(ARM64_CC)"
 	@echo ""
 	@echo "  Linux (x86_64/aarch64 musl, for testing from macOS):"
-	@echo "    make linux              — Linux x86_64 (smol, musl)"
-	@echo "    make linux-aarch64      — Linux aarch64 (smol, musl)"
-	@echo "    make linux-full         — Linux x86_64 (smol + qpp, musl)"
-	@echo "    make linux-aarch64-full — Linux aarch64 (smol + qpp, musl)"
+	@echo "    make linux              — Linux x86_64 (tokio, musl)"
+	@echo "    make linux-aarch64      — Linux aarch64 (tokio, musl)"
+	@echo "    make linux-full         — Linux x86_64 (tokio + qpp, musl)"
+	@echo "    make linux-aarch64-full — Linux aarch64 (tokio + qpp, musl)"
 	@echo "    (requires musl cross; see: make install-cross)"
 	@echo ""
 	@echo "  Testing & linting:"
-	@echo "    make test               — unit tests (tokio)"
-	@echo "    make test-smol          — unit tests (smol)"
-	@echo "    make test-both          — unit tests (both backends)"
-	@echo "    make stress             — stress tests (tokio, release)"
-	@echo "    make e2e                — Go↔Rust e2e interop (tokio + smol)"
-	@echo "    make clippy             — clippy (tokio)"
-	@echo "    make clippy-smol        — clippy (smol)"
-	@echo "    make clippy-both        — clippy (both backends)"
-	@echo "    make bench              — Go vs Rust-Tokio vs Rust-Smol"
+	@echo "    make test               — unit tests"
+	@echo "    make stress             — stress tests (release)"
+	@echo "    make e2e                — Go↔Rust e2e interop"
+	@echo "    make clippy             — clippy"
+	@echo "    make bench              — Go vs Rust"
 	@echo ""
 	@echo "  Profiling (Go pprof compatible):"
 	@echo "    make profiling-bins     — build profiling bins + pprof (CPU+heap+allocs+...)"
@@ -496,12 +437,6 @@ test:
 	ulimit -n 65536 2>/dev/null; $(CARGO) test --workspace --tests -j $(NUM_JOBS) -- --test-threads=2 --include-ignored
 	ulimit -n 65536 2>/dev/null; $(CARGO) test --workspace --doc -j $(NUM_JOBS)
 
-test-smol:
-	ulimit -n 65536 2>/dev/null; $(CARGO) test $(RT_PKGS) --no-default-features --features smol --target-dir target/smol-test --tests -- --test-threads=2 --include-ignored
-	ulimit -n 65536 2>/dev/null; $(CARGO) test $(RT_PKGS) --no-default-features --features smol --target-dir target/smol-test --doc
-
-test-both: test test-smol
-
 # Stress tests — data-integrity + concurrency, requires release build
 stress:
 	ulimit -n 65536 2>/dev/null; $(CARGO) build --release -p kcptun-client -p kcptun-server && $(CARGO) test --release -p kcptun-server --test stress_test -- --nocapture --test-threads=1
@@ -509,14 +444,9 @@ stress:
 clippy:
 	$(CARGO) clippy --workspace -- -D warnings
 
-clippy-smol:
-	$(CARGO) clippy $(RT_PKGS) --no-default-features --features smol --target-dir target/smol-clippy -- -D warnings
-
-clippy-both: clippy clippy-smol
-
-# e2e — Go↔Rust (tokio + smol) end-to-end interoperability tests
+# e2e — Go↔Rust end-to-end interoperability tests
 # Requires Go kcptun binaries in tests/kcptun-go/
-e2e: release release-smol
+e2e: release
 	@bash test_e2e.sh
 
 fmt:
@@ -525,16 +455,12 @@ fmt:
 # Check for unused dependencies (requires: cargo install cargo-udeps)
 check-deps:
 	$(CARGO) udeps --workspace
+
 # ---------------------------------------------------------------------------
 # check — fast type check (no codegen)
 # ---------------------------------------------------------------------------
 check:
 	$(CARGO) check --workspace
-
-check-smol:
-	$(CARGO) check $(RT_PKGS) --no-default-features --features smol
-
-check-both: check check-smol
 
 # ---------------------------------------------------------------------------
 # gate — pre-commit quality gate (fmt --check + test + clippy)
@@ -564,32 +490,29 @@ doc:
 # ---------------------------------------------------------------------------
 # size — show release binary sizes (human readable)
 # ---------------------------------------------------------------------------
-size: release release-smol
+size: release
 	@echo "=== Native release (tokio) ==="
 	@ls -lh target/release/kcptun-{client,server} 2>/dev/null || echo "(not built)"
-	@echo "=== Smol release ==="
-	@ls -lh target/smol-release/kcptun-{client,server} 2>/dev/null || echo "(not built)"
 	@echo "=== ARM (if built) ==="
 	@find target -name 'kcptun-*' -path '*release*' -not -name '*.d' -exec ls -lh {} + 2>/dev/null | head -20 || true
 
-
-# ---------------------------------------------------------------------------
-# bench — Go vs Rust-Tokio vs Rust-Smol performance comparison
-# ---------------------------------------------------------------------------
-bench: release release-smol
+bench: release
 	@bash bench/run_bench.sh
 
 # Go pprof profiling — see bench/PROFILE_RUNBOOK.md
-# Rust: cargo --profile profiling --features pprof (readable symbols). SKIP_PROFILE_REBUILD=1 reuses bins.
-profile:
+# Rust: cargo --profile profiling --features pprof (readable symbols + frame
+# pointers). `profile` builds profiling bins first (make only rebuilds on
+# source change), so the analysis never silently falls back to non-symbolic
+# release binaries.
+profile: profiling-bins
 	@bash bench/profile_rust_go_pprof.sh
 
-profile-mem:
+profile-mem: profiling-bins
 	@bash bench/profile_rust_go_pprof.sh mem
 
 profiling-bins:
-	@extra="-C force-frame-pointers=yes"; \
-	case "$$(uname -m)" in arm64|aarch64) extra="--cfg aes_armv8 $$extra" ;; esac; \
+	@extra="-C force-frame-pointers=yes --cfg aes_armv8 --cfg polyval_armv8"; \
+	case "$$(uname -m)" in arm64|aarch64) ;; *) extra="-C force-frame-pointers=yes" ;; esac; \
 	RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$extra" \
 		$(CARGO) build --profile profiling --features pprof -p kcptun-server -p kcptun-client -j $(NUM_JOBS)
 	@echo "Binaries: target/profiling/kcptun-{client,server}  (pprof enabled: /debug/pprof/{profile,heap,allocs,...) "
@@ -602,6 +525,24 @@ profile-go:
 profile-rust-go:
 	@bash bench/profile_rust_go_pprof.sh
 
+# ---------------------------------------------------------------------------
+# docker-test — verify build/tests on Linux (sendmmsg/recvmmsg, tcpraw)
+# ---------------------------------------------------------------------------
+docker-test:
+	@echo "==> Running Linux verification in Docker (rust:latest)..."
+	@docker run --rm -v "$(PWD):/workspace" -w /workspace rust:latest \
+		bash bench/docker_test.sh
+
+docker-test-quiet:
+	@echo "==> Running Linux verification in Docker (filtered output)..."
+	@docker run --rm -v "$(PWD):/workspace" -w /workspace rust:latest \
+		bash -c 'rustup component add rustfmt clippy 2>/dev/null; \
+		export CARGO_TARGET_DIR=/workspace/target/linux-docker; \
+		cargo fmt --all -- --check && \
+		cargo build --workspace 2>&1 | tail -1 && \
+		cargo test --workspace 2>&1 | grep -E "test result|sendmmsg|recvmmsg|FAILED" && \
+		cargo clippy --workspace -- -D warnings 2>&1 | tail -1 && \
+		echo "✅ Linux Docker verification PASSED"'
 
 # ---------------------------------------------------------------------------
 # clean / distclean

@@ -1,0 +1,24 @@
+# Dockerfile for Linux verification of kcptun-rs
+# Usage:
+#   docker build -t kcptun-rs-linux -f bench/Dockerfile.linux .
+#   docker run --rm -v "$PWD:/workspace" -w /workspace kcptun-rs-linux bash bench/docker_test.sh
+#
+# Or one-shot:
+#   docker run --rm -v "$PWD:/workspace" -w /workspace rust:latest bash bench/docker_test.sh
+
+FROM rust:latest
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    llvm \
+    pkg-config \
+    make \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set environment for correct linking
+ENV CC=clang
+ENV CARGO_TARGET_DIR=/workspace/target/linux-docker
+
+WORKDIR /workspace

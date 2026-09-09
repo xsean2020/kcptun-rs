@@ -894,7 +894,7 @@ fn test_server_multi_port() {
 
 // ─── closeWait smoke test ────────────────────────────────────────────────────
 // Verifies that closewait flag does not cause hangs or data corruption.
-// This is a smoke test — the postwait behavior is unit-tested in kio-rs.
+// This is a smoke test — the postwait behavior is unit-tested in knet-rs.
 
 #[test]
 fn test_closewait_smoke() {

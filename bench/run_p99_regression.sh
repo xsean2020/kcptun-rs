@@ -30,7 +30,7 @@ P99CAP_450=${P99CAP_450:-800000}   # µs — pre-fix 450 was ~672ms p99
 P99CAP_500=${P99CAP_500:-900000}   # µs — pre-fix 500 was ~804ms p99
 FASTCAP=${FASTCAP:-3000}           # /2s — pre-fix storm was ~14-20K / 2s
 
-cargo build --release --features async-tokio --example latency_p99 >/dev/null 2>&1 || {
+cargo build --release --features async --example latency_p99 >/dev/null 2>&1 || {
     echo "RESULT build-failed"; exit 1
 }
 EXE=target/release/examples/latency_p99

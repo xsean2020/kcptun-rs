@@ -5,7 +5,7 @@
 **Rust port of kcptun — up to 5.38× faster than Go, fully wire-compatible**
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
-[![Tests](https://img.shields.io/badge/tests-237%20passed-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-334%20passed-brightgreen)](#)
 [![E2E](https://img.shields.io/badge/e2e-68%20passed-brightgreen)](#)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#)
 [![Rust](https://img.shields.io/badge/rust-1.92+-orange)](#)
@@ -33,17 +33,19 @@ English | [中文](README.zh.md)
 
 kcptun-rs **outperforms Go kcptun across nearly every cipher and compression setting**, while maintaining **full wire compatibility** — meaning you can replace one side of a Go kcptun tunnel with the Rust binary and get an instant speed boost.
 
-| Cipher | vs Go (Tokio) | vs Go (Smol) |
-|--------|:------------:|:------------:|
-| **SM4** (nocomp) | **4.76× faster** 🏆 | **4.58× faster** |
-| **SM4** (comp) | **5.32× faster** 🏆 | **5.38× faster** |
-| **XOR** (nocomp) | **2.54× faster** | **2.34× faster** |
-| **CAST5** (nocomp) | **1.98× faster** | **1.78× faster** |
-| **Twofish** (comp) | **1.69× faster** | **1.22× faster** |
-| **AES-128** (nocomp) | **1.59× faster** | **1.41× faster** |
-| **AES-128-CFB** bulk | **1.67× faster** | **2.11× faster** 🏆 |
+| Cipher | vs Go (macOS M1) | vs Go (Linux VPS) |
+|--------|:---------------:|:-----------------:|
+| **SM4** (nocomp) | **4.76× faster** 🏆 | **1.87× faster** |
+| **SM4** (comp) | **5.32× faster** 🏆 | **3.17× faster** 🏆 |
+| **XOR** (nocomp) | **2.54× faster** | **1.60× faster** |
+| **CAST5** (nocomp) | **1.98× faster** | **1.04× faster** |
+| **Twofish** (comp) | **1.69× faster** | **1.63× faster** |
+| **AES-128** (nocomp) | **1.59× faster** | **1.14× faster** |
+| **AES-128-GCM** (comp) | **1.33× faster** | **1.25× faster** |
+| **AES-128** (comp) | **1.18× faster** | **1.83× faster** |
+| **AES-128** bulk | **1.67× faster** | **1.17× faster** |
 
-*Benchmarked on Apple M1, 10 concurrent connections × 1 MB each. Full matrix below.*
+*macOS M1: 10 conn × 1 MB. Linux VPS: 1 vCPU AMD EPYC-Rome, 4 conn × 1 MB. Full matrix below.*
 
 ---
 
@@ -54,9 +56,9 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 **kcptun-rs** is a complete Rust reimplementation that is:
 
 - ✅ **Wire-compatible** with Go kcptun (kcp-go v5) — Rust ↔ Go, Go → Rust, Rust → Rust all work
-- ⚡ **Faster than Go** on most cipher/mode combinations (up to **5.38×**)
+- ⚡ **Faster than Go** on most cipher/mode combinations (up to **5.38×** on macOS, **1.11–1.59×** on Linux VPS)
 - 🧩 **13 encryption backends** + AES-128-GCM: AES, SM4, Salsa20, Blowfish, Twofish, CAST5, 3DES, TEA, XTEA, XOR, and more
-- 🔧 **Dual async runtimes**: tokio (high-concurrency) and smol (lightweight, ARM)
+- ⚡ **Single async runtime**: tokio (multi-threaded, high-concurrency)
 - 🎯 **Production-ready features**: FEC, SMUX v1/v2, QPP obfuscation, SNMP stats, rate limiting, pprof profiling
 - 🔄 **Cross-platform**: macOS, Linux, ARMv7 (Raspberry Pi), ARM64 (Graviton)
 
@@ -73,7 +75,7 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 | **FEC** | Reed-Solomon forward error correction (Go-compatible 10/3 default) |
 | **Compression** | Session-level Snappy compression, Go byte-identical, on by default |
 | **QPP** | Quantum Permutation Pad — optional post-quantum stream obfuscation |
-| **Runtimes** | tokio (default, multi-threaded) **or** smol (lightweight, ARM-optimized) |
+| **Runtime** | tokio (multi-threaded) |
 | **Profiling** | Optional `--pprof` emits Go-compatible protobuf → `go tool pprof` |
 | **Rate Limiting** | Per-connection token bucket pacing (`--ratelimit`) |
 | **SNMP Stats** | Go-compatible SNMP fields with zero-cost opt-in collection |
@@ -129,19 +131,18 @@ kcptun-client -c config.json
 
 ## 📊 Performance Deep Dive
 
-### Bulk Throughput (200 MB, AES-128-CFB, no compression)
+### Bulk Throughput (macOS M1, 200 MB, AES-128-CFB, no compression)
 
 Path labels are **Client → Server** (bulk data leaves the client toward the server; from `bench/run_bench.sh`).
 
 | Path (Client → Server) | Throughput | Latency | vs Go→Go |
 |------|:---------:|:-------:|:--------:|
 | **Go → Go** | 51.15 MB/s | 0.31 ms | 1.00× |
-| **Rust-Tokio → Rust-Tokio** | **85.60 MB/s** 🥈 | **0.12 ms** | **1.67×** |
-| **Rust-Smol → Rust-Smol** | **108.06 MB/s** 🏆 | **0.13 ms** | **2.11×** |
+| **Rust-Tokio → Rust-Tokio** | **85.60 MB/s** 🏆 | **0.12 ms** | **1.67×** |
 | Rust-Tokio → Go | 76.48 MB/s | 0.11 ms | 1.50× |
 | Go → Rust-Tokio | 30.28 MB/s | 0.15 ms | 0.59× |
 
-> Same-stack Rust paths are clearly faster than Go→Go on this M1 host. The smol runtime's lightweight architecture gives it an edge in single-stream bulk transfer.
+> Rust-Tokio is clearly faster than Go→Go on this M1 host.
 
 ### Full Cipher × Compression Matrix
 
@@ -149,35 +150,92 @@ Tests: 10 concurrent connections, 1 MB each, all 30+ runs per cell passed (0 fai
 
 **Without compression** (`--nocomp`):
 
-| Cipher | Tokio | Smol | Go | T/Go | S/Go |
-|--------|:----:|:----:|:--:|:----:|:----:|
-| null | 38.4 | 38.8 | 35.5 | 1.08× | 1.09× |
-| none | 29.4 | 33.3 | 39.2 | 0.75× | 0.85× |
-| xor | 41.6 | 38.3 | 16.4 | **2.54×** | **2.34×** |
-| aes-128 | 43.4 | 38.3 | 27.2 | **1.59×** | **1.41×** |
-| aes-128-gcm | 36.6 | 35.8 | 41.5 | 0.88× | 0.86× |
-| salsa20 | 35.8 | 35.4 | 32.3 | **1.11×** | **1.10×** |
-| blowfish | 31.5 | 31.3 | 28.6 | **1.10×** | **1.09×** |
-| twofish | 35.1 | 37.1 | 23.2 | **1.51×** | **1.60×** |
-| cast5 | 33.3 | 30.1 | 16.9 | **1.98×** | **1.78×** |
-| 3des | 14.5 | 12.6 | 11.8 | **1.23×** | **1.07×** |
-| tea | 38.2 | 35.2 | 31.7 | **1.20×** | **1.11×** |
-| xtea | 24.7 | 22.2 | 18.6 | **1.33×** | **1.20×** |
-| **sm4** | **16.7** | **16.1** | **3.5** | **4.76×** 🏆 | **4.58×** |
+| Cipher | Rust-Tokio | Go | R/Go |
+|--------|:----------:|:--:|:----:|
+| null | 38.4 | 35.5 | 1.08× |
+| none | 29.4 | 39.2 | 0.75× |
+| xor | 41.6 | 16.4 | **2.54×** |
+| aes-128 | 43.4 | 27.2 | **1.59×** |
+| aes-128-gcm | 36.6 | 41.5 | 0.88× |
+| salsa20 | 35.8 | 32.3 | **1.11×** |
+| blowfish | 31.5 | 28.6 | **1.10×** |
+| twofish | 35.1 | 23.2 | **1.51×** |
+| cast5 | 33.3 | 16.9 | **1.98×** |
+| 3des | 14.5 | 11.8 | **1.23×** |
+| tea | 38.2 | 31.7 | **1.20×** |
+| xtea | 24.7 | 18.6 | **1.33×** |
+| **sm4** | **16.7** | **3.5** | **4.76×** 🏆 |
 
 **With compression** (Snappy):
 
-| Cipher | Tokio | Smol | Go | T/Go | S/Go |
-|--------|:----:|:----:|:--:|:----:|:----:|
-| aes-128-gcm | 36.4 | 36.0 | 27.4 | **1.33×** | **1.31×** |
-| salsa20 | 29.0 | 30.6 | 20.1 | **1.44×** | **1.52×** |
-| **sm4** | **18.7** | **18.8** | **3.5** | **5.32×** 🏆 | **5.38×** 🏆 |
-| twofish | 34.4 | 24.9 | 20.4 | **1.69×** | **1.22×** |
-| cast5 | 36.5 | 34.3 | 26.4 | **1.38×** | **1.30×** |
-| blowfish | 34.4 | 26.3 | 25.7 | **1.33×** | 1.02× |
-| aes-128 | 31.3 | 35.7 | 26.5 | **1.18×** | **1.35×** |
+| Cipher | Rust-Tokio | Go | R/Go |
+|--------|:----------:|:--:|:----:|
+| aes-128-gcm | 36.4 | 27.4 | **1.33×** |
+| salsa20 | 29.0 | 20.1 | **1.44×** |
+| **sm4** | **18.7** | **3.5** | **5.32×** 🏆 |
+| twofish | 34.4 | 20.4 | **1.69×** |
+| cast5 | 36.5 | 26.4 | **1.38×** |
+| blowfish | 34.4 | 25.7 | **1.33×** |
+| aes-128 | 31.3 | 26.5 | **1.18×** |
 
 > **SM4** is the standout: Rust outperforms Go by **4.6–5.4×** because the Go implementation uses a pure software S-box while Rust benefits from compiler auto-vectorization and pre-computed lookup tables.
+
+### Linux VPS Benchmark (1 vCPU, AMD EPYC-Rome)
+
+Results from a Linux VPS (CentOS 8, 1 vCPU / 2 threads, AMD EPYC-Rome @ 2.8 GHz, 2 GB RAM) — the kind of low-end cloud instance where kcptun is commonly deployed. Kernel UDP buffers (`net.core.rmem_max=4MB`) and CFS wakeup granularity (1 ms) were tuned before testing (see [Latency Tuning Guide](#-latency-tuning-guide-linux) below).
+
+**Bulk Throughput (100 MB, AES, fast mode, from `bench/run_bench.sh`):**
+
+| Path (Client → Server) | Throughput | Latency | vs Go→Go |
+|------|:---------:|:-------:|:--------:|
+| **Go → Go** | 51.27 MB/s | 0.27 ms | 1.00× |
+| **Rust-Tokio → Rust-Tokio** | **59.91 MB/s** 🏆 | **0.20 ms** | **1.17×** |
+| Rust-Tokio → Go | 57.94 MB/s | 0.23 ms | 1.13× |
+| Go → Rust-Tokio | 64.36 MB/s | 0.20 ms | 1.26× |
+
+**Full Cipher × Compression Matrix (4 conn × 1 MB, from `bench/bench_linux_cmp.py`):**
+
+Without compression (`--nocomp`):
+
+| Cipher | Rust-Tokio | Go | R/Go | Winner |
+|--------|:----------:|:--:|:----:|:------:|
+| null | **66.2** | 49.8 | **1.33×** | Rust |
+| none | **56.6** | 41.7 | **1.36×** | Rust |
+| xor | **58.4** | 36.5 | **1.60×** | Rust |
+| aes-128 | **45.5** | 39.9 | **1.14×** | Rust |
+| aes-192 | **50.1** | 43.9 | **1.14×** | Rust |
+| aes | **50.3** | 35.2 | **1.43×** | Rust |
+| sm4 | **24.3** | 13.0 | **1.87×** | Rust |
+| tea | **36.5** | 27.7 | **1.32×** | Rust |
+| xtea | **23.6** | 18.7 | **1.26×** | Rust |
+| salsa20 | 22.6 | **36.3** | 0.62× | Go |
+| blowfish | **33.4** | 20.2 | **1.65×** | Rust |
+| twofish | **34.3** | 22.4 | **1.53×** | Rust |
+| cast5 | **24.9** | 23.9 | **1.04×** | Rust |
+| 3des | **8.4** | 8.1 | **1.04×** | Rust |
+| aes-128-gcm | **61.7** | 48.2 | **1.28×** | Rust |
+
+With compression (Snappy):
+
+| Cipher | Rust-Tokio | Go | R/Go | Winner |
+|--------|:----------:|:--:|:----:|:------:|
+| null | 50.6 | **52.3** | 0.97× | Go |
+| none | **59.7** | 48.8 | **1.22×** | Rust |
+| xor | **54.7** | 46.8 | **1.17×** | Rust |
+| aes-128 | **60.2** | 32.9 | **1.83×** | Rust 🏆 |
+| aes-192 | **48.6** | 33.4 | **1.46×** | Rust |
+| aes | **50.3** | 37.8 | **1.33×** | Rust |
+| sm4 | **23.8** | 7.5 | **3.17×** | Rust 🏆 |
+| tea | **40.7** | 29.8 | **1.37×** | Rust |
+| xtea | **13.7** | 11.0 | **1.25×** | Rust |
+| salsa20 | 25.4 | **27.5** | 0.92× | Go |
+| blowfish | **29.4** | 21.9 | **1.34×** | Rust |
+| twofish | **33.2** | 20.4 | **1.63×** | Rust |
+| cast5 | **31.3** | 23.2 | **1.35×** | Rust |
+| 3des | **12.1** | 7.9 | **1.53×** | Rust |
+| aes-128-gcm | **48.4** | 38.6 | **1.25×** | Rust |
+
+> **Linux VPS result:** Rust-Tokio wins **28 out of 30** cipher×compression combinations on this 1-vCPU VPS. The only exceptions are `salsa20` (Go's Salsa20 implementation is highly optimized) and `null`+comp (where Go's Snappy edges ahead on trivially compressible data with no crypto overhead). Standout ratios: **SM4+comp 3.17×**, **AES-128+comp 1.83×**, **XOR 1.60×**, **Blowfish 1.65×**, **Twofish 1.53×**. The key prerequisite is tuning kernel UDP buffers (`net.core.rmem_max=4MB`) — with default 208 KB buffers, both backends lose ~80% throughput to silent packet drops.
 
 ### Stress Tests (Data Integrity)
 
@@ -192,6 +250,54 @@ All 8 stress tests pass — verifying **byte-for-byte accuracy** under concurren
 | Large data (100 conn) | 100 | 64KB + 128KB | ✅ |
 | Page refresh simulation | 80 (3 waves) | 512B…128KB | ✅ |
 | Compressible data | 1 | patterns | ✅ |
+
+### Client I/O Modes
+
+The `latency_p99` example supports three client I/O modes to measure the effect of different KCP scheduling architectures on round-trip latency:
+
+```bash
+# 1. Start an echo server in a separate process (avoids CPU contention)
+cargo run -p kcp-rs --features async --example latency_p99 -- --mode server --port 39001
+
+# 2a. Normal mode (per-connection tokio tasks) — the production default
+cargo run -p kcp-rs --features async --example latency_p99 -- \
+    --mode peer --addr 127.0.0.1:39001 --rps 200 --warmup 3 --duration 10
+
+# 2b. WorkerPool direct_rx (1 worker, no reader thread)
+cargo run -p kcp-rs --features async --example latency_p99 -- \
+    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 1 --rps 200 --warmup 3 --duration 10
+
+# 2c. WorkerPool channel (2 workers, dedicated reader + channel)
+cargo run -p kcp-rs --features async --example latency_p99 -- \
+    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 2 --rps 200 --warmup 3 --duration 10
+```
+
+**Architecture comparison:**
+
+| | Normal (per-conn) | WP direct\_rx (1w) | WP channel (2w) |
+|---|---|---|---|
+| **RX path** | `input_loop` tokio task → `kcp.input()` | worker thread `try_recv_from` → `kcp.input()` | reader thread `recv_from().await` → channel → worker `kcp.input()` |
+| **TX path** | `write_all` → inline `try_send_batch_to` | same inline send; flush/retransmit in worker | same inline send; flush/retransmit in worker |
+| **Cross-thread hops** | 0 (same runtime) | 1 (worker → client `read_notify`) | 2 (reader → channel → worker, worker → client) |
+| **Best for** | **All client use cases** | Experimental: low-RPS P999 tuning | Experimental: multi-conn server demux |
+
+**Measured (200 RPS, 1KB, external server, macOS M1):**
+
+| Mode | P50 | P99 | P999 | Max |
+|------|----:|----:|-----:|----:|
+| **Normal** | **604 μs** | **1.1 ms** | 16.6 ms | 26.3 ms |
+| WP direct\_rx (1w) | 1.5 ms | 3.8 ms | 33.4 ms | 42.1 ms |
+| WP channel (2w) | 1.4 ms | 3.7 ms | 15.1 ms | 23.8 ms |
+
+**Measured (128 concurrent, 1KB, external server):**
+
+| Mode | RPS | P50 | P99 | P999 |
+|------|----:|----:|----:|-----:|
+| **Normal** | **49,766** | 2.4 ms | 4.4 ms | 22.6 ms |
+| WP direct\_rx (1w) | 37,764 | 3.3 ms | 4.7 ms | 9.1 ms |
+| WP channel (2w) | 2,465 | 3.7 ms | 5.3 ms | 5.6 ms |
+
+> **Conclusion:** Normal mode (per-connection tokio tasks) is the correct choice for clients. WorkerPool modes add cross-thread wake overhead that hurts P50 and throughput. WorkerPool's value is on the **server side** — shared UDP socket demux for many concurrent connections (not benchmarked here via `latency_p99`).
 
 ---
 
@@ -255,19 +361,17 @@ kcptun-rs/
 ├── kcrypt-rs/       — 13 block ciphers + AES-128-GCM
 ├── smux-rs/         — SMUX stream multiplexer (v1/v2)
 ├── qpp-rs/          — Quantum Permutation Pad obfuscation
-├── kio-rs/          — Async runtime abstraction (tokio / smol)
+├── knet-rs/          — Async I/O abstraction (tokio)
 ├── kpprof-rs/       — Go-compatible pprof HTTP server
 ├── kcptun-common/   — Shared client/server helpers
 ├── kcptun-client/   — Client binary
 └── kcptun-server/   — Server binary + stress tests
 ```
 
-### Dual Runtime Design
+### Runtime Design
 
-- **tokio** (default) — multi-threaded, high-concurrency, production-scaled
-- **smol** (`--no-default-features --features smol`) — lightweight, minimal binary, ARM-optimized  
-- Mutually exclusive features — pick one per build
-- Business code uses `kio::*` abstractions only — never raw tokio/smol APIs
+- **tokio** (sole runtime) — multi-threaded, high-concurrency, production-scaled
+- Business code uses `knet::*` abstractions only — never raw tokio APIs
 
 ### Flush Loop Optimization
 
@@ -309,15 +413,15 @@ make linux             # x86_64 Linux musl (from macOS)
 make linux-aarch64     # ARM64 Linux musl (from macOS)
 ```
 
-ARM cross builds use the **smol** runtime with `pprof` disabled for minimal binary size.
+ARM cross builds use the **tokio** runtime with `pprof` disabled for minimal binary size.
 
 ### Linux Binaries from macOS
 
 Build fully static musl binaries directly from macOS — ideal for CI or deployment testing:
 
 ```bash
-make linux              # x86_64 musl (smol, ~1.3M)
-make linux-aarch64      # ARM64 musl (smol)
+make linux              # x86_64 musl (tokio)
+make linux-aarch64      # ARM64 musl (tokio)
 make linux-full         # x86_64 musl + QPP
 ```
 
@@ -346,6 +450,101 @@ net.inet.udp.recvspace=4194304
 
 > **Linux equivalent:** `net.core.rmem_max`, `net.core.rmem_default`, `net.core.wmem_max`, `net.core.wmem_default` — set to `4194304` or higher. Some distributions also require `net.core.netdev_max_backlog`.
 
+### Runtime Environment Variables
+
+Runtime tuning knobs are read from the environment when the relevant component starts:
+
+| Variable | Default | Scope | Description |
+|---|---|---|---|
+| `KCP_BUSY_YIELDS` | `0` (disabled) | kcp-rs `KcpStream::read` | Spin-bounded busy-poll: how many `yield_now` spins `read()` performs before parking on the wakeup `Notify`. Compensates tokio's notify→wake→schedule→poll hop (~0.2–2 ms per wakeup) — Go gets equivalent wakeup speed for free from its runtime's µs-level goroutine scheduling. |
+| `KCPTUN_WORKER_THREADS` | available parallelism (clamped to 1–16) | `KcpListener` shards | Default listener shard count. A positive value overrides auto-detection; an explicit Builder `worker_count(n)` overrides the environment. This variable does not size the shared Tokio runtime. |
+
+**`KCP_BUSY_YIELDS` rules of thumb** (measured on arm64 macOS, 500 RPS × 26 KB echo; see [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md)):
+
+- **Latency-sensitive request initiator with few connections**: `512` can reduce wakeup tail latency at the cost of CPU.
+- **Listener / high-concurrency server**: keep `0`. Spinning readers compete with connection and flush tasks and can sharply inflate P99.
+- **Throughput-bound / closed-loop workloads**: keep `0`. Spinning measurably regressed closed-loop req/s. Accordingly, `bench/run_p99.sh` enables `512` only for the standalone Rust→Go request initiator (combination 3); Rust↔Rust self mode, the Rust server, and closed-loop runs explicitly use the event-driven setting.
+
+The library default stays `0`, so production deployments remain event-driven. `KcpListener` creates one dedicated current-thread runtime per shard. The shared multi-thread Tokio runtime uses Tokio's system-derived default worker count.
+
+---
+
+## 🎛️ Latency Tuning Guide (Linux)
+
+Practical tuning findings from the P99 optimization work (2026-09). All numbers
+come from controlled same-machine A/B runs on a 1-vCPU Linux VM
+([docs/kcp-rs-optimization-2026-09-01.md](docs/kcp-rs-optimization-2026-09-01.md) §6–§9).
+
+### 1. Let the listener pick its topology (no action needed)
+
+`KcpListener` (used by `kcptun-server`) selects its receive pipeline at bind time:
+
+| Topology | When | What you get |
+|:---------|:-----|:-------------|
+| **Direct single worker** | `worker_count == 1` (any platform) | The worker drains the UDP socket itself — no reader thread, no queue hop. Best default on 1–2 vCPU hosts. |
+| **Direct SO_REUSEPORT group** | Linux, fresh bind, N workers | One socket per worker; the kernel's 4-tuple hash keeps each session pinned to one worker (session affinity without user-space routing). Best for multi-core hosts. |
+| **Reader pipeline** | Shared/external socket + N workers | Dedicated RX thread fans out to worker queues (also the fallback on macOS/Windows, where SO_REUSEPORT does not distribute UDP flows). |
+
+Set the shard count with `KCPTUN_WORKER_THREADS` (library) — on Linux a value > 1
+on a fresh bind automatically uses the reuseport group.
+
+### 2. `--shards N` on kcptun-server (Linux)
+
+Each shard is an independent SO_REUSEPORT socket processed by its own thread,
+so there is no shared-fd send contention.
+
+- Default (`--shards 0`): one shard per logical CPU on **Linux**; a single
+  shard elsewhere (macOS does not distribute UDP via SO_REUSEPORT).
+- Rule of thumb: **shards ≈ vCPUs**. On a 1–2 vCPU box keep 1 shard — every
+  extra worker only adds cross-core wakeups on the same core (the N=2 reuseport
+  path is verified correct, but on a single vCPU it is strictly slower).
+
+### 3. Kernel CFS wakeup granularity — the single biggest P99 knob on Linux
+
+The default `kernel.sched_wakeup_granularity_ns` (15 ms on many distros,
+including CentOS 7 / kernel 3.10) lets a woken task wait up to 15 ms before it
+may preempt the current one. Every hop in the wake chain (socket event →
+runtime → KCP task → flush task) can absorb that gate, producing rare
+**8–12 ms P999 tail clusters** on busy cores. Setting it to 1 ms erases the
+cluster: in the same 3-run validation Rust's p99 dropped from 394 µs to
+**112 µs** (p50/p90 93/91 → 19/78 µs), **beating Go** at every percentile
+(Go is immune because goroutines reschedule on an already-running P in
+user space).
+
+```bash
+# transient
+sudo sysctl -w kernel.sched_wakeup_granularity_ns=1000000
+
+# persistent (recommended for latency-sensitive hosts)
+echo 'kernel.sched_wakeup_granularity_ns=1000000' | sudo tee /etc/sysctl.d/99-kcptun-low-latency.conf
+sudo sysctl --system
+```
+
+Version notes: the knob lives at the `/proc/sys/kernel/` path up to kernel
+5.15, under `/sys/kernel/debug/sched/` (debugfs) on 5.16–6.5, and is **removed
+entirely on ≥ 6.6** (EEVDF scheduler — the gate no longer exists there; just
+skip it). It is a host-wide setting owned by ops, so the binaries never touch
+it themselves.
+
+### 4. OS-level UDP buffers (Linux)
+
+```bash
+sudo sysctl -w net.core.rmem_max=4194304
+sudo sysctl -w net.core.wmem_max=4194304
+```
+
+The binaries already request 4 MB per socket (`knet`); these sysctls just
+raise the kernel ceiling so the requests are honored.
+
+### 5. Quick checklist
+
+| Scenario | Setting |
+|:---------|:--------|
+| 1–2 vCPU host (VPS, container) | 1 shard (`--shards 1` or default worker count 1) + `wakeup_granularity=1ms` |
+| Multi-core host, many concurrent sessions | default `--shards` (= CPUs, reuseport group on Linux) + `wakeup_granularity=1ms` |
+| Lossy network | keep default; FEC (`--datashard/--parityshard`) trades bandwidth for tail latency |
+| Throughput benchmarking | restore `wakeup_granularity` to default (1 ms slightly raises fair-share switching) |
+
 ---
 
 ## 🔬 Optimization Journey
@@ -364,7 +563,9 @@ The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driv
 | + sendmmsg/recvmmsg batch I/O | — | — |
 | + Cipher enum static dispatch | vtable eliminated | — |
 | + macOS UDP buffer tuning (sysctl) | P99 −26%, throughput +28% | — |
-| → **Final (smol bulk)** | **108 MB/s** | **2.11×** 🏆 |
+| + Tokio-aware worker queue (flush timers share the driver's epoll) | open-model p99 −17%, p999 −72~85% | — |
+| + Direct-worker topologies (single-worker takeover + Linux SO_REUSEPORT group) | closed-loop throughput +4.1~6.6%, p99 −6~8% more | — |
+| → **Final (tokio)** | **85.6 MB/s** | **1.67×** |
 
 ### Notable Bug Fixes Found Along the Way
 
@@ -379,7 +580,7 @@ The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driv
 
 ### p99 Latency Collapse Investigation (256KB @ High Concurrency)
 
-Symptom: the raw `kcp-rs` KcpConn (no tunnel layers) collapsed on large
+Symptom: the raw `kcp-rs` KcpStream (no tunnel layers) collapsed on large
 payloads under sustained load — 256KB round-trip at **RPS=300 went from ~4ms
 to p50=3.2s**, while Go with the *identical* 512/512 window + Fast3 config
 stayed at **19ms**. Single-request latency was already fast (4.3ms); the
@@ -403,7 +604,7 @@ fast/early retransmit storm (~20K/2s).
 | `write_notify` → `notify_one()` (permit-storing) — the old `notify_waiters` lost wakes that landed before the waiter registered, forcing 10ms fallbacks under load | conn.rs | RPS=475 clean 2.3ms (was 539ms collapse); RPS=500 p50 500ms+→~100ms |
 
 **Tunnel comparison (why the raw lib's extreme-load queueing isn't a lib defect):**
-the same `kcp_rs::KcpConn` sustains **256KB@RPS=500 at ~11ms, 100% ok** when used
+the same `kcp_rs::KcpStream` sustains **256KB@RPS=500 at ~11ms, 100% ok** when used
 the way the product uses it (the default shared-session tunnel, `copy_bidirectional`
 two-task per conn) — vs Go tunnel 30.5ms. The raw benchmark's residual RPS=500
 deep-queue is the single-task serial-echo worst case at 131 MB/s on one
@@ -432,7 +633,7 @@ re-attempted):
 
 | Test Type | Count | What It Verifies |
 |:----------|:-----:|:-----------------|
-| Unit tests | 237 | Individual crate correctness |
+| Unit tests | 334 | Individual crate correctness |
 | E2E interop | 68 | Go↔Rust bidirectional compatibility |
 | Stress tests | 8 | Byte-for-byte data integrity at scale |
 | Clippy | `-D warnings` | Zero warnings enforced |
@@ -469,6 +670,7 @@ re-attempted):
 |:-----|:--------|:------------|
 | `-l` / `--listen` | `:29900` | KCP listen address |
 | `-t` / `--target` | (required) | TCP target address |
+| `--shards` | `0` (auto: per-CPU on Linux, 1 elsewhere) | SO_REUSEPORT shard sockets — each shard is its own socket + worker thread (see the Latency Tuning Guide below) |
 | `--key` | `it's a secrect` | Pre-shared secret |
 | `--crypt` | `aes` | Encryption (same as client) |
 | `--mode` | `fast` | KCP mode |

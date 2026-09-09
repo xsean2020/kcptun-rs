@@ -31,7 +31,11 @@
 #   MODE       (default fast3)
 #   SMUXVER    (default 2)
 #   CONN       (default 1)
-#   RUNTIME    (default tokio, options: tokio|smol)
+#   RUNTIME    (optional override: tokio|smol|goroutine; otherwise use case runtime)
+#   CONCURRENCY (default 32, bounded open-model probe concurrency)
+#   SERVER_SHARDS (default 1; Linux SO_REUSEPORT shards for multi-P tests)
+#   PROBE      (python, default; or rust for the low-noise std-thread probe)
+#   POST_CASE_COOLDOWN (default 15; seconds for TIME_WAIT drain between cases)
 #
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -48,20 +52,23 @@ CRYPT=${CRYPT:-aes}
 MODE=${MODE:-fast3}
 SMUXVER=${SMUXVER:-2}
 CONN=${CONN:-1}
-RUNTIME=${RUNTIME:-tokio}
+RUNTIME_OVERRIDE=${RUNTIME:-}
+CONCURRENCY=${CONCURRENCY:-32}
+SERVER_SHARDS=${SERVER_SHARDS:-1}
+PROBE=${PROBE:-python}
+POST_CASE_COOLDOWN=${POST_CASE_COOLDOWN:-15}
 CONV=0x00C0_FFEE
 
 # ── Binary paths ──────────────────────────────────────────────────────
-RUST_SERVER="$REPO/target/release/kcptun-server"
-RUST_CLIENT="$REPO/target/release/kcptun-client"
+RUST_TOKIO_SERVER="$REPO/target/release/kcptun-server"
+RUST_TOKIO_CLIENT="$REPO/target/release/kcptun-client"
+RUST_SMOL_SERVER="$REPO/target/smol-release/release/kcptun-server"
+RUST_SMOL_CLIENT="$REPO/target/smol-release/release/kcptun-client"
+RUST_GOROUTINE_SERVER="$REPO/target/goroutine-release/release/kcptun-server"
+RUST_GOROUTINE_CLIENT="$REPO/target/goroutine-release/release/kcptun-client"
+RUST_TUNNEL_PROBE="$REPO/target/release/examples/tunnel_probe"
 GO_SERVER="$REPO/tests/kcptun-go/server"
 GO_CLIENT="$REPO/tests/kcptun-go/client"
-
-# Select runtime flag
-if [ "$RUNTIME" = "smol" ]; then
-    RUST_SERVER="$REPO/target/smol-release/release/kcptun-server"
-    RUST_CLIENT="$REPO/target/smol-release/release/kcptun-client"
-fi
 
 # ── Network impairment setup ─────────────────────────────────────────
 setup_netem() {
@@ -108,6 +115,35 @@ wait_for_port() {
 try:
     s.connect(('127.0.0.1',$port)); s.close()
 except: sys.exit(1)
+" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        tries=$((tries - 1))
+    done
+    return 1
+}
+
+# A listening TCP socket is not sufficient: the local client can accept while
+# its KCP/SMUX path is still creating the first UDP session. Starting an
+# open-model run at that point parks every worker on the first read and turns
+# a startup race into an apparent scheduler regression.
+wait_for_tunnel_echo() {
+    local port=$1 tries=80
+    while [ $tries -gt 0 ]; do
+        if python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(0.25)
+try:
+    s.connect(('127.0.0.1',$port)); s.sendall(b'kcptun-ready')
+    out=b''
+    while len(out) < 12:
+        chunk=s.recv(12-len(out))
+        if not chunk: raise OSError('eof')
+        out += chunk
+    s.close()
+    sys.exit(0 if out == b'kcptun-ready' else 1)
+except Exception:
+    s.close(); sys.exit(1)
 " 2>/dev/null; then
             return 0
         fi
@@ -278,7 +314,7 @@ run_go_comparison() {
 
     cleanup_netem
 }
-run_tunnel_p99() {
+run_tunnel_p99_legacy() {
     local label=$1 client_bin=$2 server_bin=$3 client_port=$4 server_port=$5
     local rps=$6 size=$7 warmup=$8 duration=$9
 
@@ -316,8 +352,8 @@ while True: threading.Thread(target=echo,args=s.accept(),daemon=True).start()
     local CLI_PID=$!
 
     # Wait for client TCP listener
-    if ! wait_for_port "$client_port"; then
-        echo "  ❌ tunnel client not ready on port $client_port"
+    if ! wait_for_tunnel_echo "$client_port"; then
+        echo "  ❌ tunnel did not complete a ready echo on port $client_port"
         kill "$CLI_PID" "$SRV_PID" "$ECHO_PID" 2>/dev/null || true
         wait 2>/dev/null || true
         return 1
@@ -422,6 +458,58 @@ max_us={latencies[-1]:.1f}')
     return $result
 }
 
+# Bounded-concurrency open-model probe. This is intentionally separate from
+# the historical serial probe above: the Python driver creates a connection per
+# request, while the Rust driver keeps one TCP/SMUX stream per worker. Neither
+# may serialize requests in the driver, or scheduler contention is hidden.
+run_tunnel_p99() {
+    local label=$1 client_bin=$2 server_bin=$3 client_port=$4 server_port=$5
+    local rps=$6 size=$7 warmup=$8 duration=$9
+
+    python3 -u "$REPO/bench/echo_server.py" "$server_port" >/dev/null 2>&1 &
+    local echo_pid=$!
+    "$server_bin" -l "0.0.0.0:$server_port" -t "127.0.0.1:$server_port" \
+        --key "tunnel-p99-key" --crypt "$CRYPT" --mode "$MODE" \
+        --smuxver "$SMUXVER" --shards "$SERVER_SHARDS" \
+        --sndwnd 1024 --rcvwnd 1024 --nocomp 2>/dev/null &
+    local server_pid=$!
+    "$client_bin" -l "127.0.0.1:$client_port" -r "127.0.0.1:$server_port" \
+        --key "tunnel-p99-key" --crypt "$CRYPT" --mode "$MODE" \
+        --smuxver "$SMUXVER" --conn "$CONN" \
+        --sndwnd 1024 --rcvwnd 1024 --nocomp 2>/dev/null &
+    local client_pid=$!
+
+    local result=0
+    if ! wait_for_tunnel_echo "$client_port"; then
+        echo "  ❌ tunnel did not complete a ready echo on port $client_port"
+        result=1
+    elif [ "$PROBE" = "rust" ]; then
+        if [ ! -x "$RUST_TUNNEL_PROBE" ]; then
+            echo "  ❌ Rust probe missing: build with cargo build -p kcptun-common --example tunnel_probe --release"
+            result=1
+        elif PROBE_LABEL="$label" "$RUST_TUNNEL_PROBE" \
+            "$client_port" "$rps" "$size" "$warmup" "$duration" "$CONCURRENCY"; then
+            :
+        else
+            result=$?
+        fi
+    elif [ "$PROBE" = "python" ]; then
+        if PROBE_LABEL="$label" python3 -u "$REPO/bench/probe_tunnel.py" \
+            "$client_port" "$rps" "$size" "$warmup" "$duration" "$CONCURRENCY"; then
+            :
+        else
+            result=$?
+        fi
+    else
+        echo "  ❌ unknown PROBE=$PROBE (expected python or rust)"
+        result=1
+    fi
+    kill "$client_pid" "$server_pid" "$echo_pid" 2>/dev/null || true
+    wait "$client_pid" "$server_pid" "$echo_pid" 2>/dev/null || true
+    cleanup_netem
+    return "$result"
+}
+
 # ── Test case runner ──────────────────────────────────────────────────
 run_test_case() {
     local tc_id=$1 label=$2 rps=$3 size=$4 loss=$5 jitter=$6 runtime=$7
@@ -439,8 +527,19 @@ run_test_case() {
         fi
         run_go_comparison "$tc_id" "$label" "$rps" "$size" "$loss" "$jitter"
     else
+        local client_bin server_bin
+        case "$runtime" in
+            tokio) client_bin="$RUST_TOKIO_CLIENT"; server_bin="$RUST_TOKIO_SERVER" ;;
+            smol) client_bin="$RUST_SMOL_CLIENT"; server_bin="$RUST_SMOL_SERVER" ;;
+            goroutine) client_bin="$RUST_GOROUTINE_CLIENT"; server_bin="$RUST_GOROUTINE_SERVER" ;;
+            *) echo "  ❌ unknown runtime: $runtime"; return 1 ;;
+        esac
+        if [ ! -x "$client_bin" ] || [ ! -x "$server_bin" ]; then
+            echo "  ❌ $runtime binaries not found; build its release target first"
+            return 1
+        fi
         setup_netem lo "$loss" "$jitter"
-        run_tunnel_p99 "$tc_id" "$RUST_CLIENT" "$RUST_SERVER" \
+        run_tunnel_p99 "$tc_id" "$client_bin" "$server_bin" \
             12948 29900 "$rps" "$size" "$WARMUP" "$DURATION"
         local result=$?
         cleanup_netem
@@ -450,15 +549,6 @@ run_test_case() {
 
 # ── Main ──────────────────────────────────────────────────────────────
 trap cleanup_netem EXIT
-
-# Verify binaries exist
-for bin in "$RUST_CLIENT" "$RUST_SERVER"; do
-    if [ ! -x "$bin" ]; then
-        echo "❌ Binary not found: $bin"
-        echo "   Run: make release (tokio) or make release-smol (smol)"
-        exit 1
-    fi
-done
 
 # Determine which test cases to run
 if [ "${1:-}" = "all" ]; then
@@ -480,6 +570,10 @@ if [ "${1:-}" = "all" ]; then
         "TC-08|Large-packet smol baseline (1400B, 1 conn, 0% loss)|10000|1400|0|0|smol"
         "TC-09|5% loss stress smol (1KB, 1 conn, 5% loss)|5000|1024|5|0|smol"
         "TC-10|10% loss extreme smol (1KB, 1 conn, 10% loss)|5000|1024|10|0|smol"
+        "TC-11|Small-packet goroutine baseline (128B, 1 conn, 0% loss)|10000|128|0|0|goroutine"
+        "TC-12|Large-packet goroutine baseline (1400B, 1 conn, 0% loss)|10000|1400|0|0|goroutine"
+        "TC-13|5% loss stress goroutine (1KB, 1 conn, 5% loss)|5000|1024|5|0|goroutine"
+        "TC-14|10% loss extreme goroutine (1KB, 1 conn, 10% loss)|5000|1024|10|0|goroutine"
     )
 elif [ -n "${1:-}" ] && [ "$1" != "all" ]; then
     case "$1" in
@@ -499,6 +593,10 @@ elif [ -n "${1:-}" ] && [ "$1" != "all" ]; then
         TC-08) CASES=("TC-08|Large-packet smol baseline (1400B, 1 conn, 0% loss)|10000|1400|0|0|smol") ;;
         TC-09) CASES=("TC-09|5% loss stress smol (1KB, 1 conn, 5% loss)|5000|1024|5|0|smol") ;;
         TC-10) CASES=("TC-10|10% loss extreme smol (1KB, 1 conn, 10% loss)|5000|1024|10|0|smol") ;;
+        TC-11) CASES=("TC-11|Small-packet goroutine baseline (128B, 1 conn, 0% loss)|10000|128|0|0|goroutine") ;;
+        TC-12) CASES=("TC-12|Large-packet goroutine baseline (1400B, 1 conn, 0% loss)|10000|1400|0|0|goroutine") ;;
+        TC-13) CASES=("TC-13|5% loss stress goroutine (1KB, 1 conn, 5% loss)|5000|1024|5|0|goroutine") ;;
+        TC-14) CASES=("TC-14|10% loss extreme goroutine (1KB, 1 conn, 10% loss)|5000|1024|10|0|goroutine") ;;
         *) echo "Unknown test case: $1"; exit 1 ;;
     esac
 else
@@ -509,7 +607,7 @@ echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  kcptun-rs Tunnel P99/P999 Performance Test                   ║"
 echo "║  $(date '+%Y-%m-%d %H:%M')                                    ║"
-echo "║  Runtime: $RUNTIME                                          ║"
+echo "║  Runtime override: ${RUNTIME_OVERRIDE:-case-defined}                         ║"
 echo "║  Crypto: $CRYPT Mode: $MODE  SMUX: v$SMUXVER  Conn: $CONN        ║"
 echo "║  Warmup: ${WARMUP}s  Duration: ${DURATION}s  Payload: ${SIZE}B  Loss: ${LOSS}%  Jitter: ${JITTER}ms ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
@@ -525,19 +623,22 @@ for case_def in "${CASES[@]}"; do
     size=${SIZE:-$size}
     loss=${LOSS:-$loss}
     jitter=${JITTER:-$jitter}
-    runtime=${RUNTIME:-$runtime}
+    runtime=${RUNTIME_OVERRIDE:-$runtime}
 
-    result=$(run_test_case "$tc_id" "$label" "$rps" "$size" "$loss" "$jitter" "$runtime") || {
+    if ! result=$(run_test_case "$tc_id" "$label" "$rps" "$size" "$loss" "$jitter" "$runtime"); then
+        # Command substitution otherwise discards the probe's failure and its
+        # error counters, hiding exactly the signal a tail-latency gate needs.
+        echo "$result"
         echo "  ❌ $tc_id failed"
         RESULTS="${RESULTS}|${tc_id}|FAILED"
         continue
-    }
+    fi
 
     echo "$result"
     RESULTS="${RESULTS}|${tc_id}|${result}"
-    # Drain TIME_WAIT sockets from the connect-per-request probe (~15s on macOS)
-    # so back-to-back cases don't exhaust the ephemeral port range (EADDRNOTAVAIL).
-    sleep 15
+    # The Python probe creates a connection per request; retain a TIME_WAIT
+    # drain between cases on macOS. The persistent Rust probe can set this to 0.
+    sleep "$POST_CASE_COOLDOWN"
 done
 
 # ── Render report ─────────────────────────────────────────────────────
@@ -561,11 +662,16 @@ echo "$RESULTS" | tr '|' '\n' | grep "^TC-" | while read -r tc_id; do
     p50=$(echo "$result_line" | sed -n 's/.*p50_us=\([0-9.]*\).*/\1/p')
     p90=$(echo "$result_line" | sed -n 's/.*p90_us=\([0-9.]*\).*/\1/p')
     p99=$(echo "$result_line" | sed -n 's/.*p99_us=\([0-9.]*\).*/\1/p')
-    p999=$(echo "$result_line" | sed -n 's/.*p999_us=\([0-9.]*\).*/\1/p')
+    p999=$(echo "$result_line" | tr ' ' '\n' | sed -n 's/^p999_us=\([0-9.]*\)$/\1/p')
     avg=$(echo "$result_line" | sed -n 's/.*avg_us=\([0-9.]*\).*/\1/p')
     mn=$(echo "$result_line" | sed -n 's/.*min_us=\([0-9.]*\).*/\1/p')
-    mx=$(echo "$result_line" | sed -n 's/.*max_us=\([0-9.]*\).*/\1/p')
+    mx=$(echo "$result_line" | tr ' ' '\n' | sed -n 's/^max_us=\([0-9.]*\)$/\1/p')
     ok=$(echo "$result_line" | sed -n 's/.*ok=\([0-9]*\).*/\1/p')
+
+    if [ -z "$p50" ] || [ -z "$p90" ] || [ -z "$p99" ] || [ -z "$p999" ] || [ -z "$mx" ]; then
+        echo "| $tc_id | $rps | ${size}B | ${loss}% | — | — | — | — | — | ❌ no successful samples |"
+        continue
+    fi
 
     # Convert µs to ms
     p50_ms=$(awk "BEGIN { printf \"%.2f\", $p50 / 1000 }")

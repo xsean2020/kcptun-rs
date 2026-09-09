@@ -61,19 +61,51 @@ impl Config {
                 self.version
             )));
         }
-        if self.max_receive_buffer < 1024 {
+        if self.keepalive_timeout != 0 {
+            if self.keepalive_interval == 0 {
+                return Err(SessionError::InvalidConfig(
+                    "keep-alive interval must be positive".into(),
+                ));
+            }
+            if self.keepalive_timeout < self.keepalive_interval {
+                return Err(SessionError::InvalidConfig(
+                    "keep-alive timeout must not be shorter than interval".into(),
+                ));
+            }
+        }
+        if self.max_frame_size == 0 {
             return Err(SessionError::InvalidConfig(
-                "max receive buffer too small".into(),
+                "max frame size must be positive".into(),
             ));
         }
-        if self.max_stream_buffer < 1024 {
+        if self.max_frame_size > u16::MAX as usize {
             return Err(SessionError::InvalidConfig(
-                "max stream buffer too small".into(),
+                "max frame size must not exceed 65535".into(),
             ));
         }
-        if self.max_frame_size < 256 {
+        if self.max_receive_buffer == 0 {
             return Err(SessionError::InvalidConfig(
-                "max frame size too small".into(),
+                "max receive buffer must be positive".into(),
+            ));
+        }
+        if self.max_receive_buffer > i32::MAX as usize {
+            return Err(SessionError::InvalidConfig(
+                "max receive buffer must not exceed 2147483647".into(),
+            ));
+        }
+        if self.max_stream_buffer == 0 {
+            return Err(SessionError::InvalidConfig(
+                "max stream buffer must be positive".into(),
+            ));
+        }
+        if self.max_stream_buffer > self.max_receive_buffer {
+            return Err(SessionError::InvalidConfig(
+                "max stream buffer must not exceed max receive buffer".into(),
+            ));
+        }
+        if self.max_stream_buffer > i32::MAX as usize {
+            return Err(SessionError::InvalidConfig(
+                "max stream buffer must not exceed 2147483647".into(),
             ));
         }
         Ok(())
@@ -134,9 +166,9 @@ pub struct Session {
     /// Token bucket for receive flow control (bytes remaining).
     token_bucket: AtomicI32,
     /// Channel sender for pending UPD frames to be sent by the flush loop.
-    upd_tx: kio::Sender<UpdFrame>,
+    upd_tx: knet::Sender<UpdFrame>,
     /// Channel receiver for pending UPD frames.
-    upd_rx: kio::Receiver<UpdFrame>,
+    upd_rx: knet::Receiver<UpdFrame>,
     /// Pending SYN frames to send (queued by SmuxConn::open_stream).
     /// Drained by prepare_outbound_into() at the start of each flush cycle.
     pending_syns: Arc<Mutex<Vec<u32>>>,
@@ -144,7 +176,7 @@ pub struct Session {
     /// Only populated when `accept_enabled` is true (SmuxConn server mode).
     accepted_streams: Arc<Mutex<VecDeque<u32>>>,
     /// Notify for waking SmuxConn::accept() when a new stream arrives.
-    accept_notify: kio::Notify,
+    accept_notify: knet::Notify,
     /// Only push to accepted_streams when true. kcptun never sets this,
     /// so the queue stays empty and there's zero overhead.
     accept_enabled: AtomicBool,
@@ -163,7 +195,7 @@ impl Session {
     /// (starting at 1), server uses even IDs (starting at 0).
     fn new(config: &Config, is_client: bool) -> Result<Self, SessionError> {
         config.verify()?;
-        let (upd_tx, upd_rx) = kio::bounded(UPD_CHANNEL_CAPACITY);
+        let (upd_tx, upd_rx) = knet::bounded(UPD_CHANNEL_CAPACITY);
         let next_id = if is_client { 1 } else { 0 };
         Ok(Session {
             config: config.clone(),
@@ -172,15 +204,15 @@ impl Session {
             next_stream_id: AtomicU32::new(next_id),
             codec: Arc::new(Mutex::new(FrameCodec::new(config.max_receive_buffer))),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
-            last_keepalive_ms: AtomicU64::new(kio::mono_ms()),
-            last_activity_ms: AtomicU64::new(kio::mono_ms()),
+            last_keepalive_ms: AtomicU64::new(knet::mono_ms()),
+            last_activity_ms: AtomicU64::new(knet::mono_ms()),
             max_streams: MAX_STREAMS,
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
             upd_tx,
             upd_rx,
             pending_syns: Arc::new(Mutex::new(Vec::new())),
             accepted_streams: Arc::new(Mutex::new(VecDeque::new())),
-            accept_notify: kio::Notify::new(),
+            accept_notify: knet::Notify::new(),
             accept_enabled: AtomicBool::new(false),
         })
     }
@@ -211,12 +243,6 @@ impl Session {
     #[inline]
     pub fn streams(&self) -> Arc<Mutex<HashMap<u32, Arc<Stream>>>> {
         self.streams.clone()
-    }
-
-    /// Get a reference to the frame codec.
-    #[inline]
-    pub fn codec(&self) -> Arc<Mutex<FrameCodec>> {
-        self.codec.clone()
     }
 
     /// Get the session configuration.
@@ -264,7 +290,7 @@ impl Session {
     }
 
     /// Get the accept notification handle (for SmuxConn::accept()).
-    pub fn accept_notify(&self) -> &kio::Notify {
+    pub fn accept_notify(&self) -> &knet::Notify {
         &self.accept_notify
     }
 
@@ -367,6 +393,10 @@ impl Session {
                 }
                 Cmd::Psh => {
                     // Data push (Go cmdPSH = 2)
+                    if std::env::var("KCP_DBG").is_ok() {
+                        let exists = self.streams.lock().contains_key(&frame.stream_id);
+                        if !exists { eprintln!("DBG-LOST PSH sid={} len={}", frame.stream_id, frame.data.len()); }
+                    }
                     if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
                         // Use zero-copy push_data_bytes: the frame.data is a
                         // reference-counted Bytes slice from the codec buffer.
@@ -514,22 +544,31 @@ impl Session {
     }
 
     /// Perform keepalive check — returns true if a ping should be sent.
+    ///
+    /// `keepalive_interval == 0` means keepalives are disabled (`Config::verify`
+    /// allows `interval == 0` together with `timeout == 0`); without this guard
+    /// the elapsed-time comparison is always true and every idle write-loop
+    /// wake emits a NOP — with kcptun-common's 10 ms idle cadence both peers
+    /// then ping-pong NOPs continuously (observed via frame tracing).
     pub fn check_keepalive(&self) -> bool {
+        if self.config.keepalive_interval == 0 {
+            return false;
+        }
         let last = self.last_keepalive_ms.load(Ordering::Relaxed);
-        let elapsed_ms = kio::mono_ms().saturating_sub(last);
+        let elapsed_ms = knet::mono_ms().saturating_sub(last);
         elapsed_ms >= self.keepalive_interval.as_millis() as u64
     }
 
     /// Update last inbound activity timestamp.
     pub fn update_activity(&self) {
         self.last_activity_ms
-            .store(kio::mono_ms(), Ordering::Relaxed);
+            .store(knet::mono_ms(), Ordering::Relaxed);
     }
 
     /// Mark that a keepalive NOP was just sent (resets the interval).
     pub fn mark_keepalive_sent(&self) {
         self.last_keepalive_ms
-            .store(kio::mono_ms(), Ordering::Relaxed);
+            .store(knet::mono_ms(), Ordering::Relaxed);
     }
 
     /// Returns true if no inbound activity within keepalive_timeout.
@@ -538,7 +577,7 @@ impl Session {
             return false;
         }
         let last = self.last_activity_ms.load(Ordering::Relaxed);
-        let elapsed_ms = kio::mono_ms().saturating_sub(last);
+        let elapsed_ms = knet::mono_ms().saturating_sub(last);
         elapsed_ms >= self.config.keepalive_timeout.saturating_mul(1000)
     }
 
@@ -613,13 +652,26 @@ impl Session {
             // Drain data from streams (PSH frames), respecting per-stream peer window
             // and the overall max_bytes cap. Matches the previous manual Phase 1.
             'outer: for (&id, s) in streams.iter() {
+                // Ordering guard: open_stream inserts the stream and queues its
+                // SYN in two steps, so a stream created after the SYN drain
+                // above can hold queued data here. Emit its SYN now — a PSH or
+                // FIN frame that precedes the SYN on the wire would be dropped
+                // by the peer (unknown stream), leaving an empty stream that
+                // accepts but never delivers data.
+                {
+                    let mut syns = self.pending_syns.lock();
+                    if let Some(pos) = syns.iter().position(|&x| x == id) {
+                        syns.remove(pos);
+                        Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+                    }
+                }
                 loop {
                     if drained_total >= max_bytes {
                         break 'outer;
                     }
                     let header_pos = buf.len();
                     Frame::encode_header_into(buf, ver, Cmd::Psh, id, 0);
-                    let n = s.drain_send_max(buf, crate::frame::MAX_FRAME_SIZE);
+                    let n = s.drain_send_max(buf, self.config.max_frame_size);
                     if n == 0 {
                         buf.truncate(header_pos);
                         break;
@@ -634,6 +686,14 @@ impl Session {
             if allow_fin {
                 for (&id, s) in streams.iter() {
                     if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
+                        // Same ordering guard as the PSH loop above.
+                        {
+                            let mut syns = self.pending_syns.lock();
+                            if let Some(pos) = syns.iter().position(|&x| x == id) {
+                                syns.remove(pos);
+                                Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+                            }
+                        }
                         debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
                         Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
                         fin_streams.push(id);
@@ -808,6 +868,19 @@ mod tests {
         cfg.version = 2;
         cfg.max_receive_buffer = 0;
         assert!(cfg.verify().is_err());
+
+        cfg.max_receive_buffer = DEFAULT_CONFIG.max_receive_buffer;
+        cfg.max_frame_size = u16::MAX as usize + 1;
+        assert!(cfg.verify().is_err());
+
+        cfg.max_frame_size = DEFAULT_CONFIG.max_frame_size;
+        cfg.max_stream_buffer = cfg.max_receive_buffer + 1;
+        assert!(cfg.verify().is_err());
+
+        cfg.max_stream_buffer = DEFAULT_CONFIG.max_stream_buffer;
+        cfg.keepalive_interval = 31;
+        cfg.keepalive_timeout = 30;
+        assert!(cfg.verify().is_err());
     }
 
     #[test]
@@ -894,6 +967,58 @@ mod tests {
     }
 
     #[test]
+    /// Regression: a stream created via `open_stream` + `queue_syn` can hold
+    /// queued data BEFORE the session's next `prepare_outbound` runs. The SYN
+    /// and the data must reach the wire in SYN-first order — a PSH that
+    /// precedes its SYN is dropped by the peer (unknown stream), which leaves
+    /// an accepted-but-empty stream and deadlocks the writer (observed as
+    /// `fresh_stream_echoes_*` hangs on macOS).
+    #[test]
+    fn session_prepare_outbound_orders_syn_before_psh_of_same_stream() {
+        let cfg = Config {
+            version: 1,
+            keepalive_interval: 0,
+            keepalive_timeout: 0,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let stream = session.open_stream().unwrap();
+        let sid = stream.id();
+        session.queue_syn(sid);
+        // Data queued while the SYN is still in pending_syns.
+        stream.write(&[0xAA]).unwrap();
+
+        let mut out = BytesMut::new();
+        session.prepare_outbound_into_controlled(&mut out, 64 * 1024, 1, false);
+        assert!(!out.is_empty());
+
+        // Walk frames: SYN(sid) must appear before PSH(sid).
+        let b = &out[..];
+        let mut i = 0usize;
+        let mut syn_pos = None;
+        let mut psh_pos = None;
+        while i + 8 <= b.len() {
+            let cmd = b[i + 1];
+            let len = u16::from_le_bytes([b[i + 2], b[i + 3]]) as usize;
+            let fsid = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap());
+            if fsid == sid {
+                if cmd == 0 && syn_pos.is_none() {
+                    syn_pos = Some(i);
+                }
+                if cmd == 2 && psh_pos.is_none() {
+                    psh_pos = Some(i);
+                }
+            }
+            i += 8 + len;
+        }
+        let syn_pos = syn_pos.expect("SYN for the stream must be emitted");
+        if let Some(p) = psh_pos {
+            assert!(syn_pos < p, "SYN must precede PSH on the wire");
+        }
+        // The SYN must not linger in pending_syns after this prepare.
+        assert!(session.pending_syns.lock().is_empty());
+    }
+
     fn session_prepare_outbound_respects_max_bytes_and_peer_window() {
         let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
         let s = session.open_stream().unwrap();
@@ -912,6 +1037,30 @@ mod tests {
         assert!(buf.len() < big.len(), "should be capped by max_bytes");
         // Stream should still have pending data.
         assert!(s.pending_send() > 0);
+    }
+
+    #[test]
+    fn session_prepare_outbound_respects_configured_frame_size() {
+        let cfg = Config {
+            max_frame_size: 1024,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let stream = session.open_stream().unwrap();
+        stream.write_bytes(Bytes::from(vec![b'x'; 2500])).unwrap();
+
+        let mut buf = BytesMut::new();
+        let _ = session.prepare_outbound_into(&mut buf, 64 * 1024, 2);
+
+        let mut codec = FrameCodec::new(cfg.max_receive_buffer);
+        codec.feed(&buf);
+        let mut lengths = Vec::new();
+        while let Some(frame) = codec.decode() {
+            if frame.cmd == Cmd::Psh {
+                lengths.push(frame.data.len());
+            }
+        }
+        assert_eq!(lengths, vec![1024, 1024, 452]);
     }
 
     #[test]

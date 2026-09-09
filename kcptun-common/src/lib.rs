@@ -2,7 +2,7 @@
 //!
 //! Runtime-agnostic: key derivation, KCP mode profiles, Snappy framing,
 //! rate limiter.
-//! Runtime-gated (`tokio` / `smol`): pipe, snmp logger, encrypted KCP
+//! Runtime-gated (`tokio`): pipe, snmp logger, encrypted KCP
 //! transport assembly, KCP config, and optional QPP port.
 //!
 //! `KcptunSession` is the complete per-peer KCP + Snappy + SMUX abstraction.
@@ -18,37 +18,37 @@ mod snappy_frame;
 
 pub use key::derive_key;
 pub use mode::apply_mode;
-pub use multiport::parse_multi_port;
+pub use multiport::{parse_multi_port, random_remote_addr};
 pub use ratelimit::RateLimiter;
 pub use snappy_frame::SnappyStreamDecoder;
 
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 mod kcp_config;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 mod kcp_transport;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 mod kcptun_session;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 mod pipe;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 mod snappy_pipe;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 mod snmp_log;
 
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 pub use kcp_config::{
     kcp_config_from, kcp_config_from_cli, parse_kcp_mode, KcpCliParams, DEFAULT_CONV,
 };
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 pub use kcp_transport::CryptoTransport;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 pub use kcptun_session::{KcptunConfig, KcptunSession};
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 pub use pipe::pipe;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 pub use snappy_pipe::SnappyPipe;
-#[cfg(any(feature = "tokio", feature = "smol"))]
-pub use snmp_log::snmp_logger;
+#[cfg(feature = "tokio")]
+pub use snmp_log::{snmp_logger, snmp_signal_logger};
 
 #[cfg(feature = "qpp")]
 mod qpp_port;

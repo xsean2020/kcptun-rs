@@ -1,14 +1,15 @@
-//! Datagram transport layer for the async `KcpConn`.
+//! Datagram transport layer for the async `KcpStream`.
 //!
 //! [`PacketTransport`] is the pluggable packet-delivery abstraction under
-//! [`crate::KcpConn`]; [`PeerQueue`]/[`PeerTransport`] back the shared-socket
-//! server demultiplexer in [`crate::KcpListener`] (per-peer inbound queues and
-//! the per-peer transport fed from them).
+//! [`crate::KcpStream`]; [`PeerTransport`] is the per-peer transport handed to
+//! streams accepted by the shared-socket server demultiplexer in
+//! [`crate::KcpListener`] (inbound datagrams are fed by the worker via
+//! `feed_raw_batch`, not through the legacy [`PeerQueue`]).
 
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -21,9 +22,9 @@ pub(crate) const MAX_RETAINED_PEER_BUFFERS: usize = 64;
 
 // ─── PacketTransport ──────────────────────────────────────────────────────────
 
-/// Pluggable datagram layer under [`crate::KcpConn`].
+/// Pluggable datagram layer under [`crate::KcpStream`].
 ///
-/// Implementations: [`kio::DatagramSocket`] (plain UDP / TcpRaw) and
+/// Implementations: [`knet::DatagramSocket`] (plain UDP / TcpRaw) and
 /// `kcptun_common::CryptoTransport` (encrypt/decrypt wrapper).
 ///
 /// Uses `#[async_trait]` so async methods are object-safe without hand-written
@@ -36,6 +37,17 @@ pub trait PacketTransport: Send + Sync {
 
     /// Non-blocking read; `WouldBlock` when nothing ready.
     fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Decrypt a single raw datagram **in place**, without going through the
+    /// internal queue. Returns the plaintext length, or 0 on bad packets.
+    ///
+    /// The default implementation is identity (no crypto). `CryptoTransport`
+    /// overrides this to call its decrypt path directly, avoiding the
+    /// push/pop queue round-trip when the worker processes packets serially.
+    fn decrypt_packet_in_place(&self, buf: &mut [u8], n: usize) -> usize {
+        let _ = buf;
+        n
+    }
 
     /// Read one datagram into reusable owned storage.
     ///
@@ -77,9 +89,21 @@ pub trait PacketTransport: Send + Sync {
     /// for a later send (e.g. via the flush loop).
     ///
     /// Default: unavailable → `Err(WouldBlock)`, so callers fall back to the
-    /// async flush-loop path (existing behavior). `kio::DatagramSocket`
+    /// async flush-loop path (existing behavior). `knet::DatagramSocket`
     /// overrides this with a real non-blocking send.
     fn try_send_batch(&self, _packets: &[Bytes]) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    }
+
+    /// Non-blocking batch send to an explicit peer (unconnected socket).
+    /// Returns the number of datagrams handed to the kernel, stopping at the
+    /// first `WouldBlock` (socket send buffer full); the caller must re-queue
+    /// `packets[sent..]` for a later send.
+    ///
+    /// Default: unavailable → `Err(WouldBlock)`, so callers fall back to the
+    /// async flush-loop path (existing behavior). `knet::DatagramSocket`
+    /// overrides this with a real non-blocking send.
+    fn try_send_batch_to(&self, _packets: &[Bytes], _target: SocketAddr) -> io::Result<usize> {
         Err(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
@@ -108,33 +132,55 @@ pub trait PacketTransport: Send + Sync {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Set the TTL (hop limit) on the underlying socket.
+    /// Default: `Unsupported` (no raw socket to configure).
+    fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "set_ttl not available on this transport",
+        ))
+    }
+
+    /// Get the TTL (hop limit) from the underlying socket.
+    /// Default: `Unsupported` (no raw socket to query).
+    fn ttl(&self) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ttl not available on this transport",
+        ))
+    }
 }
 
 #[async_trait::async_trait]
-impl PacketTransport for kio::DatagramSocket {
+impl PacketTransport for knet::DatagramSocket {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         // Call inherent method (not trait) to avoid recursion.
-        kio::DatagramSocket::recv(self, buf).await
+        knet::DatagramSocket::recv(self, buf).await
     }
 
     fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        kio::DatagramSocket::try_recv(self, buf)
+        knet::DatagramSocket::try_recv(self, buf)
     }
 
     async fn send_batch(&self, packets: &[Bytes]) -> io::Result<()> {
-        kio::DatagramSocket::send_batch(self, packets).await
+        knet::DatagramSocket::send_batch(self, packets).await
     }
 
     async fn send_batch_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<()> {
-        kio::DatagramSocket::send_batch_to(self, packets, target).await
+        knet::DatagramSocket::send_batch_to(self, packets, target).await
     }
 
     fn try_send_batch(&self, packets: &[Bytes]) -> io::Result<usize> {
-        kio::DatagramSocket::try_send_batch(self, packets)
+        knet::DatagramSocket::try_send_batch(self, packets)
+    }
+
+    fn try_send_batch_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<usize> {
+        knet::DatagramSocket::try_send_batch_to(self, packets, target)
     }
 
     fn try_recv_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
-        kio::DatagramSocket::try_recv_batch(self, pool)
+        knet::DatagramSocket::try_recv_batch(self, pool)
     }
 
     fn supports_recv_batch(&self) -> bool {
@@ -142,37 +188,43 @@ impl PacketTransport for kio::DatagramSocket {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        kio::DatagramSocket::local_addr(self)
+        knet::DatagramSocket::local_addr(self)
+    }
+
+    fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        knet::DatagramSocket::set_ttl(self, ttl)
+    }
+
+    fn ttl(&self) -> io::Result<u32> {
+        knet::DatagramSocket::ttl(self)
     }
 }
 
 // ─── Per-peer queue + transport (KcpListener demux) ───────────────────────────
 
-/// Per-peer inbound queue + wakeup used by [`crate::KcpListener`] to feed one
-/// shared bound socket's datagrams into each accepted [`crate::KcpConn`].
+/// FIFO of inbound datagrams for a single peer.
 ///
-/// The queue is **drop-tail bounded**: when `max_packets` is reached, new
-/// datagrams are dropped (the listener must never wait on a peer's queue, or a
-/// slow peer would stall the whole shared socket). KCP retransmission recovers
-/// dropped datagrams.
+/// **Historical note:** this queue once fed each accepted peer's input loop
+/// (`PeerTransport::recv`). The sharded worker pipeline now feeds datagrams
+/// directly via `feed_raw_batch`, so nothing pushes into the queue in
+/// production; only the pop side remains as the trait's required receive
+/// implementations and returns `WouldBlock` / blocks on a permanently empty
+/// queue. Kept because `PeerTransport` must implement `PacketTransport`.
+#[allow(dead_code)]
 pub(crate) struct PeerQueue {
     buffers: Mutex<PeerBuffers>,
-    notify: kio::Notify,
+    notify: knet::Notify,
     closed: AtomicBool,
-    /// Drop-tail cap on queued packets (0 = unbounded).
-    max_packets: usize,
-    /// Shared listener drop counter (relaxed increments; opt-in observability).
-    drops: Arc<AtomicU64>,
 }
 
 struct PeerBuffers {
     packets: VecDeque<Vec<u8>>,
-    packet_bytes: usize,
     spare: Vec<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 impl PeerQueue {
-    pub(crate) fn new(max_packets: usize, drops: Arc<AtomicU64>) -> Self {
+    pub(crate) fn new() -> Self {
         // Keep only a tiny spare-vector index up front. Packet-sized buffers
         // are allocated lazily as traffic arrives, avoiding 128KiB of eager
         // storage for every idle peer; the recycle cap still bounds retained
@@ -181,47 +233,16 @@ impl PeerQueue {
         Self {
             buffers: Mutex::new(PeerBuffers {
                 packets: VecDeque::new(),
-                packet_bytes: 0,
                 spare,
             }),
-            notify: kio::Notify::new(),
+            notify: knet::Notify::new(),
             closed: AtomicBool::new(false),
-            max_packets,
-            drops,
-        }
-    }
-
-    /// Queue a packet and return storage suitable for the listener's next recv,
-    /// plus whether the packet actually entered the queue. On drop-tail the
-    /// dropped packet's buffer is recycled as the returned recv slot (no fresh
-    /// alloc) and `queued` is `false` so the reader skips a pointless notify.
-    pub(crate) fn push_and_reuse(&self, pkt: Vec<u8>) -> (Vec<u8>, bool) {
-        let mut buffers = self.buffers.lock();
-        if self.max_packets > 0 && buffers.packets.len() >= self.max_packets {
-            // Drop-tail: drop the newest datagram (keep queued order intact),
-            // recycling its buffer as the next recv slot — no fresh alloc.
-            self.drops.fetch_add(1, Ordering::Relaxed);
-            let mut next = pkt;
-            next.resize(MAX_DATAGRAM, 0);
-            (next, false)
-        } else {
-            buffers.packet_bytes += pkt.len();
-            buffers.packets.push_back(pkt);
-            (
-                buffers
-                    .spare
-                    .pop()
-                    .unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]),
-                true,
-            )
         }
     }
 
     fn pop(&self) -> Option<Vec<u8>> {
         let mut buffers = self.buffers.lock();
-        let pkt = buffers.packets.pop_front()?;
-        buffers.packet_bytes = buffers.packet_bytes.saturating_sub(pkt.len());
-        Some(pkt)
+        buffers.packets.pop_front()
     }
 
     /// Move a queued datagram into the consumer buffer and recycle the
@@ -229,7 +250,6 @@ impl PeerQueue {
     fn pop_into(&self, buf: &mut Vec<u8>) -> Option<usize> {
         let mut buffers = self.buffers.lock();
         let mut pkt = buffers.packets.pop_front()?;
-        buffers.packet_bytes = buffers.packet_bytes.saturating_sub(pkt.len());
         std::mem::swap(buf, &mut pkt);
         let n = buf.len();
         if buffers.spare.len() < MAX_RETAINED_PEER_BUFFERS {
@@ -251,7 +271,6 @@ impl PeerQueue {
                 Some(p) => p,
                 None => break,
             };
-            buffers.packet_bytes = buffers.packet_bytes.saturating_sub(pkt.len());
             std::mem::swap(&mut pool[n], &mut pkt);
             if buffers.spare.len() < MAX_RETAINED_PEER_BUFFERS {
                 pkt.resize(MAX_DATAGRAM, 0);
@@ -274,25 +293,18 @@ impl PeerQueue {
         self.closed.store(true, Ordering::Release);
         self.notify.notify_waiters();
     }
-
-    /// Wake a single waiting consumer. The listener routes a whole socket drain
-    /// into peer queues, then notifies each affected queue once so the peer
-    /// input loop drains the burst and batches ACKs.
-    pub(crate) fn notify_one(&self) {
-        self.notify.notify_one();
-    }
 }
 
 /// `PacketTransport` for one accepted peer: reads inbound from its
 /// [`PeerQueue`] and writes outbound on the shared listen socket addressed to
 /// that peer.
 ///
-/// Dropping the transport (i.e. dropping the accepted `KcpConn`) closes the
+/// Dropping the transport (i.e. dropping the accepted `KcpStream`) closes the
 /// peer queue so the listener reaps it and can accept a fresh connection from
 /// the same address.
 pub(crate) struct PeerTransport {
     pub(crate) queue: Arc<PeerQueue>,
-    pub(crate) socket: Arc<kio::DatagramSocket>,
+    pub(crate) socket: Arc<knet::DatagramSocket>,
     pub(crate) peer: SocketAddr,
 }
 
@@ -308,7 +320,7 @@ impl PacketTransport for PeerTransport {
             if self.queue.is_closed() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
-                    "KcpConn: peer session closed",
+                    "KcpStream: peer session closed",
                 ));
             }
             // Arm the notification, then re-check to close the wake race.
@@ -321,7 +333,7 @@ impl PacketTransport for PeerTransport {
             if self.queue.is_closed() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
-                    "KcpConn: peer session closed",
+                    "KcpStream: peer session closed",
                 ));
             }
             notified.await;
@@ -350,7 +362,7 @@ impl PacketTransport for PeerTransport {
             if self.queue.is_closed() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
-                    "KcpConn: peer session closed",
+                    "KcpStream: peer session closed",
                 ));
             }
             let notified = self.queue.notify.notified();
@@ -360,7 +372,7 @@ impl PacketTransport for PeerTransport {
             if self.queue.is_closed() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
-                    "KcpConn: peer session closed",
+                    "KcpStream: peer session closed",
                 ));
             }
             notified.await;
@@ -389,6 +401,10 @@ impl PacketTransport for PeerTransport {
         self.socket.send_batch_to(packets, self.peer).await
     }
 
+    fn try_send_batch_to(&self, packets: &[Bytes], _target: SocketAddr) -> io::Result<usize> {
+        self.socket.try_send_batch_to(packets, self.peer)
+    }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -410,73 +426,10 @@ pub(crate) type TransportWrapper =
 mod tests {
     use super::*;
 
-    /// Batch pop preserves queue order and recycles the consumer buffers.
-    #[test]
-    fn pop_batch_preserves_order_and_recycles() {
-        let drops = Arc::new(AtomicU64::new(0));
-        let q = PeerQueue::new(8, drops);
-        for i in 0..5 {
-            q.push_and_reuse(vec![0u8; 10 + i]); // payload sizes 10..14
-        }
-        let mut pool: Vec<Vec<u8>> = (0..3).map(|_| vec![0u8; MAX_DATAGRAM]).collect();
-        let n = q.pop_batch(&mut pool).unwrap();
-        assert_eq!(n, 3);
-        assert_eq!(pool[0].len(), 10);
-        assert_eq!(pool[1].len(), 11);
-        assert_eq!(pool[2].len(), 12);
-
-        let mut pool2: Vec<Vec<u8>> = (0..3).map(|_| vec![0u8; MAX_DATAGRAM]).collect();
-        let n2 = q.pop_batch(&mut pool2).unwrap();
-        assert_eq!(n2, 2);
-        assert_eq!(pool2[0].len(), 13);
-        assert_eq!(pool2[1].len(), 14);
-
-        let err = q.pop_batch(&mut pool2).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-    }
-
-    /// Drop-tail cap keeps the first queued packets and drops new ones once the
-    /// bound is reached; the drop counter reflects the tail drops.
-    #[test]
-    fn push_drop_tail_when_bounded() {
-        let drops = Arc::new(AtomicU64::new(0));
-        let q = PeerQueue::new(3, drops.clone());
-        for i in 0..5 {
-            q.push_and_reuse(vec![0u8; i + 1]);
-        }
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
-        let mut pool: Vec<Vec<u8>> = (0..3).map(|_| vec![0u8; MAX_DATAGRAM]).collect();
-        let n = q.pop_batch(&mut pool).unwrap();
-        assert_eq!(n, 3);
-        // First three enqueued survive (sizes 1,2,3); the last two are dropped.
-        assert_eq!(pool[0].len(), 1);
-        assert_eq!(pool[1].len(), 2);
-        assert_eq!(pool[2].len(), 3);
-    }
-
-    /// Drop-tail recycles the dropped packet's buffer as the next recv slot
-    /// (capacity preserved, no fresh allocation) and reports `queued = false`.
-    #[test]
-    fn push_drop_tail_recycles_buffer() {
-        let drops = Arc::new(AtomicU64::new(0));
-        let q = PeerQueue::new(1, drops.clone());
-        // First datagram queues (queue cap = 1).
-        let (_, queued) = q.push_and_reuse(vec![1u8; 5]);
-        assert!(queued);
-        // Second datagram is drop-tailed; its buffer is recycled in place.
-        let mut dropped = vec![2u8; 3];
-        dropped.reserve(MAX_DATAGRAM);
-        let (recycled, queued) = q.push_and_reuse(dropped);
-        assert!(!queued);
-        assert_eq!(recycled.len(), MAX_DATAGRAM);
-        assert!(recycled.capacity() >= MAX_DATAGRAM);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
-    }
-
+    /// Idle peers must not preallocate packet buffers.
     #[test]
     fn peer_queue_spares_are_lazy() {
-        let drops = Arc::new(AtomicU64::new(0));
-        let q = PeerQueue::new(0, drops);
+        let q = PeerQueue::new();
         let buffers = q.buffers.lock();
         assert!(
             buffers.spare.is_empty(),

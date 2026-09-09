@@ -1,34 +1,32 @@
 [package]
 name = "kcp-rs"
-version = "0.1.0"
+version = "0.2.7"
 edition = "2021"
 description = "KCP protocol implementation in Rust - reliable UDP transport"
 
 [dependencies]
 bytes = "1"
 parking_lot = "0.12"
+crossbeam-channel = "0.5"
 reed-solomon-erasure = "6"
-crc32fast = "1"
 smallvec = "1"
 thiserror.workspace = true
 async-trait.workspace = true
-# Optional async runtime + I/O (KcpConn). Enable via async-tokio or async-smol.
-kio-rs = { path = "../kio-rs", default-features = false, optional = true }
+# Optional async runtime + I/O (KcpStream). Enable via `async` feature.
+knet-rs = { path = "../knet-rs", default-features = false, optional = true }
 # Optional pprof for profiling examples (build with --features pprof)
 kpprof-rs = { path = "../kpprof-rs", default-features = false, optional = true }
 
 [dev-dependencies]
-# Integration tests for KcpConn need a runtime; async-tokio feature pulls kio/tokio.
+# Integration tests for KcpStream need a runtime.
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 libc = "0.2"
+# Used by the latency example's worker-count diagnostics.
+num_cpus = "1"
 
 [features]
 default = []
-# Convenience alias → tokio backend (matches smux-rs default).
-async = ["async-tokio"]
-# Async KcpConn over kio (tokio runtime).
-async-tokio = ["dep:kio-rs", "kio-rs/tokio"]
-# Async KcpConn over kio (smol runtime). Mutually exclusive with async-tokio at kio level.
-async-smol = ["dep:kio-rs", "kio-rs/smol"]
+# Async KcpStream over knet (tokio runtime).
+async = ["dep:knet-rs"]
 # pprof HTTP server for profiling (use with --profile profiling)
 pprof = ["dep:kpprof-rs", "kpprof-rs/tokio"]

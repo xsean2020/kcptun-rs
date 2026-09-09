@@ -14,16 +14,16 @@
 //!   - No batch averaging, no percentile-of-percentiles
 //!
 //! Usage:
-//!   cargo run -p kcp-rs --features async-tokio --example tunnel_latency \
+//!   cargo run -p kcp-rs --features async --example tunnel_latency \
 //!       -- --mode self --rps 10000 --size 1024 --duration 180 --warmup 30
-//!   cargo run -p kcp-rs --features async-smol  --example tunnel_latency \
+//!   cargo run -p kcp-rs --features async  --example tunnel_latency \
 //!       -- --mode self --rps 10000 --size 1024 --duration 180 --warmup 30
 //!
 //! Emits a RESULT line suitable for parsing by bench/report scripts:
 //!   RESULT combo=<id> samples=<N> ok=<N> size=<B> rps=<R>
 //!          p50_us=.. p90_us=.. p99_us=.. p999_us=.. avg_us=.. min_us=.. max_us=..
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 mod probe {
     use std::collections::VecDeque;
     use std::env;
@@ -31,8 +31,8 @@ mod probe {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use kcp_rs::{KcpConn, KcpListener, KcpMode, PacketTransport};
-    use kio::{AsyncReadExt, AsyncWriteExt};
+    use kcp_rs::{KcpListener, KcpMode, KcpStream, PacketTransport};
+    use knet::{AsyncReadExt, AsyncWriteExt};
 
     /// Default tunnel-stack parameters (match kcptun production defaults).
     const MTU: u32 = 1350;
@@ -123,7 +123,7 @@ mod probe {
 
     /// Read exactly `buf.len()` bytes from `conn`, polling with a timeout.
     async fn read_exact(
-        conn: &mut KcpConn,
+        conn: &mut KcpStream,
         buf: &mut [u8],
         limit: Duration,
     ) -> std::io::Result<()> {
@@ -136,7 +136,7 @@ mod probe {
                     format!("timeout waiting for echo, got {filled}/{}", buf.len()),
                 ));
             }
-            match kio::timeout(Duration::from_millis(200), conn.read(&mut buf[filled..])).await {
+            match knet::timeout(Duration::from_millis(200), conn.read(&mut buf[filled..])).await {
                 Ok(Ok(0)) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -151,14 +151,14 @@ mod probe {
         Ok(())
     }
 
-    /// Build a `KcpConn` bound to a fresh loopback port, sending to `peer`.
-    async fn build_conn(peer: SocketAddr) -> std::io::Result<KcpConn> {
-        let tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    /// Build a `KcpStream` bound to a fresh loopback port, sending to `peer`.
+    async fn build_conn(peer: SocketAddr) -> std::io::Result<KcpStream> {
+        let tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
         let local = tmp.local_addr()?;
         drop(tmp);
-        let sock = kio::UdpSocket::connect(local, peer)?;
-        KcpConn::with_transport(
-            Arc::new(kio::DatagramSocket::Udp(sock)) as Arc<dyn PacketTransport>,
+        let sock = knet::UdpSocket::connect(local, peer)?;
+        KcpStream::with_transport(
+            Arc::new(knet::DatagramSocket::Udp(sock)) as Arc<dyn PacketTransport>,
             peer,
         )
         .connected(true)
@@ -172,7 +172,7 @@ mod probe {
     }
 
     /// Echo server loop: read `size` bytes, write them back verbatim, repeat.
-    async fn echo_loop(mut conn: KcpConn, size: usize) {
+    async fn echo_loop(mut conn: KcpStream, size: usize) {
         let mut buf = vec![0u8; size];
         loop {
             if read_exact(&mut conn, &mut buf, Duration::from_secs(30))
@@ -195,7 +195,7 @@ mod probe {
     /// latencies (µs) across the measurement phase. Returns
     /// `(raw_latencies_us, measure_sends, measure_ok)`.
     async fn run_open(
-        conn: &mut KcpConn,
+        conn: &mut KcpStream,
         rps: u32,
         warmup: Duration,
         duration: Duration,
@@ -234,9 +234,9 @@ mod probe {
             let until_send = next_send.saturating_duration_since(Instant::now());
             let poll_for = until_send.min(Duration::from_micros(100));
             let read = if poll_for.is_zero() {
-                kio::timeout(Duration::from_micros(100), conn.read(&mut rx[rx_filled..])).await
+                knet::timeout(Duration::from_micros(100), conn.read(&mut rx[rx_filled..])).await
             } else {
-                kio::timeout(poll_for, conn.read(&mut rx[rx_filled..])).await
+                knet::timeout(poll_for, conn.read(&mut rx[rx_filled..])).await
             };
             match read {
                 Ok(Ok(n)) => {
@@ -320,7 +320,7 @@ mod probe {
         );
     }
 
-    async fn measure(combo: &str, conn: &mut KcpConn, args: &Args) {
+    async fn measure(combo: &str, conn: &mut KcpStream, args: &Args) {
         let (lat, sends, ok) = run_open(
             conn,
             args.rps,
@@ -348,7 +348,7 @@ mod probe {
             .unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let mut client = KcpConn::connect(addr)
+        let mut client = KcpStream::connect(addr)
             .conv(args.conv)
             .mode(KcpMode::Fast3)
             .sndwnd(SNDWND)
@@ -358,7 +358,7 @@ mod probe {
             .unwrap();
 
         let size = args.size;
-        let server_handle = kio::spawn_task(async move {
+        let server_handle = knet::spawn_task(async move {
             if let Ok((conn, _peer)) = listener.accept().await {
                 echo_loop(conn, size).await;
             }
@@ -372,7 +372,7 @@ mod probe {
 
     async fn run_peer(args: &Args) {
         let peer = args.peer.expect("peer mode requires --addr");
-        let mut conn = build_conn(peer).await.expect("failed to build KcpConn");
+        let mut conn = build_conn(peer).await.expect("failed to build KcpStream");
         measure("tunnel-rust-go", &mut conn, args).await;
     }
 
@@ -391,7 +391,7 @@ mod probe {
         );
         let size = args.size;
         while let Ok((conn, _peer)) = listener.accept().await {
-            drop(kio::spawn_task(echo_loop(conn, size)));
+            drop(knet::spawn_task(echo_loop(conn, size)));
         }
     }
 
@@ -406,7 +406,7 @@ mod probe {
         block_future(args.rt_single, fut);
     }
 
-    #[cfg(feature = "async-tokio")]
+    #[cfg(feature = "async")]
     fn block_future(
         single: bool,
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
@@ -418,29 +418,29 @@ mod probe {
                 .expect("failed to build current-thread runtime");
             rt.block_on(fut);
         } else {
-            kio::block_on(fut);
+            knet::block_on(fut);
         }
     }
 
-    #[cfg(not(feature = "async-tokio"))]
+    #[cfg(not(feature = "async"))]
     fn block_future(
         _single: bool,
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
     ) {
-        kio::block_on(fut);
+        knet::block_on(fut);
     }
 }
 
-#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+#[cfg(feature = "async")]
 fn main() {
     probe::run();
 }
 
-#[cfg(not(any(feature = "async-tokio", feature = "async-smol")))]
+#[cfg(not(any(feature = "async", feature = "async")))]
 fn main() {
     eprintln!(
-        "error: this example requires the `async-tokio` or `async-smol` feature, e.g.\n\
-         cargo run -p kcp-rs --features async-tokio --example tunnel_latency -- --mode self"
+        "error: this example requires the `async` or `async` feature, e.g.\n\
+         cargo run -p kcp-rs --features async --example tunnel_latency -- --mode self"
     );
     std::process::exit(2);
 }

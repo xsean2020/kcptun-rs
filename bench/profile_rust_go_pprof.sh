@@ -40,14 +40,25 @@ MODE="${MODE:-fast}"
 SNDWND="${SNDWND:-1024}"
 RCVWND="${RCVWND:-1024}"
 SMUXVER="${SMUXVER:-2}"
+# Compression toggle: NOCOMP=1 (default) adds --nocomp; NOCOMP=0 profiles the
+# Snappy path (the bench scenario where Rust loses to Go on null/comp).
+NOCOMP="${NOCOMP:-1}"
+if [ "$NOCOMP" = "1" ]; then
+    NOCOMP_ARG="--nocomp"
+else
+    NOCOMP_ARG=""
+fi
 OUT_DIR="${OUT_DIR:-bench/profiles}"
-PPROF_PORT="${PPROF_PORT:-16060}"
+# pprof is now a bool flag (--pprof), always listening on :6060 (matching Go kcptun).
+# To avoid conflicts when running Rust + Go simultaneously, stop any Go pprof
+# first, or run them on separate machines / containers.
+PPROF_ADDR="127.0.0.1:6060"
 SERVER="${RUST_SERVER:-$ROOT/target/profiling/kcptun-server}"
 CLIENT="${RUST_CLIENT:-$ROOT/target/profiling/kcptun-client}"
-# fallback to release if profiling missing
-[ -x "$SERVER" ] || SERVER="$ROOT/target/release/kcptun-server"
-[ -x "$CLIENT" ] || CLIENT="$ROOT/target/release/kcptun-client"
-COMMON="--crypt $CRYPT --nocomp --mode $MODE --sndwnd $SNDWND --rcvwnd $RCVWND --smuxver $SMUXVER"
+# fallback to release if profiling missing (warn: no frame pointers → degraded stacks)
+[ -x "$SERVER" ] || { echo "WARNING: $SERVER missing — using release binary (no frame pointers, degraded stacks)" >&2; SERVER="$ROOT/target/release/kcptun-server"; }
+[ -x "$CLIENT" ] || { echo "WARNING: $CLIENT missing — using release binary (no frame pointers, degraded stacks)" >&2; CLIENT="$ROOT/target/release/kcptun-client"; }
+COMMON="--crypt $CRYPT $NOCOMP_ARG --mode $MODE --sndwnd $SNDWND --rcvwnd $RCVWND --smuxver $SMUXVER"
 
 mkdir -p "$OUT_DIR"
 
@@ -97,12 +108,11 @@ sleep 0.3
 
 TS=$(date +%Y%m%d-%H%M%S)
 OUT_PB="$OUT_DIR/rust-${SIDE}-${CRYPT}-${TS}.pb"
-PPROF_ADDR="127.0.0.1:${PPROF_PORT}"
 
 case "$SIDE" in
     server)
         "$SERVER" -l "0.0.0.0:$SERVER_PORT" -t "127.0.0.1:$ECHO_PORT" \
-            --key "$KEY" $COMMON --pprof "$PPROF_ADDR" >/tmp/rust-go-pprof-s.log 2>&1 &
+            --key "$KEY" $COMMON --pprof >/tmp/rust-go-pprof-s.log 2>&1 &
         SERVER_PID=$!
         sleep 0.8
         "$CLIENT" -l "127.0.0.1:$CLIENT_PORT" -r "127.0.0.1:$SERVER_PORT" \
@@ -115,7 +125,7 @@ case "$SIDE" in
         SERVER_PID=$!
         sleep 0.5
         "$CLIENT" -l "127.0.0.1:$CLIENT_PORT" -r "127.0.0.1:$SERVER_PORT" \
-            --key "$KEY" $COMMON --pprof "$PPROF_ADDR" >/tmp/rust-go-pprof-c.log 2>&1 &
+            --key "$KEY" $COMMON --pprof >/tmp/rust-go-pprof-c.log 2>&1 &
         CLIENT_PID=$!
         ;;
     *)

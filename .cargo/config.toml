@@ -3,11 +3,14 @@
 
 # ARMv8 AES for RustCrypto `aes` 0.8 (Apple Silicon / aarch64 Linux).
 # Without this cfg, AES uses soft fixslice even when the CPU has FEAT_AES.
+# Also enables ARMv8 PMULL for GHASH (`polyval` crate), which is the missing
+# ingredient for GCM hardware acceleration — without it, aes-128-gcm uses soft
+# polyval (GHASH) and runs at ~0.65× of Go's hardware-accelerated GCM.
 [target.aarch64-apple-darwin]
-rustflags = ["--cfg", "aes_armv8"]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["--cfg", "aes_armv8"]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
 
 [target.x86_64-unknown-linux-gnu]
 linker = "x86_64-linux-gnu-gcc"

@@ -8,11 +8,7 @@
 # harness, no network beyond 127.0.0.1 loopback:
 #
 #   1. Sync KCP data-correctness tests   (default features, no async deps)
-#   2. Full suite + async KcpConn/KcpListener tests (tokio backend)
-#   3. Full suite + async KcpConn/KcpListener tests (smol backend)
-#
-# `--all-features` is intentionally NOT used: kio-rs enforces that tokio and
-# smol are mutually exclusive (see kio-rs/build.rs).
+#   2. Full suite + async KcpStream/KcpListener tests (tokio backend)
 
 set -euo pipefail
 
@@ -21,16 +17,12 @@ cd "$(dirname "$0")"
 echo "==== kcp-rs standalone tests ===="
 echo
 
-echo "==> [1/3] Sync KCP data-correctness (default features)"
+echo "==> [1/2] Sync KCP data-correctness (default features)"
 cargo test -p kcp-rs
 
 echo
-echo "==> [2/3] Async KcpConn integrity (tokio)"
-cargo test -p kcp-rs --features async-tokio
-
-echo
-echo "==> [3/3] Async KcpConn integrity (smol)"
-cargo test -p kcp-rs --features async-smol
+echo "==> [2/2] Async KcpStream integrity (tokio)"
+cargo test -p kcp-rs --features async
 
 echo
 echo "All kcp-rs standalone tests passed."

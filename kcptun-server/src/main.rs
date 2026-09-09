@@ -44,7 +44,6 @@ fn rotate_log(log_path: &str, max_size: u64) {
 }
 
 fn main() -> Result<()> {
-    use clap::Parser;
-    let cli = cli::Cli::parse();
-    kio::block_on(app::async_main(cli))
+    let cli = cli::Cli::parse_go_compatible();
+    knet::block_on(app::async_main(cli))
 }

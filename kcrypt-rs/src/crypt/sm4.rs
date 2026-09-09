@@ -71,6 +71,8 @@ fn tp(x: u32) -> u32 {
 #[derive(Debug)]
 pub struct Sm4Crypt {
     rk: [u32; 32],
+    /// Cached `E(GO_CFB_IV)` (first CFB-128 keystream block, per-key constant).
+    first_keystream: [u8; 16],
 }
 
 impl Sm4Crypt {
@@ -86,7 +88,18 @@ impl Sm4Crypt {
             k[i + 4] = k[i] ^ tp(k[i + 1] ^ k[i + 2] ^ k[i + 3] ^ CK[i]);
             rk[i] = k[i + 4];
         }
-        Sm4Crypt { rk }
+        let mut first = [0u8; 16];
+        let mut b = [0u8; 16];
+        let c = Sm4Crypt {
+            rk,
+            first_keystream: [0u8; 16],
+        };
+        c.encrypt_block(&super::GO_CFB_IV, &mut b);
+        first.copy_from_slice(&b);
+        Sm4Crypt {
+            rk: c.rk,
+            first_keystream: first,
+        }
     }
 
     fn encrypt_block(&self, inp: &[u8; 16], out: &mut [u8; 16]) {
@@ -109,6 +122,11 @@ impl BlockCipher16 for Sm4Crypt {
     #[inline]
     fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]) {
         self.encrypt_block(inp, out);
+    }
+
+    #[inline]
+    fn cached_first_keystream(&self) -> Option<[u8; 16]> {
+        Some(self.first_keystream)
     }
 }
 

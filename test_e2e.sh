@@ -1,6 +1,6 @@
 #!/bin/bash
 # kcptun end-to-end interoperability test suite.
-# Tests Go↔Rust (tokio & smol) compatibility for all encryption algorithms,
+# Tests Go↔Rust compatibility for all encryption algorithms,
 # KCP modes, SMUX versions, and compression settings.
 set -eo pipefail
 cd "$(dirname "$0")"
@@ -10,8 +10,6 @@ GO_SERVER=./tests/kcptun-go/server
 GO_CLIENT=./tests/kcptun-go/client
 RUST_SERVER=./target/release/kcptun-server
 RUST_CLIENT=./target/release/kcptun-client
-RUST_SMOL_SERVER=./target/smol-release/release/kcptun-server
-RUST_SMOL_CLIENT=./target/smol-release/release/kcptun-client
 PASS=0; FAIL=0; SKIP=0
 
 # Dynamic port counter — each test uses 3 ports (echo, server, local)
@@ -105,14 +103,8 @@ skip_test() {
     SKIP=$((SKIP+1))
 }
 
-# Check if smol release binaries are available
-have_smol() {
-    [ -x "$RUST_SMOL_SERVER" ] && [ -x "$RUST_SMOL_CLIENT" ]
-}
-
 echo "Starting e2e test suite (port base: $PORT)"
-echo "  Rust-tokio: $([ -x "$RUST_SERVER" ] && echo '✓' || echo '✗ (run: make release)')"
-echo "  Rust-smol:  $(have_smol && echo '✓' || echo '✗ (run: make release-smol) — smol tests will be skipped')"
+echo "  Rust: $([ -x "$RUST_SERVER" ] && echo '✓' || echo '✗ (run: make release)')"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -202,65 +194,6 @@ try_test "Go→Rust FEC 10/3"   "$RUST_SERVER" "--crypt aes --nocomp --datashard
 try_test "Rust→Go FEC 10/3"   "$GO_SERVER"   "--crypt aes --nocomp --datashard 10 --parityshard 3"  "$RUST_CLIENT" "--crypt aes --nocomp --datashard 10 --parityshard 3"
 try_test "Go→Rust FEC 4/2"   "$RUST_SERVER" "--crypt aes --nocomp --datashard 4 --parityshard 2"   "$GO_CLIENT" "--crypt aes --nocomp --datashard 4 --parityshard 2"
 try_test "Rust→Go FEC 4/2"   "$GO_SERVER"   "--crypt aes --nocomp --datashard 4 --parityshard 2"   "$RUST_CLIENT" "--crypt aes --nocomp --datashard 4 --parityshard 2"
-
-# ═══════════════════════════════════════════════════════════════════════
-# Section 7: Rust-smol interop (Go↔smol, smol↔tokio, smol↔smol)
-# ═══════════════════════════════════════════════════════════════════════
-echo ""
-echo "━━━ Section 7: Rust-smol interop ━━━"
-
-if have_smol; then
-    # 7a: Baseline cross-product with smol
-    echo "  ── 7a: Baseline (smol) ──"
-    try_test "Go→Smol nocomp"      "$RUST_SMOL_SERVER" "--crypt aes --nocomp" "$GO_CLIENT"        "--crypt aes --nocomp"
-    try_test "Go→Smol compress"    "$RUST_SMOL_SERVER" "--crypt aes"          "$GO_CLIENT"        "--crypt aes"
-    try_test "Smol→Go nocomp"      "$GO_SERVER"        "--crypt aes --nocomp" "$RUST_SMOL_CLIENT" "--crypt aes --nocomp"
-    try_test "Smol→Go compress"    "$GO_SERVER"        "--crypt aes"          "$RUST_SMOL_CLIENT" "--crypt aes"
-    try_test "Smol→Smol nocomp"    "$RUST_SMOL_SERVER" "--crypt aes --nocomp" "$RUST_SMOL_CLIENT" "--crypt aes --nocomp"
-    try_test "Smol→Smol compress"  "$RUST_SMOL_SERVER" "--crypt aes"          "$RUST_SMOL_CLIENT" "--crypt aes"
-    try_test "Smol→Tokio nocomp"   "$RUST_SERVER"      "--crypt aes --nocomp" "$RUST_SMOL_CLIENT" "--crypt aes --nocomp"
-    try_test "Smol→Tokio compress" "$RUST_SERVER"      "--crypt aes"          "$RUST_SMOL_CLIENT" "--crypt aes"
-    try_test "Tokio→Smol nocomp"   "$RUST_SMOL_SERVER" "--crypt aes --nocomp" "$RUST_CLIENT"      "--crypt aes --nocomp"
-    try_test "Tokio→Smol compress" "$RUST_SMOL_SERVER" "--crypt aes"          "$RUST_CLIENT"      "--crypt aes"
-
-    # 7b: Encryption algorithms (Go↔smol, nocomp)
-    echo "  ── 7b: Encryption algorithms (Go↔smol, --nocomp) ──"
-    for crypt in $CRYPTS; do
-        try_test "Go→Smol crypt=$crypt" "$RUST_SMOL_SERVER" "--crypt $crypt --nocomp" "$GO_CLIENT"        "--crypt $crypt --nocomp"
-        try_test "Smol→Go crypt=$crypt" "$GO_SERVER"        "--crypt $crypt --nocomp" "$RUST_SMOL_CLIENT" "--crypt $crypt --nocomp"
-    done
-
-    # 7c: KCP modes (Go↔smol)
-    echo "  ── 7c: KCP modes (Go↔smol, crypt=aes, nocomp) ──"
-    for mode in $MODES; do
-        try_test "Go→Smol mode=$mode" "$RUST_SMOL_SERVER" "--crypt aes --mode $mode --nocomp" "$GO_CLIENT"        "--crypt aes --mode $mode --nocomp"
-        try_test "Smol→Go mode=$mode" "$GO_SERVER"        "--crypt aes --mode $mode --nocomp" "$RUST_SMOL_CLIENT" "--crypt aes --mode $mode --nocomp"
-    done
-
-    # 7d: SMUX versions (Go↔smol)
-    echo "  ── 7d: SMUX versions (Go↔smol, crypt=aes, nocomp) ──"
-    try_test "Go→Smol smuxver=1" "$RUST_SMOL_SERVER" "--crypt aes --smuxver 1 --nocomp" "$GO_CLIENT"        "--crypt aes --smuxver 1 --nocomp"
-    try_test "Smol→Go smuxver=1" "$GO_SERVER"        "--crypt aes --smuxver 1 --nocomp" "$RUST_SMOL_CLIENT" "--crypt aes --smuxver 1 --nocomp"
-    try_test "Go→Smol smuxver=2" "$RUST_SMOL_SERVER" "--crypt aes --smuxver 2 --nocomp" "$GO_CLIENT"        "--crypt aes --smuxver 2 --nocomp"
-    try_test "Smol→Go smuxver=2" "$GO_SERVER"        "--crypt aes --smuxver 2 --nocomp" "$RUST_SMOL_CLIENT" "--crypt aes --smuxver 2 --nocomp"
-
-    # 7e: Encryption + compression (Go↔smol)
-    echo "  ── 7e: Encryption + compression (Go↔smol) ──"
-    for crypt in $COMP_CRYPTS; do
-        try_test "Go→Smol crypt=$crypt +compress" "$RUST_SMOL_SERVER" "--crypt $crypt" "$GO_CLIENT"        "--crypt $crypt"
-        try_test "Smol→Go crypt=$crypt +compress" "$GO_SERVER"        "--crypt $crypt" "$RUST_SMOL_CLIENT" "--crypt $crypt"
-    done
-
-    # 7f: FEC (Go↔smol)
-    echo "  ── 7f: FEC (Go↔smol, crypt=aes, nocomp) ──"
-    try_test "Go→Smol FEC 10/3" "$RUST_SMOL_SERVER" "--crypt aes --nocomp --datashard 10 --parityshard 3" "$GO_CLIENT"        "--crypt aes --nocomp --datashard 10 --parityshard 3"
-    try_test "Smol→Go FEC 10/3" "$GO_SERVER"        "--crypt aes --nocomp --datashard 10 --parityshard 3" "$RUST_SMOL_CLIENT" "--crypt aes --nocomp --datashard 10 --parityshard 3"
-    try_test "Go→Smol FEC 4/2"  "$RUST_SMOL_SERVER" "--crypt aes --nocomp --datashard 4 --parityshard 2"  "$GO_CLIENT"        "--crypt aes --nocomp --datashard 4 --parityshard 2"
-    try_test "Smol→Go FEC 4/2"  "$GO_SERVER"        "--crypt aes --nocomp --datashard 4 --parityshard 2"  "$RUST_SMOL_CLIENT" "--crypt aes --nocomp --datashard 4 --parityshard 2"
-else
-    echo "  ⏭️  Smol tests skipped (binaries not found — run: make release-smol)"
-    SKIP=$((SKIP+1))
-fi
 
 # ═══════════════════════════════════════════════════════════════════════
 # tcpraw --tcp transport (Linux+root only)

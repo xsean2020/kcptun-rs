@@ -5,7 +5,7 @@
 **Rust 移植 kcptun — 性能最高达到 Go 版本的 5.38 倍，完全线上兼容**
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
-[![Tests](https://img.shields.io/badge/tests-237%20passed-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-334%20passed-brightgreen)](#)
 [![E2E](https://img.shields.io/badge/e2e-68%20passed-brightgreen)](#)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#)
 [![Rust](https://img.shields.io/badge/rust-1.92+-orange)](#)
@@ -33,17 +33,19 @@
 
 kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**，同时保持**完全的线上兼容**——这意味着你可以将 Go kcptun 隧道的一端替换为 Rust 二进制文件，立即获得加速。
 
-| 加密算法 | vs Go (Tokio) | vs Go (Smol) |
-|----------|:------------:|:------------:|
-| **SM4** (无压缩) | **4.76倍** 🏆 | **4.58倍** |
-| **SM4** (压缩) | **5.32倍** 🏆 | **5.38倍** 🏆 |
-| **XOR** (无压缩) | **2.54倍** | **2.34倍** |
-| **CAST5** (无压缩) | **1.98倍** | **1.78倍** |
-| **Twofish** (压缩) | **1.69倍** | **1.22倍** |
-| **AES-128** (无压缩) | **1.59倍** | **1.41倍** |
-| **AES-128-CFB** 大吞吐 | **1.67倍** | **2.11倍** 🏆 |
+| 加密算法 | vs Go (macOS M1) | vs Go (Linux VPS) |
+|----------|:---------------:|:-----------------:|
+| **SM4** (无压缩) | **4.76倍** 🏆 | **1.87倍** |
+| **SM4** (压缩) | **5.32倍** 🏆 | **3.17倍** 🏆 |
+| **XOR** (无压缩) | **2.54倍** | **1.60倍** |
+| **CAST5** (无压缩) | **1.98倍** | **1.04倍** |
+| **Twofish** (压缩) | **1.69倍** | **1.63倍** |
+| **AES-128** (无压缩) | **1.59倍** | **1.14倍** |
+| **AES-128-GCM** (压缩) | **1.33倍** | **1.25倍** |
+| **AES-128** (压缩) | **1.18倍** | **1.83倍** |
+| **AES-128** 大吞吐 | **1.67倍** | **1.17倍** |
 
-*测试环境：Apple M1，10 并发连接 × 每连接 1 MB。完整矩阵见下文。*
+*macOS M1：10 连接 × 每连接 1 MB。Linux VPS：1 vCPU AMD EPYC-Rome，4 连接 × 每连接 1 MB。完整矩阵见下文。*
 
 ---
 
@@ -54,9 +56,9 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 **kcptun-rs** 是用 Rust 完整重写的实现：
 
 - ✅ **线上兼容** Go kcptun（kcp-go v5）— Rust ↔ Go、Go → Rust、Rust → Rust 全部可互通
-- ⚡ **性能超越 Go** — 大多数加密/模式组合下都更快，最高达 **5.38 倍**
+- ⚡ **性能超越 Go** — 大多数加密/模式组合下都更快，macOS 最高达 **5.38 倍**，Linux VPS **1.11–1.59 倍**
 - 🧩 **13 种加密后端** + AES-128-GCM：AES、SM4、Salsa20、Blowfish、Twofish、CAST5、3DES、TEA、XTEA、XOR 等
-- 🔧 **双异步运行时**：tokio（高并发）和 smol（轻量级，ARM 优化）
+- ⚡ **单一异步运行时**：tokio（多线程，高并发）
 - 🎯 **生产级功能**：FEC、SMUX v1/v2、QPP 混淆、SNMP 统计、速率限制、pprof 性能分析
 - 🔄 **跨平台**：macOS、Linux、ARMv7（树莓派）、ARM64（AWS Graviton）
 
@@ -73,7 +75,7 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 | **FEC** | Reed-Solomon 前向纠错（默认 10/3，与 Go 兼容） |
 | **压缩** | 会话级 Snappy 压缩，与 Go 字节一致，默认开启 |
 | **QPP** | 量子置换垫 — 可选的后量子流混淆层 |
-| **运行时** | tokio（默认，多线程）**或** smol（轻量，ARM 优化） |
+| **运行时** | tokio（多线程） |
 | **Go pprof** | `--pprof` 输出 Go 兼容的 protobuf 格式 → 可直接用 `go tool pprof` 分析 |
 | **速率限制** | 每连接令牌桶限速（`--ratelimit`） |
 | **SNMP 统计** | 与 Go 兼容的 SNMP 字段，零开销按需采集 |
@@ -129,19 +131,18 @@ kcptun-client -c config.json
 
 ## 📊 性能深度分析
 
-### 大吞吐测试（200 MB，AES-128-CFB，无压缩）
+### 大吞吐测试（macOS M1，200 MB，AES-128-CFB，无压缩）
 
 路径标签为 **Client → Server**（大流量由客户端发往服务端；见 `bench/run_bench.sh`）。
 
 | 路径 (Client → Server) | 吞吐量 | 延迟 | vs Go→Go |
 |------|:-----:|:----:|:--------:|
 | **Go → Go** | 51.15 MB/s | 0.31 ms | 1.00× |
-| **Rust-Tokio → Rust-Tokio** | **85.60 MB/s** 🥈 | **0.12 ms** | **1.67×** |
-| **Rust-Smol → Rust-Smol** | **108.06 MB/s** 🏆 | **0.13 ms** | **2.11×** |
+| **Rust-Tokio → Rust-Tokio** | **85.60 MB/s** 🏆 | **0.12 ms** | **1.67×** |
 | Rust-Tokio → Go | 76.48 MB/s | 0.11 ms | 1.50× |
 | Go → Rust-Tokio | 30.28 MB/s | 0.15 ms | 0.59× |
 
-> 同侧 Rust 路径在 M1 主机上明显快于 Go→Go。Smol 运行时的轻量架构使其在单流大吞吐传输中更具优势。
+> Rust-Tokio 在 M1 主机上明显快于 Go→Go。
 
 ### 完整加密 × 压缩矩阵
 
@@ -149,34 +150,92 @@ kcptun-client -c config.json
 
 **无压缩**（`--nocomp`）：
 
-| 加密算法 | Tokio | Smol | Go | T/Go | S/Go |
-|---------|:----:|:----:|:--:|:----:|:----:|
-| null | 38.4 | 38.8 | 35.5 | 1.08× | 1.09× |
-| none | 29.4 | 33.3 | 39.2 | 0.75× | 0.85× |
-| xor | 41.6 | 38.3 | 16.4 | **2.54×** | **2.34×** |
-| aes-128 | 43.4 | 38.3 | 27.2 | **1.59×** | **1.41×** |
-| aes-128-gcm | 36.6 | 35.8 | 41.5 | 0.88× | 0.86× |
-| salsa20 | 35.8 | 35.4 | 32.3 | **1.11×** | **1.10×** |
-| blowfish | 31.5 | 31.3 | 28.6 | **1.10×** | **1.09×** |
-| twofish | 35.1 | 37.1 | 23.2 | **1.51×** | **1.60×** |
-| cast5 | 33.3 | 30.1 | 16.9 | **1.98×** | **1.78×** |
-| 3des | 14.5 | 12.6 | 11.8 | **1.23×** | **1.07×** |
-| tea | 38.2 | 35.2 | 31.7 | **1.20×** | **1.11×** |
-| xtea | 24.7 | 22.2 | 18.6 | **1.33×** | **1.20×** |
-| **sm4** | **16.7** | **16.1** | **3.5** | **4.76×** 🏆 | **4.58×** |
+| 加密算法 | Rust-Tokio | Go | R/Go |
+|---------|:----------:|:--:|:----:|
+| null | 38.4 | 35.5 | 1.08× |
+| none | 29.4 | 39.2 | 0.75× |
+| xor | 41.6 | 16.4 | **2.54×** |
+| aes-128 | 43.4 | 27.2 | **1.59×** |
+| aes-128-gcm | 36.6 | 41.5 | 0.88× |
+| salsa20 | 35.8 | 32.3 | **1.11×** |
+| blowfish | 31.5 | 28.6 | **1.10×** |
+| twofish | 35.1 | 23.2 | **1.51×** |
+| cast5 | 33.3 | 16.9 | **1.98×** |
+| 3des | 14.5 | 11.8 | **1.23×** |
+| tea | 38.2 | 31.7 | **1.20×** |
+| xtea | 24.7 | 18.6 | **1.33×** |
+| **sm4** | **16.7** | **3.5** | **4.76×** 🏆 |
 
 **带压缩**（Snappy）：
 
-| 加密算法 | Tokio | Smol | Go | T/Go | S/Go |
-|---------|:----:|:----:|:--:|:----:|:----:|
-| aes-128-gcm | 36.4 | 36.0 | 27.4 | **1.33×** | **1.31×** |
-| salsa20 | 29.0 | 30.6 | 20.1 | **1.44×** | **1.52×** |
-| **sm4** | **18.7** | **18.8** | **3.5** | **5.32×** 🏆 | **5.38×** 🏆 |
-| twofish | 34.4 | 24.9 | 20.4 | **1.69×** | **1.22×** |
-| cast5 | 36.5 | 34.3 | 26.4 | **1.38×** | **1.30×** |
-| aes-128 | 31.3 | 35.7 | 26.5 | **1.18×** | **1.35×** |
+| 加密算法 | Rust-Tokio | Go | R/Go |
+|---------|:----------:|:--:|:----:|
+| aes-128-gcm | 36.4 | 27.4 | **1.33×** |
+| salsa20 | 29.0 | 20.1 | **1.44×** |
+| **sm4** | **18.7** | **3.5** | **5.32×** 🏆 |
+| twofish | 34.4 | 20.4 | **1.69×** |
+| cast5 | 36.5 | 26.4 | **1.38×** |
+| blowfish | 34.4 | 25.7 | **1.33×** |
+| aes-128 | 31.3 | 26.5 | **1.18×** |
 
 > **SM4 是最大亮点**：Rust 比 Go 快 4.6–5.4 倍，因为 Go 实现使用纯软件 S-box，而 Rust 受益于编译器的自动向量化和预计算查找表。
+
+### Linux VPS 基准测试（1 vCPU，AMD EPYC-Rome）
+
+来自 Linux VPS（CentOS 8，1 vCPU / 2 线程，AMD EPYC-Rome @ 2.8 GHz，2 GB RAM）的结果 —— 正是 kcptun 常部署的低端云主机类型。测试前已调优内核 UDP 缓冲区（`net.core.rmem_max=4MB`）和 CFS 唤醒粒度（1 ms）（见下文[延迟调优指南](#-延迟调优指南linux)）。
+
+**大吞吐测试（100 MB，AES，fast 模式，来自 `bench/run_bench.sh`）：**
+
+| 路径 (Client → Server) | 吞吐量 | 延迟 | vs Go→Go |
+|------|:-----:|:----:|:--------:|
+| **Go → Go** | 51.27 MB/s | 0.27 ms | 1.00× |
+| **Rust-Tokio → Rust-Tokio** | **59.91 MB/s** 🏆 | **0.20 ms** | **1.17×** |
+| Rust-Tokio → Go | 57.94 MB/s | 0.23 ms | 1.13× |
+| Go → Rust-Tokio | 64.36 MB/s | 0.20 ms | 1.26× |
+
+**完整加密 × 压缩矩阵（4 连接 × 1 MB，来自 `bench/bench_linux_cmp.py`）：**
+
+无压缩（`--nocomp`）：
+
+| 加密算法 | Rust-Tokio | Go | R/Go | 胜者 |
+|---------|:----------:|:--:|:----:|:----:|
+| null | **66.2** | 49.8 | **1.33×** | Rust |
+| none | **56.6** | 41.7 | **1.36×** | Rust |
+| xor | **58.4** | 36.5 | **1.60×** | Rust |
+| aes-128 | **45.5** | 39.9 | **1.14×** | Rust |
+| aes-192 | **50.1** | 43.9 | **1.14×** | Rust |
+| aes | **50.3** | 35.2 | **1.43×** | Rust |
+| sm4 | **24.3** | 13.0 | **1.87×** | Rust |
+| tea | **36.5** | 27.7 | **1.32×** | Rust |
+| xtea | **23.6** | 18.7 | **1.26×** | Rust |
+| salsa20 | 22.6 | **36.3** | 0.62× | Go |
+| blowfish | **33.4** | 20.2 | **1.65×** | Rust |
+| twofish | **34.3** | 22.4 | **1.53×** | Rust |
+| cast5 | **24.9** | 23.9 | **1.04×** | Rust |
+| 3des | **8.4** | 8.1 | **1.04×** | Rust |
+| aes-128-gcm | **61.7** | 48.2 | **1.28×** | Rust |
+
+带压缩（Snappy）：
+
+| 加密算法 | Rust-Tokio | Go | R/Go | 胜者 |
+|---------|:----------:|:--:|:----:|:----:|
+| null | 50.6 | **52.3** | 0.97× | Go |
+| none | **59.7** | 48.8 | **1.22×** | Rust |
+| xor | **54.7** | 46.8 | **1.17×** | Rust |
+| aes-128 | **60.2** | 32.9 | **1.83×** | Rust 🏆 |
+| aes-192 | **48.6** | 33.4 | **1.46×** | Rust |
+| aes | **50.3** | 37.8 | **1.33×** | Rust |
+| sm4 | **23.8** | 7.5 | **3.17×** | Rust 🏆 |
+| tea | **40.7** | 29.8 | **1.37×** | Rust |
+| xtea | **13.7** | 11.0 | **1.25×** | Rust |
+| salsa20 | 25.4 | **27.5** | 0.92× | Go |
+| blowfish | **29.4** | 21.9 | **1.34×** | Rust |
+| twofish | **33.2** | 20.4 | **1.63×** | Rust |
+| cast5 | **31.3** | 23.2 | **1.35×** | Rust |
+| 3des | **12.1** | 7.9 | **1.53×** | Rust |
+| aes-128-gcm | **48.4** | 38.6 | **1.25×** | Rust |
+
+> **Linux VPS 结果：** Rust-Tokio 在 30 个加密×压缩组合中赢下 **28 个**。仅有的两个例外是 `salsa20`（Go 的 Salsa20 实现高度优化）和 `null`+压缩（无加密开销时 Go 的 Snappy 在可压缩数据上略胜）。突出倍率：**SM4+压缩 3.17×**、**AES-128+压缩 1.83×**、**XOR 1.60×**、**Blowfish 1.65×**、**Twofish 1.53×**。前提是调优内核 UDP 缓冲区（`net.core.rmem_max=4MB`）—— 默认 208 KB 缓冲区下，两端都会因静默丢包损失 ~80% 吞吐。
 
 ### 压力测试（数据完整性）
 
@@ -191,6 +250,56 @@ kcptun-client -c config.json
 | 大数据（100 连接） | 100 | 各 64KB + 128KB | ✅ |
 | 页面刷新模拟 | 80（3 波） | 512B…128KB | ✅ |
 | 可压缩数据 | 1 | 压缩模式 | ✅ |
+
+---
+
+## 📡 客户端 I/O 模式对比
+
+`latency_p99` 示例支持三种客户端 I/O 模式，用于测量不同 KCP 调度架构对往返延迟的影响：
+
+```bash
+# 1. 在独立进程中启动 echo server（避免 CPU 竞争）
+cargo run -p kcp-rs --features async --example latency_p99 -- --mode server --port 39001
+
+# 2a. 普通模式（per-connection tokio task）— 生产默认
+cargo run -p kcp-rs --features async --example latency_p99 -- \
+    --mode peer --addr 127.0.0.1:39001 --rps 200 --warmup 3 --duration 10
+
+# 2b. WorkerPool direct_rx（1 worker，无 reader 线程）
+cargo run -p kcp-rs --features async --example latency_p99 -- \
+    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 1 --rps 200 --warmup 3 --duration 10
+
+# 2c. WorkerPool channel（2 workers，独立 reader + channel）
+cargo run -p kcp-rs --features async --example latency_p99 -- \
+    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 2 --rps 200 --warmup 3 --duration 10
+```
+
+**架构对比：**
+
+| | 普通（per-conn） | WP direct\_rx（1w） | WP channel（2w） |
+|---|---|---|---|
+| **RX 路径** | `input_loop` tokio task → `kcp.input()` | worker 线程 `try_recv_from` → `kcp.input()` | reader 线程 `recv_from().await` → channel → worker `kcp.input()` |
+| **TX 路径** | `write_all` → 内联 `try_send_batch_to` | 同样内联发送；flush/重传在 worker | 同样内联发送；flush/重传在 worker |
+| **跨线程唤醒** | 0（同一 runtime） | 1（worker → client `read_notify`） | 2（reader → channel → worker，worker → client） |
+| **适用场景** | **所有客户端场景** | 实验：低 RPS P999 调优 | 实验：多连接服务端 demux |
+
+**实测（200 RPS，1KB，独立 server，macOS M1）：**
+
+| 模式 | P50 | P99 | P999 | Max |
+|------|----:|----:|-----:|----:|
+| **普通** | **604 μs** | **1.1 ms** | 16.6 ms | 26.3 ms |
+| WP direct\_rx（1w） | 1.5 ms | 3.8 ms | 33.4 ms | 42.1 ms |
+| WP channel（2w） | 1.4 ms | 3.7 ms | 15.1 ms | 23.8 ms |
+
+**实测（128 并发，1KB，独立 server）：**
+
+| 模式 | RPS | P50 | P99 | P999 |
+|------|----:|----:|----:|-----:|
+| **普通** | **49,766** | 2.4 ms | 4.4 ms | 22.6 ms |
+| WP direct\_rx（1w） | 37,764 | 3.3 ms | 4.7 ms | 9.1 ms |
+| WP channel（2w） | 2,465 | 3.7 ms | 5.3 ms | 5.6 ms |
+
+> **结论：** 普通模式（per-connection tokio task）是客户端的正确选择。WorkerPool 模式引入跨线程唤醒开销，导致 P50 和吞吐量下降。WorkerPool 的价值在**服务端** — 共享 UDP socket 的多连接 demux（此处未通过 `latency_p99` 基准测试覆盖）。
 
 ---
 
@@ -254,19 +363,17 @@ kcptun-rs/
 ├── kcrypt-rs/       — 13 种分组密码 + AES-128-GCM
 ├── smux-rs/         — SMUX 流多路复用器 (v1/v2)
 ├── qpp-rs/          — 量子置换垫混淆
-├── kio-rs/          — 异步运行时抽象 (tokio / smol)
+├── knet-rs/          — 异步 I/O 抽象 (tokio)
 ├── kpprof-rs/       — Go 兼容 pprof HTTP 服务
 ├── kcptun-common/   — 客户端/服务端共享辅助
 ├── kcptun-client/   — 客户端二进制
 └── kcptun-server/   — 服务端二进制 + 压力测试
 ```
 
-### 双运行时设计
+### 运行时设计
 
-- **tokio**（默认）— 多线程、高并发、适合生产规模
-- **smol**（`--no-default-features --features smol`）— 轻量、极小二进制、ARM 优化
-- 互斥特性 — 每次构建选择其一
-- 业务代码仅使用 `kio::*` 抽象 — 绝不直接使用 tokio/smol API
+- **tokio**（唯一运行时）— 多线程、高并发、适合生产规模
+- 业务代码仅使用 `knet::*` 抽象 — 绝不直接使用 tokio API
 
 ### 刷新循环优化
 
@@ -305,7 +412,7 @@ make linux             # x86_64 Linux musl（从 macOS 交叉编译）
 make linux-aarch64     # ARM64 Linux musl（从 macOS 交叉编译）
 ```
 
-ARM 交叉构建使用 **smol** 运行时，禁用 `pprof` 以保持二进制最小。
+ARM 交叉构建使用 **tokio** 运行时，禁用 `pprof` 以保持二进制最小。
 
 ### 系统级 UDP 缓冲区调优（macOS）
 
@@ -332,6 +439,82 @@ net.inet.udp.recvspace=4194304
 
 > **Linux 等效设置：** `net.core.rmem_max`、`net.core.rmem_default`、`net.core.wmem_max`、`net.core.wmem_default` —— 设为 `4194304` 或更高。部分发行版还需调 `net.core.netdev_max_backlog`。
 
+### 运行时环境变量
+
+相关组件启动时会从环境读取对应的运行时调优参数：
+
+| 变量 | 默认值 | 作用域 | 说明 |
+|---|---|---|---|
+| `KCP_BUSY_YIELDS` | `0`（禁用） | kcp-rs `KcpStream::read` | 自旋上限忙轮询：`read()` 在挂起等待唤醒 `Notify` 之前先 `yield_now` 自旋的次数。用于补偿 tokio 的 notify→wake→schedule→poll 调度跳变（每次唤醒 ~0.2–2ms）—— Go 运行时的 µs 级 goroutine 唤醒天然没有这个代价。 |
+| `KCPTUN_WORKER_THREADS` | 可用并行度（限制在 1–16） | `KcpListener` shard | 默认监听器 shard 数量。正整数覆盖自动检测；显式 Builder `worker_count(n)` 优先于环境变量。该变量不控制共享 Tokio runtime 的线程数。 |
+
+**`KCP_BUSY_YIELDS` 使用规则**（arm64 macOS 实测，500 RPS × 26 KB 回声；见 [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md)）：
+
+- **少连接、延迟敏感的请求发起端**：可设为 `512`，以额外 CPU 换取更低的唤醒尾延迟。
+- **监听端 / 高并发服务端**：保持 `0`。自旋 reader 会与连接处理及 flush task 争抢调度资源，可能显著放大 P99。
+- **吞吐优先 / 闭环负载**：保持 `0`。实测自旋会拖累闭环 req/s。因此 `bench/run_p99.sh` 只给独立的 Rust→Go 请求发起端（组合 3）设置 `512`；Rust↔Rust self 模式、Rust 服务端和闭环测试明确使用事件驱动配置。
+
+库默认值保持 `0`，生产部署保持事件驱动语义。`KcpListener` 每个 shard 使用一个独立 current-thread runtime。共享多线程 Tokio runtime 使用 Tokio 根据系统环境选择的默认 worker 数量。
+
+---
+
+## 🎛️ 延迟调优指南（Linux）
+
+来自 P99 优化工作（2026-09）的实用调优结论。全部数据来自 1 vCPU Linux 虚拟机上
+受控同机 A/B 测试（[docs/kcp-rs-optimization-2026-09-01.md](docs/kcp-rs-optimization-2026-09-01.md) §6–§9）。
+
+### 1. 让监听器自动选择拓扑（无需操作）
+
+`KcpListener`（`kcptun-server` 使用）在绑定时选择接收管线：
+
+| 拓扑 | 触发条件 | 效果 |
+|:-----|:---------|:-----|
+| **直连单 worker** | `worker_count == 1`（任意平台） | worker 自己排空 UDP socket —— 无 RX 线程、无队列跳转。1–2 vCPU 主机的最佳默认值。 |
+| **直连 SO_REUSEPORT 组** | Linux、新绑定、N 个 worker | 每 worker 一个 socket；内核 4-tuple hash 把每个会话固定到一个 worker（无需用户态路由的会话亲和）。多核主机最佳。 |
+| **Reader 管线** | 共享/外部 socket + N 个 worker | 专用 RX 线程向 worker 队列分发（macOS/Windows 上因 SO_REUSEPORT 不分发 UDP 流而作为回退）。 |
+
+用 `KCPTUN_WORKER_THREADS`（库）设置 shard 数——Linux 上新绑定且值 > 1 时自动使用 reuseport 组。
+
+### 2. kcptun-server 的 `--shards N`（Linux）
+
+每个 shard 是独立的 SO_REUSEPORT socket、由独立线程处理，不存在共享 fd 的发送争用。
+
+- 默认（`--shards 0`）：**Linux** 上每个逻辑 CPU 一个 shard；其他平台单 shard（macOS 的 SO_REUSEPORT 不分发 UDP 流）。
+- 经验法则：**shards ≈ vCPU 数**。1–2 vCPU 的机器保持 1 个 shard —— 多余的 worker 在同一个核上只增加跨核唤醒（N=2 reuseport 路径功能验证正确，但在单 vCPU 上严格更慢）。
+
+### 3. 内核 CFS wakeup granularity —— Linux 上对 P99 影响最大的单项参数
+
+默认的 `kernel.sched_wakeup_granularity_ns`（很多发行版为 15ms，包括 CentOS 7 / kernel 3.10）允许被唤醒的任务最长等待 15ms 才可能抢占当前任务。唤醒链的每一跳（socket 事件 → runtime → KCP task → flush task）都可能吸收这道门槛，在繁忙的核上产生偶发的 **8–12ms P999 尾延迟簇**。设为 1ms 即可消除该簇：同样的 3 轮验证里 Rust 的 p99 从 394µs 降到 **112µs**（p50/p90 为 93/91 → 19/78µs），**在每个分位上都反超 Go**（Go 天然免疫，因为 goroutine 直接在已运行的 P 上用户态重调度）。
+
+```bash
+# 临时生效
+sudo sysctl -w kernel.sched_wakeup_granularity_ns=1000000
+
+# 持久化（推荐用于延迟敏感主机）
+echo 'kernel.sched_wakeup_granularity_ns=1000000' | sudo tee /etc/sysctl.d/99-kcptun-low-latency.conf
+sudo sysctl --system
+```
+
+版本差异：该参数在 kernel ≤ 5.15 位于 `/proc/sys/kernel/` 路径；5.16–6.5 移到 `/sys/kernel/debug/sched/`（需挂载 debugfs）；**≥ 6.6（EEVDF 调度器）已彻底移除**（该门槛机制不存在了，直接跳过即可）。它是主机级设置、由运维持有，因此二进制自身从不修改它。
+
+### 4. 系统级 UDP 缓冲区（Linux）
+
+```bash
+sudo sysctl -w net.core.rmem_max=4194304
+sudo sysctl -w net.core.wmem_max=4194304
+```
+
+二进制已为每个 socket 申请 4MB（`knet`）；这些 sysctl 只是把内核上限抬高，让申请真正生效。
+
+### 5. 快速清单
+
+| 场景 | 设置 |
+|:-----|:-----|
+| 1–2 vCPU 主机（VPS、容器） | 1 个 shard（`--shards 1` 或默认 worker 数 1）+ `wakeup_granularity=1ms` |
+| 多核主机、大量并发会话 | 默认 `--shards`（= CPU 数，Linux 上为 reuseport 组）+ `wakeup_granularity=1ms` |
+| 高丢包网络 | 保持默认；FEC（`--datashard/--parityshard`）用带宽换尾延迟 |
+| 吞吐基准测试 | 恢复 `wakeup_granularity` 默认值（1ms 会略微增加公平切换开销） |
+
 ---
 
 ## 🔬 优化历程
@@ -350,7 +533,9 @@ net.inet.udp.recvspace=4194304
 | + sendmmsg/recvmmsg 批量 I/O | — | — |
 | + 加密算法枚举静态分发 | vtable 消除 | — |
 | + macOS UDP 缓冲区调优（sysctl）| P99 −26%，吞吐 +28% | — |
-| → **最终（smol 大吞吐）** | **108 MB/s** | **2.11×** 🏆 |
+| + tokio-aware worker 队列（flush 定时器与 driver 共享 epoll） | 开放模型 p99 −17%，p999 −72~85% | — |
+| + 直连 worker 拓扑（单 worker 直排 + Linux SO_REUSEPORT 组） | 闭环吞吐 +4.1~6.6%，p99 再降 −6~8% | — |
+| → **最终（tokio）** | **85.6 MB/s** | **1.67×** |
 
 ### 沿途发现的关键 Bug 修复
 
@@ -365,7 +550,7 @@ net.inet.udp.recvspace=4194304
 
 ### p99 延迟崩塌排查（256KB @ 高并发）
 
-症状：裸 `kcp-rs` KcpConn（无隧道层）在大包高并发下崩塌 —— 256KB 回环
+症状：裸 `kcp-rs` KcpStream（无隧道层）在大包高并发下崩塌 —— 256KB 回环
 **RPS=300 时从 ~4ms 飙到 p50=3.2s**，而 Go 用*完全相同*的 512/512 窗口 +
 Fast3 配置保持 **19ms**。单请求延迟本来就快（4.3ms）；只有当请求开始重叠时
 管道才停滞。
@@ -386,7 +571,7 @@ fast/early 重传风暴（~20K/2s）。
 | fast/early 重传加 `new_segs_count > 0` 门控 —— 只在窗口能载新数据时重传；满窗口下在途段的 fastack 通常是延迟 ACK 而非丢失 | kcp.rs | RPS=300 p99 69ms→3.9ms；RPS≤450 干净（~2.3ms）|
 | `write_notify` 改 `notify_one()`（存 permit）—— 原 `notify_waiters` 在 waiter 注册前到达的 notify 会丢失，负载下触发 10ms 兜底 | conn.rs | RPS=475 干净 2.3ms（原 539ms 崩塌）；RPS=500 p50 500ms+→~100ms |
 
-**隧道对比（raw 极端负载排队非 lib 缺陷的证据）**：同一个 `kcp_rs::KcpConn`
+**隧道对比（raw 极端负载排队非 lib 缺陷的证据）**：同一个 `kcp_rs::KcpStream`
 按产品用法（默认共享 session 隧道，`copy_bidirectional` 每连接双向独立
 任务）**256KB@RPS=500 只有 ~11ms、100% 成功**（Go 隧道 30.5ms）。raw benchmark
 残余的 RPS=500 深排队是单任务串行 echo 在单连接 131MB/s 的最坏情况；隧道的
@@ -413,7 +598,7 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 
 | 测试类型 | 数量 | 验证内容 |
 |:--------|:---:|---------|
-| 单元测试 | 237 | 各 crate 的正确性 |
+| 单元测试 | 334 | 各 crate 的正确性 |
 | E2E 互通 | 68 | Go↔Rust 双向兼容性 |
 | 压力测试 | 8 | 大规模下逐字节数据完整性 |
 | Clippy | `-D warnings` | 零警告强制 |
