@@ -281,15 +281,19 @@ mod tests {
     }
 
     #[test]
-    fn golden_manual_mode_legacy_vs_config() {
-        // Legacy binary `_` branch: `let i = if interval >= 10 { interval } else { 40 };`
-        // then `kcp.set_nodelay(n, i, resend, nc)`. Library `KCP::set_mode(Manual, ...)`
-        // applies the same clamp.
-        for interval in [0u32, 5, 10, 15, 50] {
-            let mut legacy = kcp_rs::KCP::new(1, 0, |_| {});
-            let i = if interval >= 10 { interval } else { 40 };
-            legacy.set_nodelay(1, i, 2, 1);
-
+    fn golden_manual_mode_interval_clamp_matches_go() {
+        // Go's `kcp.NoDelay` clamps the interval to [10, 5000]. A sub-10 ms
+        // request therefore becomes 10 ms; it used to become 40 ms here
+        // (`KCP::set_mode` substituted its own floor), so `--mode manual
+        // --interval 5` ran 8× slower than the same flags under Go.
+        for (interval, want) in [
+            (0u32, 10u32),
+            (5, 10),
+            (10, 10),
+            (15, 15),
+            (50, 50),
+            (6000, 5000),
+        ] {
             let mut lib = kcp_rs::KCP::new(1, 0, |_| {});
             lib.apply(&kcp_config_from(
                 "manual",
@@ -308,8 +312,8 @@ mod tests {
             ));
 
             assert_eq!(
-                legacy.interval(),
                 lib.interval(),
+                want,
                 "manual interval clamp for interval={interval}"
             );
         }

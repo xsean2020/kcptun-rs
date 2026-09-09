@@ -326,9 +326,16 @@ impl KCP {
     /// - `interval`: internal update interval in milliseconds
     /// - `resend`: fast retransmit threshold (0 = disabled)
     /// - `nc`: no congestion control (0 = default, 1 = off)
+    ///
+    /// All four knobs are assigned unconditionally, as in Go (whose `>= 0`
+    /// guards are vacuous for unsigned parameters). Gating the assignment on
+    /// a non-zero value turns each knob into a one-way latch: switching from
+    /// `Fast3` back to `Normal` would leave `nodelay` set (half-linear RTO
+    /// backoff, 50 ms probe init), and `resend = 0` / `nc = 0` could never
+    /// re-disable fast retransmit / re-enable congestion control.
     pub fn set_nodelay(&mut self, nodelay: u32, interval: u32, resend: u32, nc: u32) {
+        self.nodelay = nodelay;
         if nodelay != 0 {
-            self.nodelay = nodelay;
             self.rx_minrto = RTO_NODELAY_MIN; // Go: nodelay → rx_minrto = 30
         } else {
             self.rx_minrto = RTO_DEFAULT_MIN; // Go: no nodelay → rx_minrto = 100
@@ -343,12 +350,8 @@ impl KCP {
             self.interval = interval as u32;
         }
 
-        if resend > 0 {
-            self.fastresend = resend as i32;
-        }
-        if nc > 0 {
-            self.nocwnd = nc as i32;
-        }
+        self.fastresend = resend as i32;
+        self.nocwnd = nc as i32;
     }
 
     /// Enable or disable stream mode.
@@ -670,7 +673,32 @@ impl KCP {
     /// [`flush_if_pending`](Self::flush_if_pending) once. A per-segment flush
     /// iterates the whole `snd_buf` (~O(500)), so at 50k+ pkt/s that alone is
     /// ~30M snd_buf iterations/s — the dominant per-segment cost.
+    ///
+    /// Datagrams passed here are treated as *regular* (received from the
+    /// network). FEC-reconstructed datagrams must go through
+    /// [`input_no_flush_typed`](Self::input_no_flush_typed) with
+    /// `regular = false`.
     pub fn input_no_flush(&mut self, data: &[u8], ack_no_delay: bool) -> Result<usize, KcpError> {
+        self.input_no_flush_typed(data, true, ack_no_delay)
+    }
+
+    /// [`input_no_flush`](Self::input_no_flush) with Go's `pktType` /
+    /// `regular` distinction.
+    ///
+    /// `regular = false` marks a datagram that was reconstructed by
+    /// Reed-Solomon rather than received from the peer. Such a datagram
+    /// carries a stale window advertisement and a stale `ts`, so Go
+    /// (`kcp.go` `Input`) skips three things for it: the `rmt_wnd` update,
+    /// the RTT sample, and the `RepeatSegs` counter. Feeding recovered
+    /// packets as regular lets an old window overwrite a fresher one and
+    /// folds the FEC group-fill delay into `rx_srtt`, inflating the RTO on
+    /// exactly the lossy links FEC exists for.
+    pub fn input_no_flush_typed(
+        &mut self,
+        data: &[u8],
+        regular: bool,
+        ack_no_delay: bool,
+    ) -> Result<usize, KcpError> {
         let snd_una = self.snd_una;
         let mut offset = 0usize;
         let mut latest_ts = 0u32;
@@ -715,8 +743,12 @@ impl KCP {
                 return Err(KcpError::UnknownCommand(cmd));
             }
 
-            // Trust window updates from data/ack packets (matching Go)
-            self.rmt_wnd = wnd as u32;
+            // Only trust window updates from regular packets — a
+            // FEC-recovered datagram carries a stale advertisement
+            // (Go: `if pktType == IKCP_PACKET_REGULAR`).
+            if regular {
+                self.rmt_wnd = wnd as u32;
+            }
 
             // Process UNA (matching Go: parse_una → shrink_buf)
             if self.parse_una(una) > 0 {
@@ -754,8 +786,8 @@ impl KCP {
                             }
 
                             // Insert into receive buffer (matching Go parse_data).
-                            // Go increments RepeatSegs when parse_data reports a duplicate.
-                            if self.parse_data(seg) {
+                            // Go increments RepeatSegs for regular duplicates only.
+                            if self.parse_data(seg) && regular {
                                 snmp::add(&DEFAULT_SNMP.repeat_segs, 1);
                             }
                         }
@@ -780,13 +812,12 @@ impl KCP {
             snmp::add(&DEFAULT_SNMP.in_segs, in_segs);
         }
 
-        // Update RTT with the latest ts (matching Go: only for regular packets).
+        // Update RTT with the latest ts (matching Go: only for regular
+        // packets — a recovered packet's `ts` predates the FEC group fill).
         // Fetch the current timestamp once and reuse it for flush triggers below.
         let now_ms = self.current_ms();
-        if update_rtt {
-            if itimediff(now_ms, latest_ts) >= 0 {
-                self.update_ack(itimediff(now_ms, latest_ts));
-            }
+        if update_rtt && regular && itimediff(now_ms, latest_ts) >= 0 {
+            self.update_ack(itimediff(now_ms, latest_ts));
         }
 
         // Congestion window update (matching Go: nocwnd check)
@@ -884,17 +915,20 @@ impl KCP {
             return false;
         }
 
-        // Single pass: detect duplicate and find insertion position simultaneously
-        // (replaces two separate O(n) scans with one).
+        // Single backward pass: detect duplicate and find insertion position
+        // simultaneously. Backward (as in Go kcp-go) because an out-of-order
+        // segment almost always belongs near the tail — a forward scan costs
+        // one comparison per buffered segment (up to `rcv_wnd`, i.e. ~1024)
+        // for every reordered packet.
         let mut is_dup = false;
-        let mut insert_pos = self.rcv_buf.len();
-        for (i, s) in self.rcv_buf.iter().enumerate() {
+        let mut insert_pos = 0usize;
+        for (i, s) in self.rcv_buf.iter().enumerate().rev() {
             if s.sn == sn {
                 is_dup = true;
                 break;
             }
-            if itimediff(s.sn, sn) > 0 {
-                insert_pos = i;
+            if itimediff(sn, s.sn) > 0 {
+                insert_pos = i + 1;
                 break;
             }
         }
@@ -1081,7 +1115,7 @@ impl KCP {
         if self.rmt_wnd == 0 {
             if self.probe_wait == 0 {
                 self.probe_wait = probe_init;
-                self.ts_probe = current + self.probe_wait;
+                self.ts_probe = current.wrapping_add(self.probe_wait);
             } else if itimediff(current, self.ts_probe) >= 0 {
                 if self.probe_wait < probe_init {
                     self.probe_wait = probe_init;
@@ -1090,7 +1124,7 @@ impl KCP {
                 if self.probe_wait > IKCP_PROBE_LIMIT {
                     self.probe_wait = IKCP_PROBE_LIMIT;
                 }
-                self.ts_probe = current + self.probe_wait;
+                self.ts_probe = current.wrapping_add(self.probe_wait);
                 self.probe |= KCP_ASK_SEND;
             }
         } else {
@@ -1125,7 +1159,8 @@ impl KCP {
         }
 
         // ── Move segments from snd_queue to snd_buf ──
-        while itimediff(self.snd_nxt, self.snd_una + cwnd) < 0 {
+        let mut new_segs_count = 0u32;
+        while itimediff(self.snd_nxt, self.snd_una.wrapping_add(cwnd)) < 0 {
             match self.snd_queue.pop_front() {
                 Some(mut newseg) => {
                     newseg.conv = self.conv;
@@ -1133,7 +1168,8 @@ impl KCP {
                     // SN is assigned here (matching Go: when moving to snd_buf)
                     newseg.sn = self.snd_nxt;
                     self.snd_buf.push_back(newseg);
-                    self.snd_nxt += 1;
+                    self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                    new_segs_count += 1;
                 }
                 None => break,
             }
@@ -1153,6 +1189,7 @@ impl KCP {
         let mut change = 0u64;
         let mut lost_segs = 0u64;
         let mut fast_retrans_segs = 0u64;
+        let mut early_retrans_segs = 0u64;
         let mut out_segs = 0u64;
 
         for seg in &mut self.snd_buf {
@@ -1166,27 +1203,34 @@ impl KCP {
                 // First transmission
                 needsend = true;
                 seg.rto = self.rx_rto;
-                seg.resendts = current + seg.rto;
+                seg.resendts = current.wrapping_add(seg.rto);
             } else if seg.fastack >= resent && seg.fastack != 0xFFFFFFFF {
                 // Fast retransmit — matching Go kcp-go exactly: fire when
                 // `fastack >= fastresend` (typically 2 duplicate ACKs),
-                // regardless of whether new data is being sent. The previous
+                // regardless of whether new data is being sent. An earlier
                 // `new_segs_count > 0` gate disabled fast retransmit whenever
                 // the send window was full — exactly when loss is most likely
                 // — forcing ALL retransmissions through RTO timeout (200ms+),
                 // which was the direct cause of P99/P999 tail latency spikes.
-                //
-                // The earlier "fast-retransmit storm" was caused by the
-                // non-Go early-retransmit path (firing on `fastack > 0`, i.e.
-                // just 1 dup ACK, which triggers on delayed ACKs, not loss).
-                // That path is now removed; standard Go fast retransmit with
-                // `fastresend=2` requires 2 dup ACKs and is stable.
+                needsend = true;
+                seg.fastack = 0xFFFFFFFF; // must wait until RTO to reset
+                seg.rto = self.rx_rto;
+                seg.resendts = current.wrapping_add(seg.rto);
+                change += 1;
+                fast_retrans_segs += 1;
+            } else if seg.fastack > 0 && seg.fastack != 0xFFFFFFFF && new_segs_count == 0 {
+                // Early retransmit (Go `kcp.go`: same condition). One dup ACK
+                // is enough *only* when this flush queued no new segments,
+                // i.e. the pipe is idle and a speculative retransmit is
+                // nearly free. The condition is not `new_segs_count > 0`:
+                // firing while new data is being sent is what produced the
+                // historical retransmit storm.
                 needsend = true;
                 seg.fastack = 0xFFFFFFFF;
                 seg.rto = self.rx_rto;
-                seg.resendts = current + seg.rto;
+                seg.resendts = current.wrapping_add(seg.rto);
                 change += 1;
-                fast_retrans_segs += 1;
+                early_retrans_segs += 1;
             } else if itimediff(current, seg.resendts) >= 0 {
                 // RTO timeout
                 needsend = true;
@@ -1196,7 +1240,7 @@ impl KCP {
                     seg.rto += self.rx_rto / 2; // Half-linear backoff (keep original)
                 }
                 seg.fastack = 0;
-                seg.resendts = current + seg.rto;
+                seg.resendts = current.wrapping_add(seg.rto);
                 lost_segs += 1;
             }
 
@@ -1238,7 +1282,7 @@ impl KCP {
         }
 
         // Update retransmission stats (matching Go)
-        let retrans_sum = lost_segs + fast_retrans_segs;
+        let retrans_sum = lost_segs + fast_retrans_segs + early_retrans_segs;
         if retrans_sum > 0 {
             snmp::add(&DEFAULT_SNMP.retrans_segs, retrans_sum);
         }
@@ -1248,6 +1292,9 @@ impl KCP {
         if fast_retrans_segs > 0 {
             snmp::add(&DEFAULT_SNMP.fast_retrans, fast_retrans_segs);
         }
+        if early_retrans_segs > 0 {
+            snmp::add(&DEFAULT_SNMP.early_retrans, early_retrans_segs);
+        }
         if out_segs > 0 {
             snmp::add(&DEFAULT_SNMP.out_segs, out_segs);
         }
@@ -1256,7 +1303,7 @@ impl KCP {
         if self.nocwnd == 0 {
             // Rate halving (RFC 6937)
             if change > 0 {
-                let inflight = self.snd_nxt - self.snd_una;
+                let inflight = self.snd_nxt.wrapping_sub(self.snd_una);
                 self.ssthresh = (inflight / 2).max(THRESH_MIN);
                 self.cwnd = self.ssthresh + resent;
                 self.incr = self.cwnd * self.mss;
@@ -1460,6 +1507,99 @@ mod tests {
 
     fn create_kcp(conv: u32) -> KCP {
         KCP::new(conv, 0, move |_data: Bytes| {})
+    }
+
+    /// Build a bare 24-byte KCP header (no payload).
+    fn header(conv: u32, cmd: u8, wnd: u16, ts: u32, sn: u32, una: u32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(KCP_OVERHEAD);
+        b.extend_from_slice(&conv.to_le_bytes());
+        b.push(cmd);
+        b.push(0); // frg
+        b.extend_from_slice(&wnd.to_le_bytes());
+        b.extend_from_slice(&ts.to_le_bytes());
+        b.extend_from_slice(&sn.to_le_bytes());
+        b.extend_from_slice(&una.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // len
+        b
+    }
+
+    #[test]
+    fn set_nodelay_applies_zero_values() {
+        let mut kcp = create_kcp(1);
+        kcp.set_nodelay(1, 10, 2, 1);
+        assert_eq!(kcp.nodelay, 1);
+        assert_eq!(kcp.fastresend, 2);
+        assert_eq!(kcp.nocwnd, 1);
+        assert_eq!(kcp.rx_minrto, RTO_NODELAY_MIN);
+
+        // Switching to a non-nodelay profile must clear all three knobs.
+        // Gating each assignment on a non-zero value turned them into
+        // one-way latches (Fast3 → Normal kept half-linear RTO backoff,
+        // and congestion control could never be re-enabled).
+        kcp.set_nodelay(0, 40, 0, 0);
+        assert_eq!(kcp.nodelay, 0);
+        assert_eq!(kcp.fastresend, 0);
+        assert_eq!(kcp.nocwnd, 0);
+        assert_eq!(kcp.rx_minrto, RTO_DEFAULT_MIN);
+        assert_eq!(kcp.interval, 40);
+
+        // Go's clamp: interval below 10 ms becomes 10 ms, not 40 ms.
+        kcp.set_nodelay(1, 5, 2, 1);
+        assert_eq!(kcp.interval, 10);
+    }
+
+    #[test]
+    fn fec_recovered_input_skips_window_and_rtt_updates() {
+        let mut kcp = create_kcp(1);
+
+        // A regular packet advertises a window of 8.
+        kcp.input_no_flush(&header(1, Command::WIns as u8, 8, 0, 0, 0), false)
+            .unwrap();
+        assert_eq!(kcp.rmt_wnd, 8);
+
+        // An FEC-reconstructed packet carries a stale advertisement; Go only
+        // trusts window updates from regular packets.
+        kcp.input_no_flush_typed(&header(1, Command::WIns as u8, 1, 0, 0, 0), false, false)
+            .unwrap();
+        assert_eq!(kcp.rmt_wnd, 8, "recovered packet must not shrink rmt_wnd");
+
+        // Same for the RTT estimator: a recovered ACK's `ts` predates the FEC
+        // group fill, so sampling it inflates srtt/rto.
+        let ts = (kcp.current_ms() as u32).wrapping_sub(20);
+        assert_eq!(kcp.rx_srtt, 0);
+        kcp.input_no_flush_typed(&header(1, Command::Ack as u8, 8, ts, 0, 0), false, false)
+            .unwrap();
+        assert_eq!(kcp.rx_srtt, 0, "recovered ACK must not sample RTT");
+        kcp.input_no_flush(&header(1, Command::Ack as u8, 8, ts, 0, 0), false)
+            .unwrap();
+        assert!(kcp.rx_srtt > 0, "regular ACK must sample RTT");
+    }
+
+    #[test]
+    fn early_retransmit_fires_on_one_dup_ack_when_no_new_segments() {
+        let mut kcp = create_kcp(1);
+        kcp.set_nodelay(1, 10, 2, 1); // fastresend = 2
+        kcp.set_stream_mode(false);
+        kcp.send(b"AAA").unwrap();
+        kcp.send(b"BBB").unwrap();
+        kcp.flush_with_current(100, true);
+        assert_eq!(kcp.snd_buf.len(), 2);
+        assert_eq!(kcp.snd_buf[0].xmit, 1);
+
+        // ACK sn=1 only: sn=0 collects a single duplicate ACK, below the
+        // fastresend threshold of 2.
+        kcp.input_no_flush(&header(1, Command::Ack as u8, 32, 100, 1, 0), false)
+            .unwrap();
+        assert_eq!(kcp.snd_buf[0].fastack, 1);
+
+        // snd_queue is empty, so this flush queues no new segments and Go's
+        // early-retransmit branch applies. Well before the RTO deadline.
+        kcp.flush_with_current(120, true);
+        assert_eq!(
+            kcp.snd_buf[0].xmit, 2,
+            "early retransmit must resend on one dup ACK when the pipe is idle"
+        );
+        assert_eq!(kcp.snd_buf[0].fastack, 0xFFFFFFFF);
     }
 
     #[test]

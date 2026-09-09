@@ -328,7 +328,7 @@ impl AutoTune {
 
         // Sequence IDs wrap at PAWS. Rotate the sorted history across the
         // largest cyclic gap, which is the seam between the oldest and newest
-        // samples, then require every adjacent sample to be contiguous.
+        // samples, so the window reads in linear sequence order.
         let mut largest_gap = 0;
         let mut largest_gap_at = 0;
         for i in 0..sorted.len() {
@@ -344,22 +344,28 @@ impl AutoTune {
         let ordered: Vec<(u32, bool)> = (0..sorted.len())
             .map(|offset| sorted[(start + offset) % sorted.len()])
             .collect();
-        for i in 1..ordered.len() {
-            let prev = ordered[i - 1].0;
-            let current = ordered[i].0;
+
+        let contiguous = |prev: u32, current: u32| -> bool {
             let diff = if current >= prev {
                 current - prev
             } else {
                 paws - prev + current
             };
-            if diff != 1 {
-                return 0;
-            }
-        }
+            diff == 1
+        };
+
+        // Contiguity is checked while walking towards each edge, as in Go's
+        // `autoTune.FindPeriod`: a gap only aborts the search if it is hit
+        // before the edge being looked for. Requiring the whole 258-sample
+        // window to be contiguous up front makes detection fail on any link
+        // with loss — i.e. exactly the links auto-tune exists for.
 
         // Find left edge (transition from !bit to bit)
         let mut left_edge = None;
         for i in 1..ordered.len() {
+            if !contiguous(ordered[i - 1].0, ordered[i].0) {
+                return 0;
+            }
             if ordered[i - 1].1 != bit && ordered[i].1 == bit {
                 left_edge = Some(i);
                 break;
@@ -372,6 +378,9 @@ impl AutoTune {
 
         // Find right edge (transition from bit to !bit)
         for i in left + 1..ordered.len() {
+            if !contiguous(ordered[i - 1].0, ordered[i].0) {
+                return 0;
+            }
             if ordered[i - 1].1 == bit && ordered[i].1 != bit {
                 return i - left;
             }
@@ -465,29 +474,33 @@ impl FecDecoder {
         if self.should_tune {
             let auto_ds = self.auto_tune.find_period(true, self.paws);
             let auto_ps = self.auto_tune.find_period(false, self.paws);
-            if auto_ds > 0
-                && auto_ps > 0
-                && auto_ds + auto_ps <= 256
-                && (auto_ds != self.data_shards || auto_ps != self.parity_shards)
-            {
-                // Build all replacement state before swapping dimensions. If
-                // Reed-Solomon rejects the inferred dimensions, retain the
-                // current decoder rather than leaving it half-retuned.
-                if let Ok(codec) = ReedSolomon::<Field>::new(auto_ds, auto_ps) {
-                    let shard_size = auto_ds + auto_ps;
-                    let paws = 0xffffffffu32 / shard_size as u32 * shard_size as u32;
-                    self.codec = codec;
-                    self.data_shards = auto_ds;
-                    self.parity_shards = auto_ps;
-                    self.shard_size = shard_size;
-                    self.paws = paws;
-                    self.shard_set.clear();
-                    self.completed_shards.clear();
-                    self.newest_shard_id = None;
-                    self.decode_cache = vec![Vec::new(); shard_size];
-                    self.flag_cache = vec![false; shard_size];
-                    self.should_tune = false;
+            if auto_ds > 0 && auto_ps > 0 && auto_ds + auto_ps < 256 {
+                if auto_ds != self.data_shards || auto_ps != self.parity_shards {
+                    // Build all replacement state before swapping dimensions. If
+                    // Reed-Solomon rejects the inferred dimensions, retain the
+                    // current decoder rather than leaving it half-retuned.
+                    if let Ok(codec) = ReedSolomon::<Field>::new(auto_ds, auto_ps) {
+                        let shard_size = auto_ds + auto_ps;
+                        let paws = 0xffffffffu32 / shard_size as u32 * shard_size as u32;
+                        self.codec = codec;
+                        self.data_shards = auto_ds;
+                        self.parity_shards = auto_ps;
+                        self.shard_size = shard_size;
+                        self.paws = paws;
+                        self.shard_set.clear();
+                        self.completed_shards.clear();
+                        self.newest_shard_id = None;
+                        self.decode_cache = vec![Vec::new(); shard_size];
+                        self.flag_cache = vec![false; shard_size];
+                    }
                 }
+                // Clear the flag whenever a period was detected, even if it
+                // matches the current parameters (as Go's fec.go does). Leaving
+                // it set makes this early `return` permanent: no shard is ever
+                // pushed again, so FEC silently degrades to a no-op that still
+                // pays the parity bandwidth. One stale or injected packet is
+                // enough to set the flag.
+                self.should_tune = false;
             }
             return Vec::new();
         }
@@ -975,6 +988,75 @@ mod tests {
         invalid_seq[4..].copy_from_slice(&FEC_TYPE_DATA.to_le_bytes());
         assert!(dec.decode(&invalid_seq).is_empty());
         assert!(dec.auto_tune.pulses.is_empty());
+    }
+
+    #[test]
+    fn fec_should_tune_clears_when_inferred_period_matches_current() {
+        let mut enc = FecEncoder::new(3, 2, 0).unwrap();
+        let mut dec = FecDecoder::new(3, 2).unwrap();
+
+        // Warm the pulse history with correctly flagged traffic so auto-tune
+        // can infer the current (3, 2) parameters.
+        for i in 0..6u8 {
+            let (data, parity) = enc.wrap_kcp_packet(&[i; 16], 1000);
+            dec.decode(&data);
+            for p in &parity {
+                dec.decode(p);
+            }
+        }
+        assert!(!dec.should_tune);
+
+        // One mis-flagged packet (parity flag at a data-shard position) arms
+        // auto-tune — a stale or injected packet is enough.
+        let mut bogus = vec![0u8; FEC_HEADER_SIZE];
+        bogus[..4].copy_from_slice(&30u32.to_le_bytes()); // 30 % 5 == 0 → data slot
+        bogus[4..].copy_from_slice(&FEC_TYPE_PARITY.to_le_bytes());
+        assert!(dec.decode(&bogus).is_empty());
+        assert!(
+            !dec.should_tune,
+            "the flag must clear even when the inferred period equals the \
+             current parameters; otherwise decode() returns early forever \
+             and FEC silently stops recovering"
+        );
+
+        // Recovery still works after the tune attempt: drop data shard 0 of
+        // the next group and rebuild it from the remaining shards.
+        let mut group = Vec::new();
+        let mut parity_frames = Vec::new();
+        for i in 0..3u8 {
+            let (data, parity) = enc.wrap_kcp_packet(&[0xA0 + i; 16], 1000);
+            group.push(data);
+            if !parity.is_empty() {
+                parity_frames = parity;
+            }
+        }
+        assert_eq!(parity_frames.len(), 2);
+        assert!(dec.decode(&group[1]).is_empty());
+        assert!(dec.decode(&group[2]).is_empty());
+        let recovered = dec.decode(&parity_frames[0]);
+        assert_eq!(recovered.len(), 1, "lost data shard must be recovered");
+        assert_eq!(
+            fec_kcp_from_recovered(&recovered[0]).expect("valid SIZE"),
+            &[0xA0u8; 16][..]
+        );
+    }
+
+    #[test]
+    fn fec_autotune_tolerates_gaps_after_the_detected_pulse() {
+        // Go's FindPeriod aborts only on a gap encountered *before* the edge
+        // it is looking for. Requiring the whole 258-sample window to be
+        // contiguous made detection fail on any lossy link.
+        let mut tune = AutoTune::new();
+        for seq in 0..10u32 {
+            tune.sample(seq % 5 < 3, seq);
+        }
+        // A later burst with a hole in it must not invalidate the earlier,
+        // fully observed pulse.
+        for seq in [20, 21, 22, 24, 25] {
+            tune.sample(seq % 5 < 3, seq);
+        }
+        assert_eq!(tune.find_period(true, u32::MAX), 3);
+        assert_eq!(tune.find_period(false, u32::MAX), 2);
     }
 
     #[test]

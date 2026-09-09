@@ -115,8 +115,10 @@ impl KCP {
             Some(p) => p,
             None => (nodelay, interval, resend, nc),
         };
-        let interval = if i >= 10 { i } else { 40 };
-        self.set_nodelay(n, interval, r, c);
+        // `set_nodelay` clamps the interval to Go's [10, 5000] range; do not
+        // substitute a different floor here (an explicit `interval = 5` used
+        // to become 40 ms instead of Go's 10 ms).
+        self.set_nodelay(n, i, r, c);
     }
 }
 

@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `kcp-rs` divergences from kcp-go v5 (FEC auto-tune, packet type, early retransmit, `NoDelay`)
+
+Six semantic divergences found by diffing against the Go sources (`master`
+plus tags `v5.6.8` / `v5.6.20`); each is a behavior change, none touches the
+wire format.
+
+- **FEC silently became a permanent no-op.** `FecDecoder::decode` set
+  `should_tune` whenever a packet's flag disagreed with `seqid % shard_size`
+  (one stale, reordered or injected packet is enough) and then cleared it
+  *only* inside the "inferred parameters differ from current" branch. When
+  the peer's parameters had not in fact changed, the flag stayed set and the
+  `return Vec::new()` at the top of the tune block ran for every subsequent
+  packet: no shard was ever pushed again, so the connection kept paying the
+  parity bandwidth (~30% at 10/3) with zero loss recovery, and no error was
+  reported. `should_tune` is now cleared whenever a period is detected, as in
+  Go's `fec.go` (which carries a comment about exactly this failure mode).
+  The `auto_ds + auto_ps` bound also matches Go's `< 256` (was `<= 256`).
+- **`AutoTune::find_period` required all 258 samples to be contiguous** and
+  returned 0 on any gap, so auto-tune essentially never succeeded on a lossy
+  link — the only kind of link it exists for. Contiguity is now checked while
+  walking towards each edge, as in Go's `autotune.go`: a gap aborts the search
+  only if it is hit before the edge being looked for.
+- **FEC-reconstructed packets were fed to KCP as regular packets.** Go's
+  `Input` takes a `pktType`/`regular` flag and skips three things for
+  recovered datagrams: the `rmt_wnd` update, the RTT sample and `RepeatSegs`.
+  Feeding them as regular let a stale window advertisement overwrite a fresher
+  one (needless window probing when the stale value was small) and folded the
+  whole FEC group-fill + reconstruct delay into `rx_srtt`, inflating the RTO
+  precisely on lossy links. New `KCP::input_no_flush_typed(data, regular,
+  ack_no_delay)`; `input_no_flush` keeps its signature and passes
+  `regular = true`, so no public API is removed.
+- **Early retransmit was missing.** It had been deleted as "non-Go", but all
+  three Go revisions have it; the Rust version's bug was an inverted
+  condition (`new_segs_count > 0` instead of Go's `== 0`). Go fires a
+  speculative retransmit on a single duplicate ACK *only* when the flush
+  queued no new segments, i.e. when the pipe is idle and the retransmit is
+  nearly free. Restored with Go's condition, so an idle connection recovers a
+  loss on the next 10 ms flush instead of after a full RTO (≥30 ms nodelay,
+  ≥100 ms normal); `EarlyRetransSegs` is no longer permanently 0.
+- **`set_nodelay` ignored zero values**, turning each knob into a one-way
+  latch: `nodelay = 0` did not clear `self.nodelay` (so `Fast3` → `Normal`
+  kept half-linear RTO backoff and a 50 ms probe init), `resend = 0` could
+  not disable fast retransmit, and `nc = 0` could not re-enable congestion
+  control (all four `KcpMode` profiles set `nc = 1`). Go assigns all four
+  unconditionally.
+- **`KCP::set_mode` substituted a 40 ms interval floor** for values below
+  10 ms, where Go's `NoDelay` clamps to 10 ms — `--mode manual --interval 5`
+  ran 8× slower than the same flags under Go. The clamp now lives only in
+  `set_nodelay`, matching Go's [10, 5000] range.
+
+Also in `kcp.rs`: `parse_data` scans `rcv_buf` backwards (as Go v5.6.8 does)
+instead of forwards, turning ~`rcv_wnd` comparisons per out-of-order packet
+into ~1 for the common case; and the modular wire arithmetic on
+`snd_nxt`/`resendts`/`ts_probe`/`inflight` is spelled `wrapping_*`, which is
+what release builds already did but debug/test builds panicked on at the u32
+wrap boundary.
+
+Gates: `cargo test -p kcp-rs --features async` 80 passed / 0 failed
+(including `test_fast_retransmit_fires_on_duplicate_acks`, previously
+recorded as failing), `cargo test --workspace --all-features` green, clippy
+clean for the touched crates. New regression tests:
+`fec_should_tune_clears_when_inferred_period_matches_current`,
+`fec_autotune_tolerates_gaps_after_the_detected_pulse`,
+`kcp::tests::set_nodelay_applies_zero_values`,
+`kcp::tests::fec_recovered_input_skips_window_and_rtt_updates`,
+`kcp::tests::early_retransmit_fires_on_one_dup_ack_when_no_new_segments`; the
+`kcptun-common` golden test for the manual-mode interval clamp now asserts
+Go's 10 ms floor.
+
 ### Refactored — `kcp-rs` conn module split: engine/facade layering (no behavior change)
 
 `kcp-rs/src/conn.rs` (3100+ lines mixing seven responsibilities) is split
