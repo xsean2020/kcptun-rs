@@ -61,6 +61,7 @@ cipher.encrypt(&mut data);
 Wire packing (CFB nonce+CRC, AEAD, offload heuristics) lives here in `wire.rs` — `CryptoBuf`, `encrypt_batch`, `decrypt_cfb_in_place`, `should_cpu_block_*`, `OffloadProfile`. Moved from `kcp-rs` (B2, 2026-07-31).
 `encrypt_batch` takes `&CryptEngine` (AEAD via `crypt.as_aead()`).
 - `null` vs `none` header policy: `uses_cfb_header(method)` / caller `has_encryption` flag — see `wire::encrypt_batch`.
+- Packet nonces come from `nonce::NonceGen` (private module): AES-128 over a counter under a per-instance random key, i.e. Go's `nonceAES128`. Nonces must be unpredictable, not just unique — `salsa20` uses the first 8 bytes as its stream nonce and CFB chains the nonce block into the keystream. Do not replace it with a plain counter: both ends of a session hold the same derived key, so their counters would produce identical keystreams. `CryptoBuf::new(session_id)` passes `session_id` as a PRF domain separator only.
 
 ## Dependencies
 

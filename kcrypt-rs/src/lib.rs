@@ -44,6 +44,7 @@
 pub mod cast5;
 pub mod crypt;
 pub mod des;
+mod nonce;
 pub mod wire;
 
 // Re-export the primary public API at the crate root for convenience.
