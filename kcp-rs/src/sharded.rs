@@ -102,6 +102,16 @@ const DRAIN_QUANTUM_MS: u128 = 5;
 /// before yielding the CPU. Prevents a hot peer with heavy crypto/FEC from
 /// starving other peers' flush loops, reducing P999 tail latency.
 const WORKER_TIME_BUDGET_US: u64 = 2_000;
+/// Max number of consecutive batches a worker processes before yielding to
+/// the runtime. Under high throughput with a lightweight cipher (null, xor,
+/// none), each batch finishes in tens of microseconds — an unconditional
+/// `yield_now()` per batch makes scheduling overhead dominate. Instead we
+/// let the worker run multiple batches back-to-back, only yielding after this
+/// many cycles without a yield. The time-budget guard inside `process_batch`
+/// still fires for heavy ciphers / large multi-peer bursts, so flush-loop
+/// timers are never starved. Chosen as a power of two so the modulo check is
+/// a single `and`.
+const WORKER_BATCHES_PER_YIELD: u32 = 4;
 
 // ─── RX buffer pool (lock-free recycling) ─────────────────────────────────
 //
@@ -996,6 +1006,11 @@ fn spawn_worker(
                 let mut by_peer: HashMap<SocketAddr, Vec<Vec<u8>>> = HashMap::new();
                 let mut affected: Vec<SocketAddr> = Vec::new();
                 let mut affected_seen: HashSet<SocketAddr> = HashSet::new();
+                // Batches processed since the last yield. When this reaches
+                // `WORKER_BATCHES_PER_YIELD` we yield to let flush-loop timers
+                // run. Reset to 0 on any yield (here, inside `process_batch`'s
+                // time-budget path, or after a park).
+                let mut batches_since_yield: u32 = 0;
 
                 // Direct-mode receive state: pooled slots for the recvmmsg
                 // burst drain, plus a parked-read slot (also pooled).
@@ -1162,14 +1177,22 @@ fn spawn_worker(
                     )
                     .await;
 
-                    // Yield to the runtime so per-connection flush loops
-                    // (spawn_flush_loop, default on for server sessions) get
-                    // polled. Under sustained load the batch processes faster
-                    // than WORKER_TIME_BUDGET_US (2ms), so without this yield
-                    // the current-thread runtime never polls flush-loop timers
-                    // — retransmission deadlines, delayed ACKs, and window
-                    // probes are starved at the worst possible time.
-                    knet::yield_now().await;
+                    // Adaptive yield: under high throughput with a lightweight
+                    // cipher (null/xor/none) each batch finishes in tens of µs.
+                    // An unconditional `yield_now()` per batch makes scheduler
+                    // overhead dominate the effective compute time. Instead we
+                    // process `WORKER_BATCHES_PER_YIELD` batches before
+                    // yielding, so back-to-back bursts amortize the scheduling
+                    // cost. The time-budget guard inside `process_batch`
+                    // (WORKER_TIME_BUDGET_US) still yields immediately for
+                    // heavy ciphers or large multi-peer bursts, so flush-loop
+                    // timers — retransmission deadlines, delayed ACKs, window
+                    // probes — are never starved.
+                    batches_since_yield = batches_since_yield.wrapping_add(1);
+                    if batches_since_yield >= WORKER_BATCHES_PER_YIELD {
+                        batches_since_yield = 0;
+                        knet::yield_now().await;
+                    }
                 }
             });
         })
