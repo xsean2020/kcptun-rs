@@ -97,7 +97,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
     /// Create a `QPPPort` that shares a pre-built pad table. Use this when
     /// many connections use the same key — the 7×PBKDF2 + ~2×10⁵ AES block
     /// pad construction is paid once, not per connection.
-    pub fn new_with_shared(inner: T, shared: &SharedPads, key: &[u8]) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new_with_shared(inner: T, shared: &SharedPads, key: &[u8]) -> Self {
         QPPPort {
             inner,
             pads: shared.clone(),
@@ -111,7 +112,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
     }
 
     /// Build a shared pad table for use with [`new_with_shared`](Self::new_with_shared).
-    pub fn build_shared_pads(key: &[u8], count: u16) -> SharedPads {
+    #[allow(dead_code)]
+    pub(crate) fn build_shared_pads(key: &[u8], count: u16) -> SharedPads {
         SharedPads::new(key, count)
     }
 }

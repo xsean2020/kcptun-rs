@@ -409,7 +409,7 @@ impl TcpListener {
     #[inline(always)]
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (s, a) = self.inner.accept().await?;
-        // Match Go net.TCPConn defaults and raw_tcp_stream: disable Nagle.
+        // Match Go net.TCPConn defaults: disable Nagle.
         let _ = s.set_nodelay(true);
         Ok((
             TcpStream {

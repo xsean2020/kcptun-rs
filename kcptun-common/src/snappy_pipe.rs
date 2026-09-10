@@ -69,7 +69,8 @@ where
     }
 
     /// Unwrap back to the inner transport.
-    pub fn into_inner(self) -> T {
+    #[allow(dead_code)]
+    pub(crate) fn into_inner(self) -> T {
         self.inner
     }
 

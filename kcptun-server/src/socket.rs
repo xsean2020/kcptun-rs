@@ -2,19 +2,8 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{Context as AnyContext, Result};
+use anyhow::Result;
 use log::warn;
-
-/// Parse a "host:port" string into a SocketAddr.
-#[allow(dead_code)]
-pub(crate) fn parse_addr(addr: &str) -> Result<SocketAddr> {
-    // Handle ":port" shorthand by defaulting to "0.0.0.0"
-    if addr.starts_with(':') {
-        let host_addr = format!("0.0.0.0{}", addr);
-        return host_addr.parse::<SocketAddr>().context("invalid address");
-    }
-    addr.parse::<SocketAddr>().context("invalid address")
-}
 
 /// Bind and tune a UDP fd without registering it with an async runtime.
 ///
@@ -78,29 +67,4 @@ fn build_udp(
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
     Ok(socket.into())
-}
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_addr() {
-        let addr = parse_addr("127.0.0.1:29900").unwrap();
-        assert_eq!(addr.port(), 29900);
-        assert!(addr.ip().is_loopback());
-    }
-
-    #[test]
-    fn test_parse_addr_ipv6() {
-        let addr = parse_addr("[::1]:29900").unwrap();
-        assert_eq!(addr.port(), 29900);
-    }
-
-    #[test]
-    fn test_parse_addr_invalid() {
-        assert!(parse_addr("not-an-address").is_err());
-    }
 }

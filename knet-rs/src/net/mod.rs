@@ -101,28 +101,6 @@ pub(crate) fn raw_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpList
     Ok(socket.into())
 }
 
-/// Create a tuned `std::net::TcpStream` via socket2 (blocking connect).
-///
-/// Currently unused — `TcpStream::connect` uses runtime-native non-blocking
-/// connect. Retained for potential blocking paths (e.g. tcpraw fallback).
-#[allow(dead_code)]
-pub(crate) fn raw_tcp_stream(remote_addr: SocketAddr) -> io::Result<std::net::TcpStream> {
-    let domain = if remote_addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-
-    let _ = socket.set_recv_buffer_size(SOCK_BUF);
-    let _ = socket.set_send_buffer_size(SOCK_BUF);
-    let _ = socket.set_nodelay(true);
-
-    socket.connect(&remote_addr.into())?;
-    socket.set_nonblocking(true)?;
-    Ok(socket.into())
-}
-
 // ─── Backend selection ────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 mod mmsg;
