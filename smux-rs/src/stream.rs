@@ -788,7 +788,6 @@ impl Stream {
             w.wake();
         }
     }
-
 }
 /// Shared read logic for `AsyncRead` impls on `Stream` (and Arc wrappers).
 ///
@@ -1135,7 +1134,9 @@ mod tests {
             let mut buf = [0u8; 32];
             // &mut Stream implements AsyncRead via the blanket impl
             // for T: AsyncRead + Unpin.
-            let n = knet::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
+            let n = knet::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
             assert_eq!(n, 11);
             assert_eq!(&buf[..11], b"hello trait");
         });
@@ -1148,7 +1149,9 @@ mod tests {
             let mut stream = Stream::new(1);
 
             // Write some data via AsyncWrite trait
-            let n = knet::AsyncWriteExt::write(&mut stream, b"hello world").await.unwrap();
+            let n = knet::AsyncWriteExt::write(&mut stream, b"hello world")
+                .await
+                .unwrap();
             assert_eq!(n, 11);
 
             // Verify via the sync method
@@ -1163,7 +1166,6 @@ mod tests {
     #[test]
     fn set_flush_notify_wakes_on_async_write() {
         knet::block_on(async {
-            
             let notify = Arc::new(knet::Notify::new());
             let mut stream = Stream::new(1);
             stream.set_flush_notify(notify.clone());
@@ -1171,7 +1173,9 @@ mod tests {
                 notify.notified().await;
             });
             knet::sleep_ms(1).await;
-            let n = knet::AsyncWriteExt::write(&mut stream, b"ping").await.unwrap();
+            let n = knet::AsyncWriteExt::write(&mut stream, b"ping")
+                .await
+                .unwrap();
             assert_eq!(n, 4);
             let _ = knet::timeout(std::time::Duration::from_millis(200), waiter).await;
         });

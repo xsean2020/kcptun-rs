@@ -27,9 +27,6 @@ use crate::stream::{Stream, StreamState};
 /// so the counter only stops when it runs out of room (Go signals `ErrGoAway`
 /// when `nextStreamID` wraps past 2^32).
 const MAX_STREAMS: u32 = u32::MAX - 1;
-/// Channel capacity for pending UPD frames.
-const UPD_CHANNEL_CAPACITY: usize = 1024;
-
 /// SMUX session configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -141,6 +138,10 @@ pub enum SessionError {
 }
 
 /// A pending UPD frame to be sent to the peer.
+///
+/// Retained for API compatibility; UPD frames are now emitted directly
+/// into the outbound buffer by [`Session::emit_upd_frames`], so this
+/// struct is no longer produced by any Session method.
 #[derive(Debug, Clone)]
 pub struct UpdFrame {
     pub stream_id: u32,
@@ -170,10 +171,6 @@ pub struct Session {
     max_streams: u32,
     /// Token bucket for receive flow control (bytes remaining).
     token_bucket: AtomicI32,
-    /// Channel sender for pending UPD frames to be sent by the flush loop.
-    upd_tx: knet::Sender<UpdFrame>,
-    /// Channel receiver for pending UPD frames.
-    upd_rx: knet::Receiver<UpdFrame>,
     /// Pending SYN frames to send (queued by SmuxConn::open_stream).
     /// Drained by prepare_outbound_into() at the start of each flush cycle.
     pending_syns: Arc<Mutex<Vec<u32>>>,
@@ -200,7 +197,6 @@ impl Session {
     /// (starting at 1), server uses even IDs (starting at 0).
     fn new(config: &Config, is_client: bool) -> Result<Self, SessionError> {
         config.verify()?;
-        let (upd_tx, upd_rx) = knet::bounded(UPD_CHANNEL_CAPACITY);
         let next_id = if is_client { 1 } else { 0 };
         Ok(Session {
             config: config.clone(),
@@ -221,8 +217,6 @@ impl Session {
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             max_streams: MAX_STREAMS,
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
-            upd_tx,
-            upd_rx,
             pending_syns: Arc::new(Mutex::new(Vec::new())),
             accepted_streams: Arc::new(Mutex::new(VecDeque::new())),
             accept_notify: knet::Notify::new(),
@@ -312,16 +306,6 @@ impl Session {
             self.return_tokens(reclaimed);
         }
         reclaimed
-    }
-
-    /// Take all pending UPD frames that need to be sent.
-    /// The caller should encode and send these via the transport.
-    pub fn take_upd_frames(&self) -> Vec<UpdFrame> {
-        let mut frames = Vec::new();
-        while let Ok(frame) = self.upd_rx.try_recv() {
-            frames.push(frame);
-        }
-        frames
     }
 
     /// Queue a SYN frame to be sent by the next prepare_outbound_into() call.
@@ -528,41 +512,49 @@ impl Session {
         Ok(results)
     }
 
-    /// Check streams for pending UPD notifications and enqueue UPD frames.
+    /// Emit pending UPD frames directly into the outbound buffer.
     ///
-    /// Call this periodically — it scans all streams for pending UPD flags
-    /// and queues UpdFrame messages on the channel for the flush loop to send.
+    /// Scans all streams for pending UPD flags and encodes each into `buf`
+    /// immediately. Because `take_upd()` (which atomically clears the flag)
+    /// and the frame encoding happen under the same `streams` lock, there is
+    /// no window where a flag is cleared but the frame is lost — the old
+    /// channel path could drop a frame on a full channel and relied on
+    /// `rearm_upd()` to recover, which still left a race window.
     ///
-    /// No-op for `version = 1`, which has no UPD frame (Go v1 never sends
-    /// one, and a strict v1 peer treats an unexpected command as a protocol
-    /// error).
-    pub fn check_upd(&self) {
+    /// No-op for `version = 1`, which has no UPD frame.
+    ///
+    /// Callers that already hold the `streams` lock should use
+    /// [`emit_upd_frames_locked`](Self::emit_upd_frames_locked) instead
+    /// to avoid re-entrant locking.
+    pub fn emit_upd_frames(&self, buf: &mut BytesMut, ver: u8) {
         if self.config.version < 2 {
             return;
         }
         let streams = self.streams.lock();
+        self.emit_upd_frames_locked(&streams, buf, ver);
+    }
+
+    /// Same as [`emit_upd_frames`](Self::emit_upd_frames) but assumes the
+    /// caller already holds the `streams` lock. Used by
+    /// [`prepare_outbound_into_controlled`](Self::prepare_outbound_into_controlled)
+    /// to merge all three passes (reclaim tokens, UPD emit, PSH drain) into
+    /// a single `streams` lock acquisition.
+    fn emit_upd_frames_locked(
+        &self,
+        streams: &parking_lot::MutexGuard<'_, HashMap<u32, Arc<Stream>>>,
+        buf: &mut BytesMut,
+        ver: u8,
+    ) {
+        if self.config.version < 2 {
+            return;
+        }
         for (&stream_id, stream) in streams.iter() {
             if let Some((consumed, window)) = stream.take_upd() {
-                // Enqueue UPD frame for sending
-                if self
-                    .upd_tx
-                    .try_send(UpdFrame {
-                        stream_id,
-                        consumed,
-                        window,
-                    })
-                    .is_err()
-                {
-                    // `take_upd` already cleared the pending flag, so a
-                    // dropped frame would leave the peer looking at a stale
-                    // window until the reader consumes another
-                    // max_recv_buf/2 bytes — a per-stream deadlock once the
-                    // peer fills its window. Re-arm instead.
-                    stream.rearm_upd();
-                    continue;
-                }
+                Frame::encode_header_into(buf, ver, Cmd::Upd, stream_id, 8);
+                buf.extend_from_slice(&consumed.to_le_bytes());
+                buf.extend_from_slice(&window.to_le_bytes());
                 debug!(
-                    "SMUX: enqueued UPD frame stream={} consumed={} window={}",
+                    "SMUX: emitted UPD frame stream={} consumed={} window={}",
                     stream_id, consumed, window
                 );
             }
@@ -716,7 +708,7 @@ impl Session {
     /// (e.g., after `kcp.send` of the whole batch succeeds). This preserves the
     /// "can't lose FIN" invariant.
     ///
-    /// The low-level `drain_send_max` / `check_upd` / `take_upd_frames` remain
+    /// The low-level `drain_send_max` / `emit_upd_frames` remain
     /// available for advanced integration; this method is the recommended
     /// single entry point for normal high-performance flush loops.
     pub fn prepare_outbound_into(&self, buf: &mut BytesMut, max_bytes: usize, ver: u8) -> Vec<u32> {
@@ -749,52 +741,66 @@ impl Session {
             }
         }
 
-        // Emit flow-control updates before stream payload. A KCP-backed
-        // writer may block while queueing a large payload; putting UPD first
-        // prevents a circular stall where the peer cannot send more request
-        // data until this update is delivered.
-        self.check_upd();
-        // Give the receive window back for what the application has read
-        // since the last cycle (Go does this from `Stream.Read`).
-        self.reclaim_tokens();
-        for upd in self.take_upd_frames() {
-            Frame::encode_header_into(buf, ver, Cmd::Upd, upd.stream_id, 8);
-            buf.extend_from_slice(&upd.consumed.to_le_bytes());
-            buf.extend_from_slice(&upd.window.to_le_bytes());
-        }
-
+        // ── Single `streams` lock for all three passes ──
+        //
+        // The old code acquired `streams` three times per flush cycle:
+        //   1. `reclaim_tokens()` — lock, scan, unlock
+        //   2. `emit_upd_frames()` — lock, scan, unlock
+        //   3. PSH drain + FIN collect — lock, scan (twice), unlock
+        //
+        // Each lock/unlock is a `parking_lot::Mutex` (futex on Linux,
+        // lllval/ulock on macOS). Under high stream count (64+), the scan
+        // itself dominates; but the three lock acquisitions add up:
+        //   - 3× atomic CAS fences
+        //   - 3× HashMap bucket iteration (cold cache lines)
+        //   - 2× `pending_syns` nested lock inside the PSH/FIN loops
+        //
+        // Merged into one lock pass: reclaim tokens → emit UPD → drain PSH
+        // → collect FIN, all without releasing the lock between them.
         {
             let streams = self.streams.lock();
 
-            // Per-stream share of this cycle's budget. Without it the first
-            // stream in iteration order drains until its queue empties, its
-            // window closes, or the *global* cap is gone — so a saturated
-            // bulk stream starved every stream after it of all bytes, not
-            // just of priority (Go interleaves frames with a shaper heap).
-            // HashMap order is arbitrary but stable for a given key set, so
-            // the victim stayed the victim.
+            // Per-stream share of this cycle's budget.
             let share = if streams.is_empty() {
                 max_bytes
             } else {
                 (max_bytes / streams.len()).max(self.config.max_frame_size)
             };
 
-            // Drain data from streams (PSH frames), respecting per-stream peer window
-            // and the overall max_bytes cap. Matches the previous manual Phase 1.
-            'outer: for (&id, s) in streams.iter() {
-                // Ordering guard: open_stream inserts the stream and queues its
-                // SYN in two steps, so a stream created after the SYN drain
-                // above can hold queued data here. Emit its SYN now — a PSH or
-                // FIN frame that precedes the SYN on the wire would be dropped
-                // by the peer (unknown stream), leaving an empty stream that
-                // accepts but never delivers data.
-                {
-                    let mut syns = self.pending_syns.lock();
-                    if let Some(pos) = syns.iter().position(|&x| x == id) {
-                        syns.remove(pos);
-                        Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
-                    }
+            // Drain pending SYN frames queued during the stream iteration
+            // (by open_stream). This replaces the per-stream `pending_syns`
+            // lock checks that used to run inside the PSH/FIN loops.
+            // We snapshot the SYN set once and check membership with a simple
+            // `contains` — no nested lock per stream.
+            let syn_snapshot: std::collections::HashSet<u32> = {
+                let syns = self.pending_syns.lock();
+                syns.iter().copied().collect()
+            };
+            if !syn_snapshot.is_empty() {
+                let mut syns = self.pending_syns.lock();
+                syns.clear();
+                for id in &syn_snapshot {
+                    Frame::encode_header_into(buf, ver, Cmd::Syn, *id, 0);
                 }
+            }
+            // Stream IDs that had a SYN queued are now consumed; the PSH
+            // loop below does not need to re-check `pending_syns` per stream.
+
+            // Pass 1: reclaim tokens (give receive window back to session).
+            let mut reclaimed: usize = 0;
+            for s in streams.values() {
+                reclaimed += s.take_return_tokens();
+            }
+            if reclaimed > 0 {
+                self.return_tokens(reclaimed);
+            }
+
+            // Pass 2: emit UPD frames (v2 only, directly into buf).
+            self.emit_upd_frames_locked(&streams, buf, ver);
+
+            // Pass 3: drain PSH data from streams, respecting per-stream
+            // peer window and the overall max_bytes cap.
+            'outer: for (&id, s) in streams.iter() {
                 let mut drained_this_stream = 0usize;
                 loop {
                     if drained_total >= max_bytes {
@@ -816,19 +822,10 @@ impl Session {
                 }
             }
 
-            // Collect FIN candidates (local closed, no pending send, FIN not yet sent).
-            // Encode FIN headers now; mark_fin_sent only after transport accepts the bytes.
+            // Pass 4: collect FIN candidates in the same lock scope.
             if allow_fin {
                 for (&id, s) in streams.iter() {
                     if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
-                        // Same ordering guard as the PSH loop above.
-                        {
-                            let mut syns = self.pending_syns.lock();
-                            if let Some(pos) = syns.iter().position(|&x| x == id) {
-                                syns.remove(pos);
-                                Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
-                            }
-                        }
                         debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
                         Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
                         fin_streams.push(id);
@@ -1041,29 +1038,59 @@ mod tests {
     }
 
     #[test]
-    fn session_upd_frame_channel() {
-        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
-        // Initially no UPD frames
-        assert!(session.take_upd_frames().is_empty());
+    fn session_emit_upd_frames() {
+        // v2 config: UPD frames are emitted directly into the outbound buffer.
+        let v2_config = Config {
+            version: 2,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&v2_config).unwrap();
 
-        // Send a UPD frame through the channel
-        session
-            .upd_tx
-            .try_send(UpdFrame {
-                stream_id: 1,
-                consumed: 100,
-                window: 65536,
-            })
+        // No streams → no UPD frames.
+        let mut buf = BytesMut::new();
+        session.emit_upd_frames(&mut buf, 2);
+        assert!(buf.is_empty());
+
+        // Open a stream and simulate a pending UPD by reading data.
+        let s = session.open_stream().unwrap();
+        let id = s.id();
+        // Push some data into the stream's receive buffer to trigger a UPD.
+        s.push_data_bytes(Bytes::from_static(b"hello world"))
             .unwrap();
+        // Simulate a read to arm the UPD flag.
+        let mut read_buf = [0u8; 11];
+        let _ = s.read(&mut read_buf);
 
-        let frames = session.take_upd_frames();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].stream_id, 1);
-        assert_eq!(frames[0].consumed, 100);
-        assert_eq!(frames[0].window, 65536);
+        let mut buf = BytesMut::new();
+        session.emit_upd_frames(&mut buf, 2);
+        assert!(!buf.is_empty(), "UPD frame should have been emitted");
 
-        // Should be empty again
-        assert!(session.take_upd_frames().is_empty());
+        // Decode and verify.
+        let mut codec = FrameCodec::new(v2_config.max_receive_buffer);
+        codec.feed(&buf);
+        let frame = codec.decode().expect("a frame");
+        assert_eq!(frame.cmd, Cmd::Upd);
+        assert_eq!(frame.stream_id, id);
+        assert_eq!(frame.data.len(), 8);
+
+        // Second call should produce nothing — the flag was consumed.
+        let mut buf2 = BytesMut::new();
+        session.emit_upd_frames(&mut buf2, 2);
+        assert!(buf2.is_empty(), "UPD flag should have been cleared");
+    }
+
+    #[test]
+    fn session_emit_upd_frames_v1_noop() {
+        // v1 sessions never emit UPD frames.
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        s.push_data_bytes(Bytes::from_static(b"data")).unwrap();
+        let mut read_buf = [0u8; 4];
+        let _ = s.read(&mut read_buf);
+
+        let mut buf = BytesMut::new();
+        session.emit_upd_frames(&mut buf, 1);
+        assert!(buf.is_empty(), "v1 must not emit UPD frames");
     }
 
     #[test]
