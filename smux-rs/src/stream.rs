@@ -474,13 +474,36 @@ impl Stream {
                         // Re-check for data that raced with FIN.
                         match self.read(buf) {
                             Ok(v) => return Ok(v),
-                            Err(StreamError::WouldBlock) | Err(StreamError::Closed) => {
-                                return Err(StreamError::Closed);
+                            Err(StreamError::Closed) => return Err(StreamError::Closed),
+                            Err(StreamError::WouldBlock) => {
+                                // read() returns WouldBlock — not Closed — while
+                                // inside the EOF grace period (the grace wakeup
+                                // is scheduled by read() itself via
+                                // spawn_task). Translating that WouldBlock to
+                                // Closed here would truncate a late-arriving
+                                // data tail, exactly the bug the grace period
+                                // exists to prevent.
+                                //
+                                // Wait for the wakeup, but also bound the wait
+                                // at the grace duration + a small margin. In a
+                                // multi-thread runtime the spawn_task wakeup
+                                // fires and we re-poll immediately when data
+                                // arrives. In a current-thread runtime (tests),
+                                // the spawned task is not polled until the
+                                // block_on future yields, so the timeout is
+                                // the only way to re-poll and reach the real
+                                // EOF after the grace expires.
+                                let _ = knet::timeout(
+                                    std::time::Duration::from_millis(EOF_GRACE_MS + 50),
+                                    self.ch_reader_wakeup.notified(),
+                                )
+                                .await;
                             }
                             Err(e) => return Err(e),
                         }
+                    } else {
+                        self.ch_reader_wakeup.notified().await;
                     }
-                    self.ch_reader_wakeup.notified().await;
                 }
                 Err(e) => return Err(e),
             }
