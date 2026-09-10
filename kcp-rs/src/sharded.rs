@@ -1156,6 +1156,15 @@ fn spawn_worker(
                         &mut deferred,
                     )
                     .await;
+
+                    // Yield to the runtime so per-connection flush loops
+                    // (spawn_flush_loop, default on for server sessions) get
+                    // polled. Under sustained load the batch processes faster
+                    // than WORKER_TIME_BUDGET_US (2ms), so without this yield
+                    // the current-thread runtime never polls flush-loop timers
+                    // — retransmission deadlines, delayed ACKs, and window
+                    // probes are starved at the worst possible time.
+                    knet::yield_now().await;
                 }
             });
         })
