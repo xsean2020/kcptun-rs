@@ -474,22 +474,41 @@ impl Stream {
 
     /// Async read — waits for data or FIN, like Go's tryRead.
     pub async fn read_async(&self, buf: &mut [u8]) -> Result<(usize, bool), StreamError> {
-        /// Re-poll interval while inside the EOF grace window.
-        const EOF_POLL: std::time::Duration = std::time::Duration::from_millis(20);
         loop {
             match self.read(buf) {
                 Ok(v) => return Ok(v),
                 Err(StreamError::WouldBlock) => {
                     if self.remote_closed.load(Ordering::Acquire) {
-                        // A FIN was seen and nothing is buffered, so `read`
-                        // put us in the EOF grace window (see its comment)
-                        // and will return `Closed` once the window expires.
-                        // Translating this `WouldBlock` into `Closed` — as
-                        // this used to — truncated exactly the data tail the
-                        // grace exists to deliver. Re-poll on a short timer
-                        // rather than relying on the one-shot wakeup task,
-                        // which needs `set_self_ref`.
-                        let _ = knet::timeout(EOF_POLL, self.ch_reader_wakeup.notified()).await;
+                        // Re-check for data that raced with FIN.
+                        match self.read(buf) {
+                            Ok(v) => return Ok(v),
+                            Err(StreamError::Closed) => return Err(StreamError::Closed),
+                            Err(StreamError::WouldBlock) => {
+                                // read() returns WouldBlock — not Closed — while
+                                // inside the EOF grace period (the grace wakeup
+                                // is scheduled by read() itself via
+                                // spawn_task). Translating that WouldBlock to
+                                // Closed here would truncate a late-arriving
+                                // data tail, exactly the bug the grace period
+                                // exists to prevent.
+                                //
+                                // Wait for the wakeup, but also bound the wait
+                                // at the grace duration + a small margin. In a
+                                // multi-thread runtime the spawn_task wakeup
+                                // fires and we re-poll immediately when data
+                                // arrives. In a current-thread runtime (tests),
+                                // the spawned task is not polled until the
+                                // block_on future yields, so the timeout is
+                                // the only way to re-poll and reach the real
+                                // EOF after the grace expires.
+                                let _ = knet::timeout(
+                                    std::time::Duration::from_millis(EOF_GRACE_MS + 50),
+                                    self.ch_reader_wakeup.notified(),
+                                )
+                                .await;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     } else {
                         self.ch_reader_wakeup.notified().await;
                     }
