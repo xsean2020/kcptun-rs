@@ -260,6 +260,12 @@ impl SharedIoState {
     /// Finish a partially-sent wire batch without releasing the single-sender
     /// token. `fec_wire` is retained when present so retrying never re-encodes
     /// the KCP packets with new FEC sequence numbers.
+    ///
+    /// A 50ms timeout guards against the continuation task not being polled
+    /// promptly (overloaded worker): if the send does not complete in time, the
+    /// send token is released so the flush loop can drain pending ACKs and
+    /// requeue retries. Without this, `is_sending` blocks all output —
+    /// including ACKs — until the task runs.
     pub(crate) fn spawn_send_remainder(
         self: &Arc<Self>,
         packets: Vec<Bytes>,
@@ -268,18 +274,34 @@ impl SharedIoState {
     ) {
         let shared = self.clone();
         drop(knet::spawn_task(async move {
-            let result = if let Some(ref wire) = fec_wire {
-                shared.send_packets(&wire[sent.min(wire.len())..]).await
-            } else {
-                shared
-                    .send_packets(&packets[sent.min(packets.len())..])
-                    .await
+            // Race the async send against a 50ms deadline. If the socket stays
+            // un-writable or the task is starved, release the token so the
+            // flush loop's async flush_tx_batch path takes over.
+            let send_fut = async {
+                if let Some(ref wire) = fec_wire {
+                    shared.send_packets(&wire[sent.min(wire.len())..]).await
+                } else {
+                    shared
+                        .send_packets(&packets[sent.min(packets.len())..])
+                        .await
+                }
             };
-            if let Err(e) = result {
-                *shared.last_error.lock() = Some(e);
+            let result = knet::timeout(Duration::from_millis(50), send_fut).await;
+            match result {
+                Ok(r) => {
+                    if let Err(e) = r {
+                        *shared.last_error.lock() = Some(e);
+                    }
+                    shared.recycle_raw_packets(packets);
+                    shared.finish_sending();
+                }
+                Err(_) => {
+                    // Timed out: release the token and requeue unsent packets
+                    // so the flush loop can retry via async flush_tx_batch.
+                    shared.recycle_raw_packets(packets);
+                    shared.finish_sending();
+                }
             }
-            shared.recycle_raw_packets(packets);
-            shared.finish_sending();
         }));
     }
 
