@@ -15,7 +15,7 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use smallvec::SmallVec;
 
 use crate::segment::SegmentPool;
@@ -1077,13 +1077,17 @@ impl KCP {
 
         let mtu = self.mtu as usize;
 
-        // Helper: flush the output buffer and return remaining capacity
+        // Helper: flush the output buffer and return remaining capacity.
+        //
+        // `split().freeze()` moved the allocation out and forced `reserve(mtu)`
+        // to malloc a new buffer every time — one malloc per output packet.
+        // `copy_to_bytes` copies the data into a new `Bytes` and clears the
+        // buffer, leaving its existing allocation intact for the next packet
+        // encode. The copy is cheap (a single memcpy of ≤ mtu bytes, already
+        // about to be encrypted/written) compared to the malloc it replaces.
         let flush_buf = |buf: &mut BytesMut, output: &mut Box<dyn FnMut(Bytes) + Send>| {
             if !buf.is_empty() {
-                let data = buf.split().freeze();
-                // split() moves the allocation out; re-reserve so the next
-                // packet encode does not pay a fresh malloc per output packet.
-                buf.reserve(mtu);
+                let data = buf.copy_to_bytes(buf.len());
                 output(data);
             }
         };
