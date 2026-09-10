@@ -629,6 +629,14 @@ impl KcpStream {
         self.owns_connection = false;
     }
 
+    /// Mark this `KcpStream` as the connection owner: its `Drop` will call
+    /// `close()` when it is dropped. Used by `ShardedKcpListener::accept` to
+    /// ensure the caller-owned stream tears down the session on drop, rather
+    /// than leaking it until the idle reaper sweeps.
+    pub(crate) fn attach_owner(&mut self) {
+        self.owns_connection = true;
+    }
+
     /// Monotonic timestamp in milliseconds of the latest successful read or write.
     pub fn last_activity_ms(&self) -> u64 {
         self.shared.last_activity_ms.load(Ordering::Relaxed)

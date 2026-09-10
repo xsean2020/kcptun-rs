@@ -458,7 +458,10 @@ impl KcpListener {
     /// Accept the next client connection.
     pub async fn accept(&self) -> io::Result<(KcpStream, SocketAddr)> {
         loop {
-            if let Some(v) = self.pending.lock().pop_front() {
+            if let Some(mut v) = self.pending.lock().pop_front() {
+                // Mark the accepted stream as the connection owner so dropping
+                // it closes the session instead of leaking until the reaper.
+                v.conn.attach_owner();
                 return Ok((v.conn, v.peer));
             }
             if self.closed.load(Ordering::Acquire) {
@@ -468,7 +471,8 @@ impl KcpListener {
                 ));
             }
             let notified = self.accept_notify.notified();
-            if let Some(v) = self.pending.lock().pop_front() {
+            if let Some(mut v) = self.pending.lock().pop_front() {
+                v.conn.attach_owner();
                 return Ok((v.conn, v.peer));
             }
             notified.await;
@@ -484,7 +488,8 @@ impl KcpListener {
 
     /// Non-blocking accept.
     pub fn try_accept(&self) -> io::Result<Option<(KcpStream, SocketAddr)>> {
-        if let Some(v) = self.pending.lock().pop_front() {
+        if let Some(mut v) = self.pending.lock().pop_front() {
+            v.conn.attach_owner();
             return Ok(Some((v.conn, v.peer)));
         }
         if self.closed.load(Ordering::Acquire) {
