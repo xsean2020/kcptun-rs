@@ -174,6 +174,18 @@ impl SharedIoState {
         self.raw_packets.lock().recycle(packets);
     }
 
+    /// Put a batch back at the front of the pending send queue (FIFO).
+    ///
+    /// Used when `spawn_send_remainder` times out: the unsent suffix is
+    /// returned so the flush loop's next drain retries it immediately,
+    /// instead of waiting for KCP's RTO to retransmit those segments.
+    /// Callers must only requeue **pre-FEC** packets — an already-expanded
+    /// wire batch would be FEC-expanded a second time and land in a new
+    /// Reed-Solomon group.
+    pub(crate) fn requeue_raw_packets_front(&self, packets: Vec<Bytes>) {
+        self.raw_packets.lock().requeue_front(packets);
+    }
+
     /// Release the send token and preserve a wake-up for packets queued while
     /// the sender was awaiting UDP I/O. The flush task may have consumed the
     /// original notification while the token was held; without a fresh permit,
@@ -263,9 +275,17 @@ impl SharedIoState {
     ///
     /// A 50ms timeout guards against the continuation task not being polled
     /// promptly (overloaded worker): if the send does not complete in time, the
-    /// send token is released so the flush loop can drain pending ACKs and
-    /// requeue retries. Without this, `is_sending` blocks all output —
-    /// including ACKs — until the task runs.
+    /// send token is released so ACKs are not blocked behind a starved task.
+    ///
+    /// On timeout the unsent suffix is handled as follows:
+    /// - **No FEC:** the suffix is requeued at the front of `raw_packets` so
+    ///   the flush loop retries it on its next drain (much sooner than KCP's
+    ///   RTO). The cancelled future may already have handed some of those
+    ///   datagrams to the kernel — duplicates are fine; KCP ignores them.
+    /// - **FEC:** the suffix is *not* requeued. `raw_packets` holds pre-FEC
+    ///   packets and the next `flush_tx_batch` would expand them into a
+    ///   *new* Reed-Solomon group, desynchronizing the encoder/decoder pair.
+    ///   Recovery is left to KCP retransmission of the still-unacked segments.
     pub(crate) fn spawn_send_remainder(
         self: &Arc<Self>,
         packets: Vec<Bytes>,
@@ -274,9 +294,10 @@ impl SharedIoState {
     ) {
         let shared = self.clone();
         drop(knet::spawn_task(async move {
+            let used_fec = fec_wire.is_some();
             // Race the async send against a 50ms deadline. If the socket stays
             // un-writable or the task is starved, release the token so the
-            // flush loop's async flush_tx_batch path takes over.
+            // flush loop can drain pending ACKs.
             let send_fut = async {
                 if let Some(ref wire) = fec_wire {
                     shared.send_packets(&wire[sent.min(wire.len())..]).await
@@ -292,13 +313,29 @@ impl SharedIoState {
                     if let Err(e) = r {
                         *shared.last_error.lock() = Some(e);
                     }
+                    // fec_wire is a fresh Vec from fec_expand_packets (not
+                    // pool-backed); dropping it is the recycle.
                     shared.recycle_raw_packets(packets);
                     shared.finish_sending();
                 }
                 Err(_) => {
-                    // Timed out: release the token and requeue unsent packets
-                    // so the flush loop can retry via async flush_tx_batch.
-                    shared.recycle_raw_packets(packets);
+                    // Timed out: the future was cancelled mid-send. Split the
+                    // pre-FEC batch at `sent` and put the unsent suffix back
+                    // for an immediate flush-loop retry — but only when we
+                    // were sending the raw packets (no FEC). See the method
+                    // docs for why an expanded wire batch cannot go back.
+                    if used_fec {
+                        shared.recycle_raw_packets(packets);
+                    } else {
+                        let split = sent.min(packets.len());
+                        let mut unsent = packets;
+                        let already_sent = unsent.split_off(split);
+                        // Prefix reached the kernel; only its capacity is worth
+                        // recycling. The suffix is requeued for retry.
+                        shared.recycle_raw_packets(already_sent);
+                        shared.requeue_raw_packets_front(unsent);
+                    }
+                    // finish_sending notifies when pending is non-empty.
                     shared.finish_sending();
                 }
             }

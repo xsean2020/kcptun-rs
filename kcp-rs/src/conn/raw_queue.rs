@@ -38,6 +38,18 @@ impl RawPacketQueue {
         self.pending.push(data);
     }
 
+    /// Prepend a batch back onto `pending` (FIFO: these must go out before
+    /// anything accumulated after them). Used by the timeout path in
+    /// `spawn_send_remainder` so the flush loop retries the unsent suffix
+    /// instead of waiting for a full KCP RTO.
+    pub(crate) fn requeue_front(&mut self, mut batch: Vec<Bytes>) {
+        if batch.is_empty() {
+            return;
+        }
+        batch.append(&mut self.pending);
+        self.pending = batch;
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -110,5 +122,40 @@ impl ReadBuffer {
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
         self.bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn requeue_front_preserves_fifo_order() {
+        let mut q = RawPacketQueue::default();
+        q.push(Bytes::from_static(b"a"));
+        q.push(Bytes::from_static(b"b"));
+        let drained = q.drain();
+        assert_eq!(drained.len(), 2);
+
+        // New packets arrive while the sender is away.
+        q.push(Bytes::from_static(b"c"));
+        q.push(Bytes::from_static(b"d"));
+
+        // Sender times out and requeues the unsent suffix ("b" only).
+        let unsent = vec![drained[1].clone()];
+        q.requeue_front(unsent);
+
+        let next = q.drain();
+        let texts: Vec<&[u8]> = next.iter().map(|b| &b[..]).collect();
+        assert_eq!(texts, vec![&b"b"[..], &b"c"[..], &b"d"[..]]);
+    }
+
+    #[test]
+    fn requeue_front_ignores_empty_batch() {
+        let mut q = RawPacketQueue::default();
+        q.push(Bytes::from_static(b"x"));
+        q.requeue_front(Vec::new());
+        assert_eq!(q.drain().len(), 1);
     }
 }

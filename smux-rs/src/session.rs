@@ -184,9 +184,6 @@ pub struct Session {
     max_streams: u32,
     /// Token bucket for receive flow control (bytes remaining).
     token_bucket: AtomicI32,
-    /// Pending SYN frames to send (queued by SmuxConn::open_stream).
-    /// Drained by prepare_outbound_into() at the start of each flush cycle.
-    pending_syns: Arc<Mutex<Vec<u32>>>,
     /// Accepted stream IDs waiting for SmuxConn::accept() to pick up.
     /// Only populated when `accept_enabled` is true (SmuxConn server mode).
     accepted_streams: Arc<Mutex<VecDeque<u32>>>,
@@ -231,7 +228,6 @@ impl Session {
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             max_streams: MAX_STREAMS,
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
-            pending_syns: Arc::new(Mutex::new(Vec::new())),
             accepted_streams: Arc::new(Mutex::new(VecDeque::new())),
             accept_notify: knet::Notify::new(),
             accept_enabled: AtomicBool::new(false),
@@ -344,11 +340,14 @@ impl Session {
 
     /// Queue a SYN frame to be sent by the next prepare_outbound_into() call.
     ///
-    /// Used by SmuxConn::open_stream() so that SYN frames are automatically
-    /// included in the outbound flush. kcptun sends SYN manually, so it never
-    /// calls this — pending_syns stays empty.
+    /// Used by `SmuxConn::open_stream` and `kcptun_session::open_stream`.
+    /// The flag lives on the Stream so the flush path can emit SYN in the
+    /// same snapshot walk that drains PSH/FIN — a session-level queue drained
+    /// *before* the snapshot raced with `open_stream` and let PSH overtake SYN.
     pub fn queue_syn(&self, stream_id: u32) {
-        self.pending_syns.lock().push(stream_id);
+        if let Some(s) = self.streams.lock().get(&stream_id) {
+            s.arm_syn();
+        }
     }
 
     /// Pop the next accepted stream ID (for SmuxConn::accept()).
@@ -766,17 +765,6 @@ impl Session {
         let mut fin_streams = Vec::new();
         let mut drained_total = 0usize;
 
-        // Drain pending SYN frames first (queued by SmuxConn::open_stream).
-        // kcptun never queues SYNs, so this is a no-op for kcptun.
-        {
-            let mut syns = self.pending_syns.lock();
-            if !syns.is_empty() {
-                for id in syns.drain(..) {
-                    Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
-                }
-            }
-        }
-
         // ── Lock-free COW snapshot traversal ──
         //
         // One `Mutex::lock().clone()` (a single atomic increment) gives us
@@ -792,10 +780,16 @@ impl Session {
         let snapshot = self.stream_snapshot();
 
         // Per-stream share of this cycle's budget.
+        //
+        // Do NOT floor the share at `max_frame_size`: when `max_bytes <
+        // n * max_frame_size` that lets the first stream in snapshot order
+        // eat the entire budget and starve the rest. `drain_send_max` is
+        // already capped per frame; the share only bounds how much one
+        // stream may take across frames in this cycle.
         let share = if snapshot.is_empty() {
             max_bytes
         } else {
-            (max_bytes / snapshot.len()).max(self.config.max_frame_size)
+            (max_bytes / snapshot.len()).max(1)
         };
 
         // Pass 1: reclaim tokens (give receive window back to session).
@@ -813,7 +807,17 @@ impl Session {
 
         // Pass 3: drain PSH data from streams, respecting per-stream
         // peer window and the overall max_bytes cap.
+        //
+        // SYN is claimed from the same Stream object, in this same walk,
+        // *before* any PSH for that stream. A session-level SYN queue
+        // drained earlier raced with open_stream (insert+rebuild_snapshot
+        // then queue_syn) and let PSH overtake SYN — the peer drops
+        // unknown-stream data and KCP has already ACKed it.
         'outer: for &(id, ref s) in snapshot.iter() {
+            // Cheap relaxed peek: steady-state this is a single load.
+            if s.syn_pending() && s.take_syn_pending() {
+                Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+            }
             let mut drained_this_stream = 0usize;
             loop {
                 if drained_total >= max_bytes {
@@ -822,9 +826,22 @@ impl Session {
                 if drained_this_stream >= share {
                     break;
                 }
+                // Cap each frame by both the configured frame size and this
+                // stream's remaining share / the cycle's remaining budget,
+                // so a small max_bytes cannot be overshot by a full frame.
+                let remaining_cycle = max_bytes - drained_total;
+                let remaining_share = share - drained_this_stream;
+                let cap = self
+                    .config
+                    .max_frame_size
+                    .min(remaining_cycle)
+                    .min(remaining_share);
+                if cap == 0 {
+                    break;
+                }
                 let header_pos = buf.len();
                 Frame::encode_header_into(buf, ver, Cmd::Psh, id, 0);
-                let n = s.drain_send_max(buf, self.config.max_frame_size);
+                let n = s.drain_send_max(buf, cap);
                 if n == 0 {
                     buf.truncate(header_pos);
                     break;
@@ -839,6 +856,12 @@ impl Session {
         if allow_fin {
             for &(id, ref s) in snapshot.iter() {
                 if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
+                    // Same ordering rule as Pass 3: a stream that never got
+                    // its SYN out this cycle (Pass 3 broke on max_bytes
+                    // before reaching it) must not send FIN first either.
+                    if s.syn_pending() && s.take_syn_pending() {
+                        Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+                    }
                     debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
                     Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
                     fin_streams.push(id);
@@ -1167,7 +1190,7 @@ mod tests {
         let stream = session.open_stream().unwrap();
         let sid = stream.id();
         session.queue_syn(sid);
-        // Data queued while the SYN is still in pending_syns.
+        // Data queued while the SYN flag is still armed on the stream.
         stream.write(&[0xAA]).unwrap();
 
         let mut out = BytesMut::new();
@@ -1197,10 +1220,89 @@ mod tests {
         if let Some(p) = psh_pos {
             assert!(syn_pos < p, "SYN must precede PSH on the wire");
         }
-        // The SYN must not linger in pending_syns after this prepare.
-        assert!(session.pending_syns.lock().is_empty());
+        // The SYN flag was claimed by this prepare — not left set.
+        assert!(!stream.syn_pending());
     }
 
+    /// A stream with a pending SYN and no payload still gets its SYN on the
+    /// next prepare (the flag lives on the Stream, not a side queue).
+    #[test]
+    fn session_prepare_outbound_emits_syn_without_data() {
+        let cfg = Config {
+            version: 1,
+            keepalive_interval: 0,
+            keepalive_timeout: 0,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let stream = session.open_stream().unwrap();
+        let sid = stream.id();
+        session.queue_syn(sid);
+        assert!(stream.syn_pending());
+
+        let mut out = BytesMut::new();
+        session.prepare_outbound_into_controlled(&mut out, 64 * 1024, 1, false);
+        assert!(!out.is_empty(), "SYN must be emitted even with no payload");
+        assert_eq!(out[1], 0, "cmd must be SYN");
+        assert_eq!(
+            u32::from_le_bytes(out[4..8].try_into().unwrap()),
+            sid,
+            "SYN stream id"
+        );
+        assert!(!stream.syn_pending());
+    }
+
+    /// Race-shaped regression: the stream is already in the snapshot with
+    /// queued data, and `queue_syn` arms the flag *after* that snapshot exists.
+    /// The flush path must still claim SYN from the Stream itself and emit it
+    /// before PSH in the same buffer. The old session-level `pending_syns`
+    /// Vec drained *before* the snapshot, so this interleaving sent PSH first
+    /// and the peer dropped the unknown-stream payload (KCP had already ACKed
+    /// it; the local send buffer had already been drained — silent loss).
+    #[test]
+    fn session_syn_flag_on_stream_beats_psh_in_same_walk() {
+        let cfg = Config {
+            version: 1,
+            keepalive_interval: 0,
+            keepalive_timeout: 0,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let stream = session.open_stream().unwrap();
+        let sid = stream.id();
+        // Data is already sitting on the stream (snapshot would include it).
+        stream.write(&[0xBB, 0xCC]).unwrap();
+        // Arm SYN the way open_stream does — insert already happened, so the
+        // next snapshot will contain this stream with the flag set.
+        session.queue_syn(sid);
+
+        let mut out = BytesMut::new();
+        let _ = session.prepare_outbound_into_controlled(&mut out, 64 * 1024, 1, false);
+
+        let b = &out[..];
+        let mut i = 0usize;
+        let mut syn_pos = None;
+        let mut psh_pos = None;
+        while i + 8 <= b.len() {
+            let cmd = b[i + 1];
+            let len = u16::from_le_bytes([b[i + 2], b[i + 3]]) as usize;
+            let fsid = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap());
+            if fsid == sid {
+                if cmd == 0 && syn_pos.is_none() {
+                    syn_pos = Some(i);
+                }
+                if cmd == 2 && psh_pos.is_none() {
+                    psh_pos = Some(i);
+                }
+            }
+            i += 8 + len;
+        }
+        let syn = syn_pos.expect("SYN must be claimed from the Stream flag");
+        let psh = psh_pos.expect("PSH must be drained in the same walk");
+        assert!(syn < psh, "SYN offset {syn} must precede PSH offset {psh}");
+    }
+
+    #[test]
     fn session_prepare_outbound_respects_max_bytes_and_peer_window() {
         let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
         let s = session.open_stream().unwrap();
@@ -1219,6 +1321,64 @@ mod tests {
         assert!(buf.len() < big.len(), "should be capped by max_bytes");
         // Stream should still have pending data.
         assert!(s.pending_send() > 0);
+    }
+
+    /// When `max_bytes` is smaller than `n * max_frame_size`, every stream
+    /// with data must still get a slice of the cycle. The old share floor of
+    /// `max_frame_size` let the first stream in snapshot order consume the
+    /// whole budget.
+    #[test]
+    fn session_prepare_outbound_small_budget_is_shared_across_streams() {
+        let cfg = Config {
+            version: 1,
+            max_frame_size: 16 * 1024,
+            keepalive_interval: 0,
+            keepalive_timeout: 0,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let streams: Vec<_> = (0..8)
+            .map(|_| {
+                let s = session.open_stream().unwrap();
+                s.write_bytes(Bytes::from(vec![b'y'; 8 * 1024])).unwrap();
+                s
+            })
+            .collect();
+
+        // Budget well under one full frame: the old floor would hand all of
+        // it to whichever stream HashMap/snapshot order listed first.
+        let mut buf = BytesMut::new();
+        let _ = session.prepare_outbound_into(&mut buf, 4096, 1);
+        assert!(!buf.is_empty());
+
+        let mut codec = FrameCodec::new(64 * 1024);
+        codec.feed(&buf);
+        let mut per_stream = std::collections::HashMap::new();
+        while let Some(f) = codec.decode() {
+            if f.cmd == Cmd::Psh {
+                *per_stream.entry(f.stream_id).or_insert(0usize) += f.data.len();
+            }
+        }
+        assert!(
+            per_stream.len() >= 4,
+            "expected several streams to receive data, got {per_stream:?}"
+        );
+        // No single stream may swallow the whole 4 KiB budget when 8 streams
+        // are saturated (share ≈ 512 B each).
+        for (sid, n) in &per_stream {
+            assert!(
+                *n < 4096,
+                "stream {sid} took the entire budget ({n} bytes): {per_stream:?}"
+            );
+        }
+        // All eight streams should have been offered something.
+        for s in &streams {
+            assert!(
+                per_stream.contains_key(&s.id()),
+                "stream {} was starved: {per_stream:?}",
+                s.id()
+            );
+        }
     }
 
     #[test]

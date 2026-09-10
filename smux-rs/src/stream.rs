@@ -154,6 +154,16 @@ pub struct Stream {
     local_closed: AtomicBool,
     /// Whether a FIN frame has been sent for this stream.
     fin_sent: AtomicBool,
+    /// A SYN still needs to go out for this stream.
+    ///
+    /// Lives on the Stream (not a session-level Vec) so the flush path can
+    /// emit SYN in the same snapshot walk that drains PSH/FIN. A separate
+    /// `pending_syns` queue drained before the snapshot opened a race:
+    /// `open_stream` inserts into the map + rebuilds the snapshot, then
+    /// `queue_syn` enqueues the SYN — a flush that had already drained the
+    /// queue would emit PSH before SYN, and the peer drops unknown-stream
+    /// data (KCP already ACKed it, local buffer already drained: silent loss).
+    syn_pending: AtomicBool,
 
     // ── V2 flow control ──
     /// Incremental bytes consumed by reader (triggers UPD at threshold).
@@ -211,6 +221,7 @@ impl Stream {
             remote_closed: AtomicBool::new(false),
             local_closed: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
+            syn_pending: AtomicBool::new(false),
             incr: AtomicU32::new(0),
             upd_consumed: AtomicU32::new(0),
             pending_upd: AtomicBool::new(false),
@@ -671,6 +682,27 @@ impl Stream {
     #[inline]
     pub fn is_fin_sent(&self) -> bool {
         self.fin_sent.load(Ordering::Acquire)
+    }
+
+    /// Arm the pending-SYN flag (`queue_syn`).
+    #[inline]
+    pub fn arm_syn(&self) {
+        self.syn_pending.store(true, Ordering::Release);
+    }
+
+    /// Cheap peek used by the flush hot path — almost always false.
+    #[inline]
+    pub fn syn_pending(&self) -> bool {
+        self.syn_pending.load(Ordering::Acquire)
+    }
+
+    /// Atomically claim the right to emit this stream's SYN.
+    ///
+    /// Returns true exactly once per `arm_syn`. Callers must emit SYN
+    /// before any PSH/FIN for this stream in the same outbound buffer.
+    #[inline]
+    pub fn take_syn_pending(&self) -> bool {
+        self.syn_pending.swap(false, Ordering::AcqRel)
     }
 
     /// Time since `mark_local_closed` / `force_local_closed_at`, if local is closed.
