@@ -193,46 +193,65 @@ impl FrameCodec {
     /// returned `Frame.data` is a reference-counted slice of the codec
     /// buffer, not a copy.
     pub fn decode(&mut self) -> Option<Frame> {
-        if self.buf.len() < FRAME_HEADER_SIZE {
-            return None;
+        loop {
+            if self.buf.len() < FRAME_HEADER_SIZE {
+                return None;
+            }
+
+            // Peek at the length field to determine total frame size
+            let length = u16::from_le_bytes([self.buf[2], self.buf[3]]) as usize;
+            let total_len = FRAME_HEADER_SIZE + length;
+
+            if self.buf.len() < total_len {
+                return None;
+            }
+
+            // Validate the command byte *before* consuming the frame.
+            // The old code called split_to first and then returned None on
+            // an unknown cmd, which discarded the frame's bytes and left
+            // the caller (process_data's while-let loop) believing no more
+            // complete frames existed — stranding every later valid frame
+            // (possibly carrying FIN or window data) until the next feed.
+            let cmd_byte = self.buf[1];
+            let cmd = match Cmd::from_u8(cmd_byte) {
+                Some(c) => c,
+                None => {
+                    // Skip the malformed frame and continue with the next.
+                    // Go would close the session on an unknown command; we
+                    // are lenient here to survive a single stray/garbage
+                    // frame without dropping everything after it.
+                    let _ = self.buf.split_to(total_len);
+                    continue;
+                }
+            };
+
+            // Extract frame bytes (zero-copy: split_to advances the buffer)
+            let frame_bytes = self.buf.split_to(total_len).freeze();
+
+            // Parse header fields
+            let ver = frame_bytes[0];
+            let stream_id = u32::from_le_bytes([
+                frame_bytes[4],
+                frame_bytes[5],
+                frame_bytes[6],
+                frame_bytes[7],
+            ]);
+
+            // Slice payload (zero-copy: reference-counted view into frame_bytes)
+            let payload = if length > 0 {
+                frame_bytes.slice(FRAME_HEADER_SIZE..)
+            } else {
+                Bytes::new()
+            };
+
+            return Some(Frame {
+                ver,
+                cmd,
+                length: length as u32,
+                stream_id,
+                data: payload,
+            });
         }
-
-        // Peek at the length field to determine total frame size
-        let length = u16::from_le_bytes([self.buf[2], self.buf[3]]) as usize;
-        let total_len = FRAME_HEADER_SIZE + length;
-
-        if self.buf.len() < total_len {
-            return None;
-        }
-
-        // Extract frame bytes (zero-copy: split_to advances the buffer)
-        let frame_bytes = self.buf.split_to(total_len).freeze();
-
-        // Parse header fields
-        let ver = frame_bytes[0];
-        let cmd_byte = frame_bytes[1];
-        let stream_id = u32::from_le_bytes([
-            frame_bytes[4],
-            frame_bytes[5],
-            frame_bytes[6],
-            frame_bytes[7],
-        ]);
-        let cmd = Cmd::from_u8(cmd_byte)?;
-
-        // Slice payload (zero-copy: reference-counted view into frame_bytes)
-        let payload = if length > 0 {
-            frame_bytes.slice(FRAME_HEADER_SIZE..)
-        } else {
-            Bytes::new()
-        };
-
-        Some(Frame {
-            ver,
-            cmd,
-            length: length as u32,
-            stream_id,
-            data: payload,
-        })
     }
 
     /// Encode a frame and return the bytes.
@@ -417,5 +436,43 @@ mod tests {
         assert_eq!(buf[6], 0x34); // sid byte 2
         assert_eq!(buf[7], 0x12); // sid byte 3
         assert_eq!(&buf[8..], b"ab"); // data
+    }
+
+    #[test]
+    fn frame_codec_skips_unknown_cmd_and_decodes_next() {
+        let mut codec = FrameCodec::new(1024);
+
+        // Build a valid frame, then a frame with an unknown cmd byte (5),
+        // then another valid frame. The old decode() consumed the unknown-
+        // cmd frame's bytes via split_to and then returned None, so the
+        // caller stopped and the third frame was stranded until the next
+        // feed.
+        let good1 = Frame::new(Cmd::Psh, 1, Bytes::from("first"));
+        let good2 = Frame::new(Cmd::Psh, 2, Bytes::from("second"));
+
+        let mut buf = Vec::new();
+        good1.encode(&mut buf);
+        // Manually craft a frame with an unknown cmd byte (5).
+        buf.push(2); // ver
+        buf.push(5); // unknown cmd
+        buf.extend_from_slice(&3u16.to_le_bytes()); // length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // stream_id
+        buf.extend_from_slice(b"bad");
+        good2.encode(&mut buf);
+
+        codec.feed(&buf);
+
+        let d1 = codec.decode().unwrap();
+        assert_eq!(d1.cmd, Cmd::Psh);
+        assert_eq!(d1.stream_id, 1);
+        assert_eq!(&d1.data[..], b"first");
+
+        // The unknown-cmd frame must be skipped, not strand the next one.
+        let d2 = codec.decode().unwrap();
+        assert_eq!(d2.cmd, Cmd::Psh);
+        assert_eq!(d2.stream_id, 2);
+        assert_eq!(&d2.data[..], b"second");
+
+        assert!(codec.decode().is_none());
     }
 }
