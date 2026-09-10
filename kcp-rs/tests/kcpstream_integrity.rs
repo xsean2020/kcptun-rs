@@ -548,3 +548,26 @@ fn kcpstream_zero_sndwnd_uses_effective_window() {
         conn.close();
     });
 }
+
+/// When FEC is active, the KCP MTU must be reduced by the FEC header size
+/// (`FEC_HEADER_SIZE_PLUS_2` = 8) so that the on-wire datagram does not exceed
+/// the configured `--mtu`. Go does `mtu -= fecHeaderSize` in `sess.go`.
+#[test]
+fn kcpstream_fec_reduces_mtu_by_overhead() {
+    knet::block_on(async {
+        let (conn_a, _conn_b) = pair_conns(Some((10, 3))).await;
+        // 1350 - 8 = 1342
+        assert_eq!(conn_a.kcp_mtu(), 1342);
+        conn_a.close();
+    });
+}
+
+/// Without FEC, the MTU must remain exactly as configured.
+#[test]
+fn kcpstream_no_fec_keeps_mtu() {
+    knet::block_on(async {
+        let (conn_a, _conn_b) = pair_conns(None).await;
+        assert_eq!(conn_a.kcp_mtu(), 1350);
+        conn_a.close();
+    });
+}

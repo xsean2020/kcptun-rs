@@ -109,13 +109,13 @@ mod endpoint;
 mod halves;
 mod raw_queue;
 
-pub use endpoint::SharedIoState;
-pub use halves::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 pub(crate) use endpoint::process_inbound_batch;
+pub use endpoint::SharedIoState;
 use endpoint::{spawn_flush_loop, spawn_input_loop};
-use raw_queue::{RawPacketQueue, ReadBuffer};
+pub use halves::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 #[cfg(test)]
 use raw_queue::MAX_RETAINED_RAW_BATCH;
+use raw_queue::{RawPacketQueue, ReadBuffer};
 
 // ─── KcpStream ──────────────────────────────────────────────────────────────────
 
@@ -632,6 +632,12 @@ impl KcpStream {
     /// Monotonic timestamp in milliseconds of the latest successful read or write.
     pub fn last_activity_ms(&self) -> u64 {
         self.shared.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    /// The effective KCP MTU after any FEC overhead adjustment.
+    #[doc(hidden)]
+    pub fn kcp_mtu(&self) -> u32 {
+        self.shared.kcp.lock().mtu()
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -1226,7 +1232,8 @@ impl KcpStreamBuilder {
         let effective_snd_wnd = kcp.snd_wnd() as usize;
 
         // FEC (header_offset=0): crypto would wrap the whole FEC frame later.
-        let (fec_encoder, fec_decoder) = if config.datashard > 0 && config.parityshard > 0 {
+        let fec_enabled = config.datashard > 0 && config.parityshard > 0;
+        let (fec_encoder, fec_decoder) = if fec_enabled {
             let d = config.datashard as usize;
             let p = config.parityshard as usize;
             (
@@ -1236,6 +1243,20 @@ impl KcpStreamBuilder {
         } else {
             (None, None)
         };
+
+        // When FEC is active, each KCP segment is wrapped in a 6+2 byte FEC
+        // header on the wire (`[seq 4][type 2][size 2][kcp]`). If the KCP MTU
+        // is not reduced by that overhead, a `--mtu 1350` session emits 1358-
+        // byte datagrams — silently exceeding PPPoE/VPN MTU limits and
+        // causing random packet loss. Go does `mtu -= fecHeaderSize` in
+        // `sess.go`; we do the same here after `apply` so the MSS (and thus
+        // the segment size KCP segments into) already accounts for FEC.
+        if fec_enabled {
+            let adj = config.mtu.saturating_sub(FEC_HEADER_SIZE_PLUS_2 as u32);
+            if adj >= crate::segment::KCP_OVERHEAD as u32 {
+                kcp.set_mtu(adj);
+            }
+        }
 
         let shared = Arc::new(SharedIoState {
             transport,
@@ -1323,10 +1344,7 @@ impl KcpStreamBuilder {
                     .await
                     .is_err()
                     {
-                        crate::snmp::add(
-                            &crate::snmp::DEFAULT_SNMP.read_fallback_timeout,
-                            1,
-                        );
+                        crate::snmp::add(&crate::snmp::DEFAULT_SNMP.read_fallback_timeout, 1);
                     }
                 }
             })
@@ -1373,7 +1391,6 @@ pub(crate) fn resolve_one(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address"))
 }
-
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -1737,5 +1754,3 @@ mod integ {
         }
     }
 }
-
-
