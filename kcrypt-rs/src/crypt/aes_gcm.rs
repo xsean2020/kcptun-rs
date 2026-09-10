@@ -87,12 +87,8 @@ impl AeadCrypt for Aes128GcmCrypt {
             .encrypt_in_place_detached(nonce, b"", &mut out[pt_start..pt_end])
             .expect("AES-GCM encrypt should not fail");
         out[pt_end..].copy_from_slice(tag.as_slice());
-        let frozen = out.split_to(total).freeze();
-        // Warm the leftover allocation for the next seal_into call.
-        if out.capacity() < SPARE {
-            out.reserve(SPARE);
-        }
-        frozen
+        use bytes::Buf;
+        out.copy_to_bytes(total)
     }
 
     fn open(&self, data: &[u8]) -> Result<Vec<u8>, String> {

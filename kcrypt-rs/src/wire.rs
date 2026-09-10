@@ -192,11 +192,11 @@ impl CryptoBuf {
 
         crypt.encrypt(&mut self.enc_buf[..total]);
 
-        let sealed = self.enc_buf.split_to(total).freeze();
-        if self.enc_buf.capacity() < SPARE {
-            self.enc_buf.reserve(SPARE);
-        }
-        sealed
+        // copy_to_bytes preserves enc_buf's allocation; split_to moved it
+        // out and forced the reserve below to malloc a new buffer per
+        // packet. In the batch path this is one malloc per packet.
+        use bytes::Buf;
+        self.enc_buf.copy_to_bytes(total)
     }
 
     /// Encrypt one packet with the standard 20B CFB wire format.
