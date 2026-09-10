@@ -856,6 +856,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "des",
+ "getrandom 0.2.17",
  "hmac",
  "parking_lot 0.12.5",
  "pbkdf2",

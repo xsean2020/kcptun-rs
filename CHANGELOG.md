@@ -75,6 +75,61 @@ clean for the touched crates. New regression tests:
 `kcp::tests::early_retransmit_fires_on_one_dup_ack_when_no_new_segments`; the
 `kcptun-common` golden test for the manual-mode interval clamp now asserts
 Go's 10 ms floor.
+### Security — packet nonces are random again (`kcrypt-rs`), and QPP no longer desyncs on a partial write
+
+Three related nonce-reuse defects, all introduced by "counter instead of
+PRNG" optimizations. The wire format is unchanged (the nonce travels in the
+packet, so new and old peers interoperate in both directions).
+
+- **`salsa20` reused its keystream.** `CryptoBuf`'s nonce was
+  `[counter 8B][session_id 8B]` with the counter starting at 0 and
+  `session_id` a compile-time constant (`0xDEAD_BEEF`), and
+  `Salsa20Crypt::encrypt` takes its 8-byte stream nonce from the *counter*
+  half only. Packet *i* therefore used one keystream on the client and the
+  server, on the data path and the ACK path, in every `--conn` channel and
+  after every restart — a two-time pad. Because integrity is a CRC-32 over
+  the plaintext, one known plaintext also turned into a packet-forgery
+  oracle.
+- **`aes-128-gcm` reused nonces.** The counter started at 1 in every
+  `Aes128GcmCrypt`, and both ends build one from the same PBKDF2 key, so
+  both sealed their first packet under nonce 1. GCM nonce reuse leaks the
+  plaintext XOR and the authentication-key relationship needed to forge tags.
+- **CFB ciphers (the `aes` default, `sm4`, `twofish`, …) were
+  deterministic.** CFB chains the nonce into the keystream: with a fixed IV,
+  `C₁ = nonce ⊕ E(IV)` and `K₂ = E(C₁)`, so a nonce that repeats makes the
+  first ciphertext blocks byte-identical across sessions — a plaintext-XOR
+  leak for same-index packets and a stable DPI fingerprint. The module
+  comment claimed the fixed IV made the nonce non-cryptographic; it does the
+  opposite.
+
+All three now draw from `kcrypt_rs::nonce::NonceGen`: AES-128 over a counter
+under a per-instance key from the OS CSPRNG — the construction Go uses
+(`nonceAES128` in kcp-go's `entropy.go`). Cost is one AES block per packet
+(a few ns with AES-NI) with no syscall on the datapath, and nonces neither
+repeat within a session nor correlate across sessions.
+
+Also fixed: **`QPPPort::poll_write` advanced the QPP pads before the inner
+write was accepted.** `Poll::Pending` or a short write from `SmuxIo` (normal
+under KCP/SMUX backpressure) made the caller retry a buffer whose pads had
+already been consumed, desynchronizing the two PRNG streams permanently —
+everything after the first short write decrypted to garbage, with no
+resynchronization. Ciphertext is now staged and drained (`poll_flush` /
+`poll_shutdown` drain it too), so each plaintext byte consumes its pad
+exactly once. New test
+`qpp_port::tests::short_writes_and_pending_do_not_desync_the_pads` drives the
+port through a writer that accepts 100 bytes at a time and stalls every third
+call.
+
+Gates: `cargo test --workspace --all-features` green (except the pre-existing
+`autoexpire_multi_port_test` sandbox failure), clippy and
+`cargo fmt --check` clean for the touched files. New tests:
+`nonce::tests::*` (3),
+`wire::tests::packet_nonces_are_unique_and_not_shared_between_peers` (covers
+`aes-128` and `salsa20`), and the QPP test above;
+`wire::tests::encrypt_batch_parallel_crc_matches_serial` now compares
+`prepare + finalize` against a decrypt roundtrip instead of byte-equality
+against a second serial encryption, which only held while nonces were
+deterministic.
 
 ### Refactored — `kcp-rs` conn module split: engine/facade layering (no behavior change)
 

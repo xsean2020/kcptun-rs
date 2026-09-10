@@ -5,25 +5,28 @@
 //!
 //! No CRC32 — AEAD provides built-in authentication via the GCM tag.
 //!
-//! Nonce: 12-byte counter (unique per `Aes128GcmCrypt` instance). Go uses
-//! random nonces; uniqueness is the only wire requirement. Counter avoids
-//! per-packet PRNG cost on the seal hot path.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Nonce: 12 bytes from [`crate::nonce::NonceGen`] — a per-instance keyed
+//! PRF over a counter, i.e. Go's `nonceAES128` construction. A plain counter
+//! is not usable here: both ends of a session derive the same key from
+//! `--key` and would seal their first packets under the same nonce, and GCM
+//! nonce reuse leaks the plaintext XOR *and* the authentication-key
+//! relationship needed to forge tags for arbitrary ciphertexts.
 
 use aes_gcm::aead::{generic_array::GenericArray, AeadInPlace, KeyInit};
 use aes_gcm::Aes128Gcm;
 use bytes::{Bytes, BytesMut};
 
 use super::{AeadCrypt, BlockCrypt};
+use crate::nonce::NonceGen;
 
 const NONCE_SZ: usize = 12;
 const TAG_SZ: usize = 16;
 
 pub struct Aes128GcmCrypt {
     cipher: Aes128Gcm,
-    /// Monotonic counter for unique nonces (replaces per-packet PRNG).
-    nonce_ctr: AtomicU64,
+    /// Per-instance nonce source; see the module docs for why a counter is
+    /// not sufficient.
+    nonce: NonceGen,
 }
 
 impl std::fmt::Debug for Aes128GcmCrypt {
@@ -40,16 +43,14 @@ impl Aes128GcmCrypt {
         let cipher = Aes128Gcm::new(GenericArray::from_slice(&k));
         Aes128GcmCrypt {
             cipher,
-            nonce_ctr: AtomicU64::new(1),
+            nonce: NonceGen::new(0),
         }
     }
 
     #[inline]
     fn next_nonce(&self) -> [u8; NONCE_SZ] {
-        let n = self.nonce_ctr.fetch_add(1, Ordering::Relaxed);
         let mut nonce = [0u8; NONCE_SZ];
-        // 12-byte nonce: high 4 zero, low 8 = counter LE (unique per instance)
-        nonce[4..12].copy_from_slice(&n.to_le_bytes());
+        nonce.copy_from_slice(&self.nonce.next()[..NONCE_SZ]);
         nonce
     }
 }

@@ -3,29 +3,29 @@
 //! The Go kcp-go v5 CFB wire format is:
 //!   `[nonce 16B][CRC32 4B][ciphertext]`
 //!
-//! The nonce does NOT participate in the CFB IV logic (the IV is the fixed
-//! `GO_CFB_IV`), so it can be any value — including a counter. This module
-//! replaces the per-packet `rand::thread_rng().fill_bytes()` + `vec![]`
-//! allocation with:
-//! - An `AtomicU64` counter for nonce generation (no PRNG call per packet)
+//! This module keeps the per-packet cost low with:
 //! - A reusable `BytesMut` buffer (no heap allocation per packet)
 //! - `Bytes` return type (reference-counted, zero-copy send to tokio tasks)
+//! - [`crate::nonce::NonceGen`] for the 16-byte nonce: one AES block per
+//!   packet, no syscall, same construction as Go's `nonceAES128`
 //!
 //! ## Nonce design
 //!
-//! The 16-byte nonce is split into:
-//!   `[counter 8B][session_id 8B]`
+//! The nonce is the output of a per-instance keyed PRF over a counter, so it
+//! is unpredictable and non-repeating. It must be both: `salsa20` uses the
+//! first eight nonce bytes as its stream nonce, and CFB chains the nonce
+//! block into the keystream (`K₂ = E(nonce ⊕ E(IV))`). A plain counter — the
+//! previous design — repeated across the two ends of a session, across
+//! `--conn` channels and across restarts, which is keystream reuse for
+//! salsa20 and deterministic ciphertext for CFB. See [`crate::nonce`].
 //!
-//! The counter increments per packet within a session; the session_id
-//! provides cross-session diversity. This is safe because the CFB IV is
-//! fixed (`GO_CFB_IV`) — the nonce is only encrypted as part of the packet
-//! header, not used as a cryptographic IV.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! `session_id` is retained as the PRF domain separator (data path vs. ACK
+//! path), not as the nonce's only source of diversity.
 
 use bytes::{Bytes, BytesMut};
 
 use crate::crypt::{AeadCrypt, BlockCrypt, CryptEngine};
+use crate::nonce::NonceGen;
 
 /// Crypto header size: `[nonce 16B][CRC32 4B]`.
 pub const CRYPTO_HEADER_SIZE: usize = 20;
@@ -141,20 +141,21 @@ pub struct CryptoBuf {
     /// One buffer per `CryptoBuf` (i.e. per logical encrypt path) so `seal_into`
     /// never allocates after the first use. Used by [`CryptoBuf::seal_aead`].
     aead_buf: BytesMut,
-    /// Monotonic nonce counter (replaces `rand::thread_rng`).
-    nonce_counter: AtomicU64,
-    /// Session identifier for nonce diversity.
-    session_id: u64,
+    /// Per-instance nonce source (keyed PRF over a counter).
+    nonce: NonceGen,
 }
 
 impl CryptoBuf {
-    /// Create a new `CryptoBuf` with the given session ID for nonce diversity.
+    /// Create a new `CryptoBuf`.
+    ///
+    /// `session_id` separates the PRF domains of two paths that share a
+    /// process (the data path and the ACK path); nonce unpredictability comes
+    /// from the generator's random key, not from this value.
     pub fn new(session_id: u64) -> Self {
         CryptoBuf {
             enc_buf: BytesMut::with_capacity(2048),
             aead_buf: BytesMut::with_capacity(2048),
-            nonce_counter: AtomicU64::new(0),
-            session_id,
+            nonce: NonceGen::new(session_id),
         }
     }
 
@@ -170,7 +171,9 @@ impl CryptoBuf {
     /// ## Implementation notes
     /// - Uses `extend_from_slice` (single O(n) write) instead of `resize(total, 0)`
     ///   followed by `copy_from_slice`. The zero-fill was immediately overwritten.
-    /// - Nonce is built from a monotonic counter + session_id; no per-packet PRNG.
+    /// - The nonce comes from [`NonceGen`]: one AES block per packet, as in
+    ///   Go's `nonceAES128`. It must be unpredictable, not merely unique —
+    ///   CFB feeds the nonce block into the keystream.
     #[inline]
     pub fn encrypt_cfb(&mut self, data: &[u8], crypt: &CryptEngine) -> Bytes {
         let total = CRYPTO_HEADER_SIZE + data.len();
@@ -181,10 +184,7 @@ impl CryptoBuf {
 
         // Build via extend (one O(n) write) — avoid resize(total, 0) zero-fill
         // that would immediately be overwritten.
-        let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
-        self.enc_buf.extend_from_slice(&n.to_le_bytes());
-        self.enc_buf
-            .extend_from_slice(&self.session_id.to_le_bytes());
+        self.enc_buf.extend_from_slice(&self.nonce.next());
         let crc = crc32fast::hash(data);
         self.enc_buf.extend_from_slice(&crc.to_le_bytes());
         self.enc_buf.extend_from_slice(data);
@@ -235,10 +235,8 @@ impl CryptoBuf {
         self.enc_buf.clear();
         self.enc_buf.reserve(total + SPARE);
 
-        let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
-        self.enc_buf.extend_from_slice(&n.to_le_bytes());
-        self.enc_buf
-            .extend_from_slice(&self.session_id.to_le_bytes());
+        let n = self.nonce.next();
+        self.enc_buf.extend_from_slice(&n);
         // CRC placeholder — filled by finalize_encrypt_packet before encrypt.
         self.enc_buf.extend_from_slice(&[0u8; 4]);
         self.enc_buf.extend_from_slice(data);
@@ -635,18 +633,43 @@ mod tests {
     }
 
     #[test]
-    fn test_nonce_counter_increments() {
-        let (crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
-        let mut cb = CryptoBuf::new(0xCAFEBABE);
+    fn packet_nonces_are_unique_and_not_shared_between_peers() {
+        // salsa20 is the sharpest case: its 8-byte stream nonce *is* the
+        // first half of the packet nonce, so a repeat is literal keystream
+        // reuse. aes-128 (CFB) shows the chained-keystream effect.
+        for method in ["aes-128", "salsa20"] {
+            let (crypt, _) = CryptEngine::select(method, b"test-key-12345678");
+            let mut cb = CryptoBuf::new(0xCAFEBABE);
 
-        let data = b"test data for nonce";
-        let pkt1 = cb.encrypt_cfb(data, &crypt);
-        let pkt2 = cb.encrypt_cfb(data, &crypt);
+            let data = b"test data for nonce";
+            let pkt1 = cb.encrypt_cfb(data, &crypt);
+            let pkt2 = cb.encrypt_cfb(data, &crypt);
 
-        // Nonces should differ (counter incremented)
-        assert_ne!(&pkt1[..8], &pkt2[..8]);
-        // Session ID should be the same
-        assert_eq!(&pkt1[8..16], &pkt2[8..16]);
+            assert_ne!(&pkt1[..NONCE_SIZE], &pkt2[..NONCE_SIZE], "{method} nonce");
+            // Identical plaintext must not yield identical ciphertext.
+            assert_ne!(
+                &pkt1[NONCE_SIZE..],
+                &pkt2[NONCE_SIZE..],
+                "{method} keystream reused within a session"
+            );
+
+            // Both ends of a session share the key and the session id; their
+            // nonce streams must still be unrelated. The previous
+            // counter-based nonce had both start at zero, so packet i of the
+            // client and packet i of the server used one keystream.
+            let mut peer = CryptoBuf::new(0xCAFEBABE);
+            let peer_pkt = peer.encrypt_cfb(data, &crypt);
+            assert_ne!(
+                &peer_pkt[..NONCE_SIZE],
+                &pkt1[..NONCE_SIZE],
+                "{method} peer nonce"
+            );
+            assert_ne!(
+                &peer_pkt[NONCE_SIZE..],
+                &pkt1[NONCE_SIZE..],
+                "{method} keystream shared between peers"
+            );
+        }
     }
 
     #[test]
@@ -915,17 +938,29 @@ mod tests {
             }
 
             // prepare + finalize must match encrypt_cfb wire semantics (CRC over plain).
+            // Nonces are per-packet random, so compare by decrypting rather
+            // than by byte-equality against a second serial encryption.
             let mut prep_cb = CryptoBuf::new(0xBEEF);
-            let mut serial_cb = CryptoBuf::new(0xBEEF);
+            let mut check_cb = CryptoBuf::new(0xBEEF);
             let plain = b"parallel-crc-wire-check-payload!!";
             let mut prepared = prep_cb.prepare_encrypt(plain);
             assert_eq!(&prepared[NONCE_SIZE..CRYPTO_HEADER_SIZE], &[0, 0, 0, 0]);
+            let nonce_before = prepared[..NONCE_SIZE].to_vec();
             CryptoBuf::finalize_encrypt_packet(&mut prepared, &crypt);
-            let serial = serial_cb.encrypt_cfb(plain, &crypt);
+            let mut finalized = prepared.to_vec();
+            let dec = check_cb
+                .decrypt_cfb(&mut finalized, &crypt)
+                .unwrap_or_else(|| panic!("{method}: finalize CRC/decrypt failed"));
             assert_eq!(
-                prepared.as_ref(),
-                serial.as_ref(),
-                "{method}: finalize must equal serial encrypt_cfb (expect_par={expect_par})"
+                &dec[..],
+                &plain[..],
+                "{method}: finalize must produce encrypt_cfb wire semantics \
+                 (expect_par={expect_par})"
+            );
+            assert_eq!(
+                &finalized[..NONCE_SIZE],
+                &nonce_before[..],
+                "{method}: finalize must not rewrite the nonce"
             );
         }
     }
