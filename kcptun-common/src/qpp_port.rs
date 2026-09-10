@@ -1,7 +1,13 @@
 //! QPP stream wrapper (optional feature `qpp`).
+//!
+//! The pad table (`pads` + `rpads`, ~160 KiB for 61 pads) depends only on the
+//! key and pad count, not on the connection. Building it per connection costs
+//! 7×PBKDF2 + ~2×10⁵ AES blocks and blocks the reactor thread. Instead, build
+//! it once and share it via [`Arc`]; each connection keeps its own PRNG state.
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, BytesMut};
@@ -12,9 +18,30 @@ use knet::ReadBuf;
 /// Same as binaries' pipe buffer (64 KiB).
 const PIPE_BUF_SIZE: usize = 65536;
 
+/// Shared pad table built once from `(key, count)`. Cheap to clone (Arc).
+#[derive(Clone)]
+struct SharedPads {
+    pads: Arc<[u8]>,
+    rpads: Arc<[u8]>,
+    num_pads: u16,
+}
+
+impl SharedPads {
+    fn new(key: &[u8], count: u16) -> Self {
+        let qpp = qpp_rs::QuantumPermutationPad::new(key, count);
+        // Take ownership of the pad vectors; the QPP's own enc_rand/dec_rand
+        // are not needed — each connection has its own PRNG.
+        SharedPads {
+            pads: Arc::from(qpp.pads.as_slice()),
+            rpads: Arc::from(qpp.rpads.as_slice()),
+            num_pads: qpp.count(),
+        }
+    }
+}
+
 pub struct QPPPort<T: AsyncRead + AsyncWrite + Unpin> {
     inner: T,
-    qpp: parking_lot::Mutex<qpp_rs::QuantumPermutationPad>,
+    pads: SharedPads,
     prng_enc: parking_lot::Mutex<qpp_rs::Rand>,
     prng_dec: parking_lot::Mutex<qpp_rs::Rand>,
     read_buf: BytesMut,
@@ -32,7 +59,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
     pub fn new(inner: T, key: &[u8], count: u16) -> Self {
         QPPPort {
             inner,
-            qpp: parking_lot::Mutex::new(qpp_rs::QuantumPermutationPad::new(key, count)),
+            pads: SharedPads::new(key, count),
             prng_enc: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
             prng_dec: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
             read_buf: BytesMut::with_capacity(PIPE_BUF_SIZE),
@@ -66,6 +93,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
         self.write_pos = 0;
         Poll::Ready(Ok(()))
     }
+
+    /// Create a `QPPPort` that shares a pre-built pad table. Use this when
+    /// many connections use the same key — the 7×PBKDF2 + ~2×10⁵ AES block
+    /// pad construction is paid once, not per connection.
+    pub fn new_with_shared(inner: T, shared: &SharedPads, key: &[u8]) -> Self {
+        QPPPort {
+            inner,
+            pads: shared.clone(),
+            prng_enc: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
+            prng_dec: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
+            read_buf: BytesMut::with_capacity(PIPE_BUF_SIZE),
+            read_io_buf: vec![0u8; PIPE_BUF_SIZE],
+            write_enc_buf: Vec::with_capacity(PIPE_BUF_SIZE),
+        }
+    }
+
+    /// Build a shared pad table for use with [`new_with_shared`](Self::new_with_shared).
+    pub fn build_shared_pads(key: &[u8], count: u16) -> SharedPads {
+        SharedPads::new(key, count)
+    }
 }
 
 // ── tokio QPPPort AsyncRead/AsyncWrite (uses ReadBuf) ──
@@ -95,14 +142,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
                     return Poll::Ready(Ok(()));
                 }
                 // Decrypt in-place in the read buffer (eliminates to_vec())
+                // No lock on a shared QPP needed — only the per-connection
+                // PRNG is mutable, and it is already behind its own Mutex.
                 {
-                    let qpp = this.qpp.lock();
                     let mut prng = this.prng_dec.lock();
                     qpp_rs::decrypt_with_pads(
-                        &qpp.rpads,
+                        &this.pads.rpads,
                         &mut tmp[..filled],
                         &mut prng,
-                        qpp.count(),
+                        this.pads.num_pads,
                     );
                 }
                 let n = buf.remaining().min(filled);
@@ -155,9 +203,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for QPPPort<T> {
         this.write_enc_buf.extend_from_slice(buf);
         this.write_pos = 0;
         {
-            let qpp = this.qpp.lock();
             let mut prng = this.prng_enc.lock();
-            qpp_rs::encrypt_with_pads(&qpp.pads, &mut this.write_enc_buf, &mut prng, qpp.count());
+            qpp_rs::encrypt_with_pads(
+                &this.pads.pads,
+                &mut this.write_enc_buf,
+                &mut prng,
+                this.pads.num_pads,
+            );
         }
 
         match this.poll_drain(cx) {
