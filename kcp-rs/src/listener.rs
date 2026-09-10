@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::KcpConfig;
-use crate::conn::KcpStream;
 use crate::conn::resolve_one;
+use crate::conn::KcpStream;
 use crate::transport::PacketTransport;
 
 /// TCP-transport factory for connected [`KcpStream`] sessions: each accepted

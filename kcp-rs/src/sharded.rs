@@ -80,7 +80,9 @@ use knet::Notify;
 // *blocking* `recv_timeout` inside the async context, which froze the runtime
 // driver — and with it every flush-loop timer on this shard — for up to the
 // park timeout. (pprof: crossbeam `recv_deadline`+`wait_until` ≈ 7% CPU.)
-pub use knet::{Receiver as AsyncReceiver, Sender as AsyncSender, TrySendError as AsyncTrySendError};
+pub use knet::{
+    Receiver as AsyncReceiver, Sender as AsyncSender, TrySendError as AsyncTrySendError,
+};
 /// RX batch size for `try_recv_batch_from_into` (§16: 16–32 is a good starting
 /// point for low-latency + throughput).
 const RECV_BATCH: usize = 32;
@@ -1064,17 +1066,15 @@ fn spawn_worker(
                             }
                             batch.len()
                         }
-                        WorkerRx::Direct { socket: rx_socket } => {
-                            drain_own_socket(
-                                rx_socket,
-                                &mut batch,
-                                &mut slots,
-                                &mut peers,
-                                &limits,
-                                &last_error,
-                                0,
-                            )
-                        }
+                        WorkerRx::Direct { socket: rx_socket } => drain_own_socket(
+                            rx_socket,
+                            &mut batch,
+                            &mut slots,
+                            &mut peers,
+                            &limits,
+                            &last_error,
+                            0,
+                        ),
                     };
 
                     if batch.is_empty() {
@@ -1230,8 +1230,7 @@ fn drain_own_socket(
         // Ensure consumed slots carry full-MTU capacity again.
         for slot in &mut slots[..recv_cap] {
             if slot.capacity() < MAX_DATAGRAM {
-                *slot =
-                    crate::sharded::acquire_buf().unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]);
+                *slot = crate::sharded::acquire_buf().unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]);
             }
         }
         let got = match rx_socket.try_recv_batch_from_into(&mut slots[..recv_cap], peers) {
@@ -1252,9 +1251,7 @@ fn drain_own_socket(
         if limits.max_drain_packets > 0 && drained >= limits.max_drain_packets {
             break;
         }
-        if drained >= DRAIN_QUANTUM
-            || drain_started.elapsed().as_millis() >= DRAIN_QUANTUM_MS
-        {
+        if drained >= DRAIN_QUANTUM || drain_started.elapsed().as_millis() >= DRAIN_QUANTUM_MS {
             break;
         }
     }
@@ -1879,10 +1876,13 @@ mod tests {
             let msg = format!("direct echo round {round}");
             client.write_all(msg.as_bytes()).await.unwrap();
             let mut rx = vec![0u8; msg.len()];
-            tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut rx))
-                .await
-                .expect("echo reply timed out")
-                .expect("read failed");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut rx),
+            )
+            .await
+            .expect("echo reply timed out")
+            .expect("read failed");
             assert_eq!(rx, msg.as_bytes());
         }
 

@@ -6,8 +6,8 @@
 
 //! Split out of `conn.rs` (engine/facade layering); no behavior change.
 
-use super::*;
 use super::raw_queue::{READ_PREFETCH_MAX_BYTES, READ_PREFETCH_MAX_MESSAGES};
+use super::*;
 
 /// Slot count per `try_recv_batch` drain call in the input loop (matches the
 /// listener's recvmmsg batch; the transport fills up to this many per call).
@@ -919,4 +919,3 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
         }
     })
 }
-

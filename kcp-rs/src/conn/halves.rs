@@ -429,4 +429,3 @@ impl OwnedWriteHalf {
 
 impl_half_read!(OwnedReadHalf);
 impl_half_write!(OwnedWriteHalf);
-

@@ -851,7 +851,6 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kcp_stream_write_backpressure_bounds_inflight() {
-
         // Bind-then-drop a port so nothing listens on it: the peer never ACKs.
         let tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let dead = tmp.local_addr().unwrap();

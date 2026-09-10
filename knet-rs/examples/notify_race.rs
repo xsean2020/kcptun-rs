@@ -1,9 +1,9 @@
 //! Repro: accept()-shaped loop vs back-to-back notify_one.
+use knet::Notify;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use knet::Notify;
 
 fn main() {
     // 单 Notify + 单队列; notifier 快速连发 3 次 push+notify(同一读批的 SYN/PSH/FIN 形态),
@@ -31,7 +31,10 @@ fn main() {
     for _ in 0..9u32 {
         let n = notify.clone();
         let q = queue.clone();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {

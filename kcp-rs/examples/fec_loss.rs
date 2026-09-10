@@ -160,10 +160,8 @@ mod lossy {
         let conn_a = knet::UdpSocket::connect(addr_a, addr_b).unwrap();
         let conn_b = knet::UdpSocket::connect(addr_b, addr_a).unwrap();
 
-        let inner_a: Arc<dyn PacketTransport> =
-            Arc::new(knet::DatagramSocket::Udp(conn_a));
-        let inner_b: Arc<dyn PacketTransport> =
-            Arc::new(knet::DatagramSocket::Udp(conn_b));
+        let inner_a: Arc<dyn PacketTransport> = Arc::new(knet::DatagramSocket::Udp(conn_a));
+        let inner_b: Arc<dyn PacketTransport> = Arc::new(knet::DatagramSocket::Udp(conn_b));
 
         // Lossy wrapper goes on the data receiver (B): A→B data loses, while
         // A's recv (B→A ACKs) stays lossless, so recovery is measurable.
@@ -295,7 +293,11 @@ mod lossy {
                 g(&snmp.fec_full_shards),
                 g(&snmp.fec_errs),
             );
-            assert_eq!(got, total, "transfer incomplete: got {} want {}", got, total);
+            assert_eq!(
+                got, total,
+                "transfer incomplete: got {} want {}",
+                got, total
+            );
         });
     }
 
@@ -332,7 +334,10 @@ fn main() {
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
-            let mut val = || it.next().unwrap_or_else(|| panic!("missing value for {arg}"));
+            let mut val = || {
+                it.next()
+                    .unwrap_or_else(|| panic!("missing value for {arg}"))
+            };
             match arg.as_str() {
                 "--loss" => loss = val().parse().unwrap(),
                 "--size" => size = val().parse().unwrap(),
