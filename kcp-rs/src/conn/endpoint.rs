@@ -567,7 +567,9 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
     // For FEC mode, original data shards stay borrowed. Only reconstructed
     // shards need owned storage because the decoder's result is temporary.
     let has_fec = shared.fec_decoder.is_some();
-    let mut kcp_slices: Vec<Cow<'_, [u8]>> = Vec::new();
+    // `bool` marks Go's `regular` packet type: `true` for a datagram received
+    // from the peer, `false` for one reconstructed by Reed-Solomon.
+    let mut kcp_slices: Vec<(Cow<'_, [u8]>, bool)> = Vec::new();
 
     if has_fec {
         // Decode the complete burst while holding the decoder mutex once.
@@ -583,29 +585,29 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
                 match fec_flag {
                     FEC_TYPE_DATA => {
                         if input.len() > FEC_HDR {
-                            kcp_slices.push(Cow::Borrowed(&input[FEC_HDR..]));
+                            kcp_slices.push((Cow::Borrowed(&input[FEC_HDR..]), true));
                         }
                         for r in &recovered {
                             if let Some(kcp_slice) = fec_kcp_from_recovered(r) {
-                                kcp_slices.push(Cow::Owned(kcp_slice.to_vec()));
+                                kcp_slices.push((Cow::Owned(kcp_slice.to_vec()), false));
                             }
                         }
                     }
                     FEC_TYPE_PARITY => {
                         for r in &recovered {
                             if let Some(kcp_slice) = fec_kcp_from_recovered(r) {
-                                kcp_slices.push(Cow::Owned(kcp_slice.to_vec()));
+                                kcp_slices.push((Cow::Owned(kcp_slice.to_vec()), false));
                             }
                         }
                     }
                     _ => {
                         if input.len() >= 24 {
-                            kcp_slices.push(Cow::Borrowed(input));
+                            kcp_slices.push((Cow::Borrowed(input), true));
                         }
                     }
                 }
             } else if input.len() >= 24 {
-                kcp_slices.push(Cow::Borrowed(input));
+                kcp_slices.push((Cow::Borrowed(input), true));
             }
         }
     } else {
@@ -620,14 +622,14 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
     let (ws, data_ready, protocol_pending) = {
         let mut kcp = shared.kcp.lock();
         if has_fec {
-            for slice in &kcp_slices {
-                if input_with_optional_conv(&mut kcp, shared, slice.as_ref()) {
+            for (slice, regular) in &kcp_slices {
+                if input_with_optional_conv(&mut kcp, shared, slice.as_ref(), *regular) {
                     had_input = true;
                 }
             }
         } else {
             for input in datagrams {
-                if input_with_optional_conv(&mut kcp, shared, input) {
+                if input_with_optional_conv(&mut kcp, shared, input, true) {
                     had_input = true;
                 }
             }
@@ -701,13 +703,14 @@ pub(crate) fn input_with_optional_conv(
     kcp: &mut KCP,
     shared: &SharedIoState,
     input: &[u8],
+    regular: bool,
 ) -> bool {
     if input.len() < 24 {
         return false;
     }
     if !shared.adopt_conv.load(Ordering::Acquire) {
         return kcp
-            .input_no_flush(input, shared.acknodelay.load(Ordering::Acquire))
+            .input_no_flush_typed(input, regular, shared.acknodelay.load(Ordering::Acquire))
             .is_ok();
     }
 
@@ -715,7 +718,7 @@ pub(crate) fn input_with_optional_conv(
     let candidate = u32::from_le_bytes(input[..4].try_into().unwrap());
     kcp.set_conv(candidate);
     if kcp
-        .input_no_flush(input, shared.acknodelay.load(Ordering::Acquire))
+        .input_no_flush_typed(input, regular, shared.acknodelay.load(Ordering::Acquire))
         .is_ok()
     {
         shared.adopt_conv.store(false, Ordering::Release);
