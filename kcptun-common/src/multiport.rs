@@ -6,18 +6,28 @@
 //! `-r example.com:29900` / `-l myhost:29900` work. Shared by client dial and
 //! server listen paths.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
 
 /// Resolve one `(host, port)` to a concrete [`SocketAddr`] (first A/AAAA
 /// record), handling both IP literals and DNS hostnames. IPv6 literals are
 /// stripped of their brackets (`[::1]` → `::1`) before lookup.
+///
+/// **Fast path:** when `host` is already an IP literal, the address is
+/// constructed directly — `to_socket_addrs` would otherwise call the
+/// blocking `getaddrinfo` syscall, which is unnecessary and serially
+/// expensive when resolving a multi-port range (e.g. 51 sequential calls
+/// for `-r host:50200-50250`).
 fn resolve_one(host: &str, port: u16) -> Result<SocketAddr> {
     let h = host
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host);
+    // IP-literal fast path: skip getaddrinfo.
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
     (h, port)
         .to_socket_addrs()
         .with_context(|| format!("cannot resolve address {host}:{port}"))?
@@ -47,8 +57,27 @@ pub fn parse_multi_port(addr: &str) -> Result<Vec<SocketAddr>> {
             );
         }
         let mut addrs = Vec::with_capacity((max_port - min_port + 1) as usize);
-        for port in min_port..=max_port {
-            addrs.push(resolve_one(host, port)?);
+        // For IP literals, resolve_one is a direct construction (no syscall).
+        // For hostnames, resolve once to get the IP, then construct all
+        // SocketAddrs from that IP — avoids N-1 redundant getaddrinfo calls.
+        let resolved_ip = {
+            let h = host
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(host);
+            h.parse::<IpAddr>().ok()
+        };
+        match resolved_ip {
+            Some(ip) => {
+                for port in min_port..=max_port {
+                    addrs.push(SocketAddr::new(ip, port));
+                }
+            }
+            None => {
+                for port in min_port..=max_port {
+                    addrs.push(resolve_one(host, port)?);
+                }
+            }
         }
         Ok(addrs)
     } else {
