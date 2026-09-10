@@ -590,6 +590,13 @@ impl KCP {
         };
         if seg.sn == sn {
             seg.acked = true;
+            // The flush loop skips acked segments (`if seg.acked { continue }`),
+            // so the payload is dead weight until `parse_una` eventually pops
+            // the segment from the front of `snd_buf`. With `snd_wnd = 1024`
+            // that can be ~1.4 MB per connection of payloads already accepted
+            // by the peer but still pinned in memory.
+            seg.data.clear();
+            seg.len = 0;
             // Go: recycleSegment frees the data buffer but leaves the entry
             // so we don't need to remove from snd_buf here.
         }
