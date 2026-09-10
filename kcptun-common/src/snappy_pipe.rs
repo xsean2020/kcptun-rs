@@ -148,9 +148,17 @@ where
 
     fn take_decoded(&mut self, out: &mut [u8]) -> usize {
         let n = out.len().min(self.dec_out.len());
-        for (dst, src) in out[..n].iter_mut().zip(self.dec_out.drain(..n)) {
-            *dst = src;
+        // Two memcpy operations instead of a per-byte drain loop.
+        // VecDeque may wrap around the ring buffer, so we copy in
+        // up to two contiguous chunks.
+        let (front, back) = self.dec_out.as_slices();
+        let first = n.min(front.len());
+        out[..first].copy_from_slice(&front[..first]);
+        if first < n {
+            let rest = n - first;
+            out[first..n].copy_from_slice(&back[..rest]);
         }
+        self.dec_out.drain(..n);
         n
     }
 
