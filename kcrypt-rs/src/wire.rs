@@ -577,6 +577,14 @@ pub fn encrypt_batch_ref_into(
                     .collect()
             };
             // Phase 2: CRC + encrypt in parallel (both are stateless / per-packet).
+            //
+            // NOTE: This path is rarely reached in production. For heavy CFB
+            // ciphers, should_cpu_block_encrypt returns true at ≥1 packet / 512 B
+            // (heavy 8-byte) or ≥8 packets / 8 KiB (fast/AES), routing through
+            // cpu_block with allow_parallel=false. When allow_parallel=false,
+            // should_parallel_cfb_encrypt always returns false, so the serial
+            // path is used. This parallel path only triggers when the caller
+            // explicitly sets allow_parallel=true (e.g. force_inline mode).
             let chunk_size = prepared.len().div_ceil(nthreads);
             let mut iter = prepared.into_iter();
             std::thread::scope(|s| {
@@ -600,8 +608,12 @@ pub fn encrypt_batch_ref_into(
                         r
                     }));
                 }
+                // Use unwrap_or_default so a worker panic doesn't propagate
+                // into the flush loop and kill the session.
                 for h in handles {
-                    out.extend(h.join().unwrap());
+                    if let Ok(chunk_out) = h.join() {
+                        out.extend(chunk_out);
+                    }
                 }
             });
         }
