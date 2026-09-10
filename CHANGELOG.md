@@ -130,7 +130,79 @@ Gates: `cargo test --workspace --all-features` green (except the pre-existing
 `prepare + finalize` against a decrypt roundtrip instead of byte-equality
 against a second serial encryption, which only held while nonces were
 deterministic.
+### Fixed — `smux-rs` receive flow control, stream lifecycle and fair scheduling (**breaking**, 0.1.0 → 0.2.0)
 
+- **Receive-side flow control did not exist.** `token_bucket` was only ever
+  *incremented*: nothing subtracted from it, `token_bucket_value()` had no
+  non-test caller, and the one write was backwards (receiving a peer UPD,
+  which advertises the *peer's* window, added 256 KiB to *our* bucket on
+  every update). `max_receive_buffer` was therefore pure bookkeeping and any
+  peer writing faster than the local application read grew memory without
+  bound — with `version = 1` (the `DEFAULT_CONFIG`) there is no per-stream
+  window either, so nothing bounded it at all. Now: `process_data` charges
+  the bucket per buffered byte, the flush cycle reclaims what the
+  application has consumed (`reclaim_tokens`, since a `Stream` has no
+  back-reference to its session the way Go's does),
+  `remove_stream` / `reap_stale_streams` recycle the share of a stream that
+  will never be read (Go's `recycleTokens`), and both read loops
+  (`SmuxConn::run`, `kcptun-common`'s `read_loop`) stop pulling from the
+  transport while `has_receive_capacity()` is false.
+- **A duplicate or replayed SYN silently replaced a live stream.**
+  `accept_stream` inserted unconditionally, so the application's
+  `Arc<Stream>` was evicted from the map: it never received data again, its
+  writes were never drained, and its queued receive data was dropped — a
+  wedged connection until the peer's TCP timeout, triggerable by any peer.
+  `accept_stream` now returns `Ok(None)` for an existing id (**breaking**:
+  the return type is `Option<Arc<Stream>>`).
+- **Stream ids ran out after 32768 opens.** `MAX_STREAMS` capped the *id
+  counter* at 65536 rather than concurrency, and ids are never reused, so a
+  long-lived session on a short-connection proxy eventually failed every
+  `open_stream`; the client's handler closes the whole KCP session and every
+  stream on it. The cap is now the id space itself (`u32::MAX - 1`), as in
+  Go, which signals `ErrGoAway` only on wraparound.
+- **`read_async` truncated the data tail after a FIN.** `read` returns
+  `WouldBlock` during the EOF grace window specifically to mean "poll
+  again", and `read_async` translated it straight into `Closed` — defeating
+  the grace for the exact FIN-overtakes-tail race it was added for. It now
+  re-polls until the grace expires.
+- **Window updates were lost when the UPD channel was full.** `take_upd`
+  clears the pending flag before the `try_send`, so a full channel dropped
+  the update permanently and the peer kept looking at a stale window until
+  the reader consumed another `max_recv_buf / 2` bytes — a per-stream
+  deadlock once the peer filled its window. The flag is re-armed on failure.
+  `check_upd` is also a no-op for `version = 1` now (Go v1 has no UPD
+  frame, and a strict v1 peer treats cmd 4 as a protocol error).
+- **Frame versions were never validated.** A mismatch now closes the session
+  (Go's `ErrInvalidProtocol`) instead of half-processing frames, which
+  turned a version misconfiguration into a confusing stall.
+- **Head-of-line starvation in the outbound scheduler.** The inner drain
+  loop ran one stream until its queue emptied, its window closed, or the
+  *global* 64 KiB budget was gone, with no per-stream share — and `HashMap`
+  iteration order is arbitrary but stable for a given key set. A saturated
+  bulk stream therefore gave every stream after it **zero** bytes for as
+  long as it stayed busy (an interactive stream sharing a session with a
+  download stalled indefinitely). Each stream now gets
+  `max(max_bytes / streams, max_frame_size)` per cycle.
+- **`SmuxConn::run` returned early on a `process_data` error** via `?`,
+  skipping the session shutdown every other exit path performs, so streams
+  never got their close wakeups and `accept()` waited forever.
+- Removed a `std::env::var("KCP_DBG")` lookup that ran **per received data
+  frame** (a `String` allocation plus the process-wide environment lock,
+  plus a second `streams` lock when set), and sized the session's
+  `FrameCodec` buffer to one max frame instead of `max_receive_buffer`
+  (4 MiB reserved per session up front, with `decode`'s payload slices
+  pinning the whole block — the same anti-pattern
+  `BUGREPORT_PROXY_MEMORY_GROWTH.md` M4 removed from `Stream::with_buffer`).
+
+Gates: `cargo test -p smux-rs --all-features` 67 passed / 0 failed,
+`cargo test --workspace --all-features` green apart from the pre-existing
+`autoexpire_multi_port_test` sandbox failure; clippy and
+`cargo fmt --check` clean for the touched files. New tests:
+`receive_window_is_charged_on_push_and_reclaimed_on_read`,
+`receive_window_is_exhaustible_and_recycled_with_the_stream`,
+`outbound_drain_gives_every_stream_a_share`,
+`version_mismatch_closes_the_session`, plus a duplicate-SYN assertion in
+`session_accept_stream`.
 ### Refactored — `kcp-rs` conn module split: engine/facade layering (no behavior change)
 
 `kcp-rs/src/conn.rs` (3100+ lines mixing seven responsibilities) is split

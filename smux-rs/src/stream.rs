@@ -167,6 +167,11 @@ pub struct Stream {
     /// Peer's advertised receive window size (from UPD).
     /// Initialized to 256 KiB matching Go `initialPeerWindow`.
     peer_window: AtomicU32,
+    /// Bytes handed to the reader since the session last reclaimed them.
+    /// The session decrements its token bucket when a frame is buffered and
+    /// adds these back once the application has consumed them (Go returns
+    /// them from `Stream.Read` via `sess.returnTokens`).
+    tokens_to_return: AtomicUsize,
 
     // ── Async notification ──
     /// Wakes up a reader blocked in `read_async()`.
@@ -211,6 +216,7 @@ impl Stream {
             pending_upd: AtomicBool::new(false),
             peer_consumed: AtomicU32::new(0),
             peer_window: AtomicU32::new(262144), // Go initialPeerWindow
+            tokens_to_return: AtomicUsize::new(0),
             ch_reader_wakeup: knet::Notify::new(),
             ch_write_wakeup: knet::Notify::new(),
             flush_notify: Mutex::new(None),
@@ -450,6 +456,8 @@ impl Stream {
 
         self.recv_buf_bytes_avail
             .fetch_sub(offset, Ordering::Relaxed);
+        // The session's receive-window tokens for these bytes are now free.
+        self.tokens_to_return.fetch_add(offset, Ordering::Relaxed);
         let was_empty = self.bytes_read.fetch_add(offset as u32, Ordering::Relaxed) == 0;
         let incr_val = self.incr.fetch_add(offset as u32, Ordering::Relaxed) + offset as u32;
         let need_upd = if incr_val >= (self.max_recv_buf as u32 / 2) || was_empty {
@@ -466,25 +474,56 @@ impl Stream {
 
     /// Async read — waits for data or FIN, like Go's tryRead.
     pub async fn read_async(&self, buf: &mut [u8]) -> Result<(usize, bool), StreamError> {
+        /// Re-poll interval while inside the EOF grace window.
+        const EOF_POLL: std::time::Duration = std::time::Duration::from_millis(20);
         loop {
             match self.read(buf) {
                 Ok(v) => return Ok(v),
                 Err(StreamError::WouldBlock) => {
                     if self.remote_closed.load(Ordering::Acquire) {
-                        // Re-check for data that raced with FIN.
-                        match self.read(buf) {
-                            Ok(v) => return Ok(v),
-                            Err(StreamError::WouldBlock) | Err(StreamError::Closed) => {
-                                return Err(StreamError::Closed);
-                            }
-                            Err(e) => return Err(e),
-                        }
+                        // A FIN was seen and nothing is buffered, so `read`
+                        // put us in the EOF grace window (see its comment)
+                        // and will return `Closed` once the window expires.
+                        // Translating this `WouldBlock` into `Closed` — as
+                        // this used to — truncated exactly the data tail the
+                        // grace exists to deliver. Re-poll on a short timer
+                        // rather than relying on the one-shot wakeup task,
+                        // which needs `set_self_ref`.
+                        let _ = knet::timeout(EOF_POLL, self.ch_reader_wakeup.notified()).await;
+                    } else {
+                        self.ch_reader_wakeup.notified().await;
                     }
-                    self.ch_reader_wakeup.notified().await;
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Take the bytes the reader has consumed since the last call.
+    ///
+    /// The session adds these back to its receive-window token bucket. Go
+    /// does the same from inside `Stream.Read` (`sess.returnTokens`); here
+    /// the stream has no back-reference to its session, so the session
+    /// reclaims them once per flush cycle.
+    #[inline]
+    pub fn take_return_tokens(&self) -> usize {
+        self.tokens_to_return.swap(0, Ordering::Relaxed)
+    }
+
+    /// Release the window tokens for data that will never be read: bytes
+    /// still buffered plus bytes already consumed but not yet reclaimed.
+    ///
+    /// Called when the session drops the stream (Go's `recycleTokens`).
+    /// Without this, a stream closed with unread data would leak its share of
+    /// the session's receive window permanently, and enough closed streams
+    /// would stall the session.
+    pub fn recycle_tokens(&self) -> usize {
+        let buffered = {
+            let mut inner = self.recv.lock();
+            inner.recv.clear();
+            self.recv_buf_bytes_avail.swap(0, Ordering::Relaxed)
+        };
+        buffered + self.tokens_to_return.swap(0, Ordering::Relaxed)
     }
 
     /// Write data into the send buffer (copies into owned `Bytes` via pool).
@@ -689,6 +728,12 @@ impl Stream {
         } else {
             None
         }
+    }
+
+    /// Re-arm the pending UPD flag after a taken update could not be sent.
+    #[inline]
+    pub fn rearm_upd(&self) {
+        self.pending_upd.store(true, Ordering::Release);
     }
 
     /// Close the stream fully (both sides + clear buffers).

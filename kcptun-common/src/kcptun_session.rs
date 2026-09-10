@@ -247,6 +247,16 @@ async fn read_loop(
     let mut buf = vec![0u8; 64 * 1024];
     let mut decoder = (!nocomp).then(crate::SnappyStreamDecoder::new);
     while !dead.load(Ordering::Acquire) && !smux.is_closed() && !kcp.is_closed() {
+        // Respect the SMUX receive window: while it is exhausted, stop
+        // pulling from KCP so its receive window fills and the peer feels
+        // backpressure, instead of buffering unread data without bound
+        // (`max_receive_buffer` used to be pure bookkeeping). The write loop
+        // reclaims tokens every cycle as the application reads, so this
+        // parks for at most one tick.
+        if !smux.has_receive_capacity() {
+            knet::sleep_ms(10).await;
+            continue;
+        }
         let n = match kcp.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,

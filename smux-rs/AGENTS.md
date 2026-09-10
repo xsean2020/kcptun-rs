@@ -38,6 +38,21 @@ None (flat `src/`).
 - Frame layout: `ver(1)|cmd(1)|length(2 LE)|stream_id(4 LE)` + payload.
 - Session owns stream map and read loop; streams are half-close aware.
 - Keepalive via periodic ping frames — do not break idle timeout semantics expected by binaries.
+- **Receive flow control is session-level and cooperative.** `process_data`
+  charges `token_bucket` for every buffered payload byte; the flush cycle
+  (`prepare_outbound_into` → `reclaim_tokens`) returns what the application
+  has read, and `remove_stream` / `reap_stale_streams` recycle what will
+  never be read. A transport read loop **must** check
+  `Session::has_receive_capacity()` before pulling more data (both
+  `SmuxConn::run` and `kcptun-common`'s `read_loop` do) — with `version = 1`
+  there is no per-stream window at all, so this bucket is the only bound on
+  how much unread data a fast peer can make us buffer.
+- `accept_stream` returns `Ok(None)` for an id that already exists: a
+  duplicate or replayed SYN must not evict a live stream.
+- UPD (cmd 4) is v2-only; `check_upd` is a no-op for `version = 1`.
+- A received frame whose `ver` differs from `config.version` closes the
+  session (Go's `ErrInvalidProtocol`). `Frame::new` still defaults to
+  `SMUX_VER` (2), so build frames with `.with_ver(session.version())`.
 - Compression is **not** in this crate; binaries wrap transport with Snappy before/after SMUX.
 - **Do not restore `with_backpressure`.** KCP backpressure belongs on the transport / KcpStream layer, not SmuxIo.
 - **R4 lock model (`Stream`):** `recv: Mutex<RecvInner>` (state + recv queue + read_waker + local_closed_at) and `send: Mutex<SendInner>` (send queue + write_waker). If both locks are needed: **recv then send**. Take wakers under lock, **wake after release**. No legacy contiguous `recv_buf`; only `VecDeque<Bytes>`. Peer window / half-close flags stay atomic.

@@ -21,7 +21,12 @@ use bytes::{Bytes, BytesMut};
 use crate::frame::{Cmd, Frame, FrameCodec};
 use crate::stream::{Stream, StreamState};
 
-const MAX_STREAMS: u32 = 65536;
+/// Highest stream id an `open_stream` may hand out.
+///
+/// This is an id-space limit, not a concurrency limit: ids are never reused,
+/// so the counter only stops when it runs out of room (Go signals `ErrGoAway`
+/// when `nextStreamID` wraps past 2^32).
+const MAX_STREAMS: u32 = u32::MAX - 1;
 /// Channel capacity for pending UPD frames.
 const UPD_CHANNEL_CAPACITY: usize = 1024;
 
@@ -202,7 +207,15 @@ impl Session {
             closed: Arc::new(AtomicBool::new(false)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU32::new(next_id),
-            codec: Arc::new(Mutex::new(FrameCodec::new(config.max_receive_buffer))),
+            // One frame is at most 8 + 65535 bytes, and `decode` hands out
+            // `Bytes` views into this block — a slice retained by a slow
+            // stream pins the whole allocation. Sizing it at
+            // `max_receive_buffer` (4 MiB by default) meant every session
+            // reserved 4 MiB up front and any unread payload kept it alive.
+            codec: Arc::new(Mutex::new(FrameCodec::new(
+                (crate::frame::FRAME_HEADER_SIZE + u16::MAX as usize)
+                    .min(config.max_receive_buffer),
+            ))),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
             last_keepalive_ms: AtomicU64::new(knet::mono_ms()),
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
@@ -257,10 +270,48 @@ impl Session {
         self.token_bucket.load(Ordering::Relaxed)
     }
 
+    /// Whether the session still has receive-window budget.
+    ///
+    /// A transport read loop must consult this before pulling more data:
+    /// with `version = 1` there is no per-stream window at all, so this
+    /// bucket is the only thing bounding how much unread data a fast peer
+    /// can make us buffer. Go's `recvLoop` stops reading the transport while
+    /// its bucket is non-positive; not implementing that meant
+    /// `max_receive_buffer` was pure bookkeeping and memory grew without
+    /// limit whenever the application read slower than the peer wrote.
+    #[inline]
+    pub fn has_receive_capacity(&self) -> bool {
+        self.token_bucket.load(Ordering::Relaxed) > 0
+    }
+
+    /// Charge the receive window for a frame that was buffered for a stream.
+    #[inline]
+    fn consume_tokens(&self, n: usize) {
+        self.token_bucket
+            .fetch_sub(n.min(i32::MAX as usize) as i32, Ordering::Relaxed);
+    }
+
     /// Return tokens to the token bucket (bytes consumed by the reader).
     /// This replenishes the flow control window after data has been read.
     pub fn return_tokens(&self, n: usize) {
-        self.token_bucket.fetch_add(n as i32, Ordering::Relaxed);
+        self.token_bucket
+            .fetch_add(n.min(i32::MAX as usize) as i32, Ordering::Relaxed);
+    }
+
+    /// Reclaim the receive window for bytes the application has consumed.
+    ///
+    /// Go returns tokens from inside `Stream.Read`; a `Stream` here has no
+    /// back-reference to its session, so the flush cycle sweeps the streams
+    /// instead. Returns the number of bytes reclaimed.
+    pub fn reclaim_tokens(&self) -> usize {
+        let reclaimed: usize = {
+            let streams = self.streams.lock();
+            streams.values().map(|s| s.take_return_tokens()).sum()
+        };
+        if reclaimed > 0 {
+            self.return_tokens(reclaimed);
+        }
+        reclaimed
     }
 
     /// Take all pending UPD frames that need to be sent.
@@ -308,6 +359,12 @@ impl Session {
             return Err(SessionError::SessionClosed);
         }
 
+        // Go only refuses to open once the id space itself is exhausted
+        // (`ErrGoAway` when `nextStreamID` wraps). Capping at 65536 turned
+        // the 32768th stream *ever opened* on a session into a hard failure,
+        // which the client handles by closing the whole KCP session and
+        // every stream still running on it — reachable in hours on a busy
+        // short-connection proxy.
         let id = self.next_stream_id.fetch_add(2, Ordering::SeqCst);
         if id > self.max_streams {
             return Err(SessionError::TooManyStreams);
@@ -328,10 +385,20 @@ impl Session {
 
     /// Accept the next incoming stream (server side).
     ///
-    /// Returns the accepted stream.
-    pub fn accept_stream(&self, id: u32) -> Result<Arc<Stream>, SessionError> {
+    /// Returns the accepted stream, or `None` if a stream with this id
+    /// already exists — a duplicated or replayed SYN must not evict a live
+    /// stream (Go ignores the frame in that case). The old `Arc<Stream>`
+    /// stayed in the application's hands but was no longer in the session
+    /// map, so it never received data again and its writes were never
+    /// drained: a silently wedged connection until the peer's TCP timeout.
+    pub fn accept_stream(&self, id: u32) -> Result<Option<Arc<Stream>>, SessionError> {
         if self.is_closed() {
             return Err(SessionError::SessionClosed);
+        }
+
+        let mut streams = self.streams.lock();
+        if streams.contains_key(&id) {
+            return Ok(None);
         }
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
@@ -343,8 +410,8 @@ impl Session {
             stream.disable_peer_window();
         }
 
-        self.streams.lock().insert(id, stream.clone());
-        Ok(stream)
+        streams.insert(id, stream.clone());
+        Ok(Some(stream))
     }
 
     /// Process incoming data from the transport.
@@ -364,12 +431,28 @@ impl Session {
         while let Some(frame) = codec.decode() {
             // Any received frame confirms peer is alive.
             self.update_activity();
+            if frame.ver != self.config.version {
+                // Go rejects a version mismatch with ErrInvalidProtocol
+                // rather than half-processing the frame.
+                log::warn!(
+                    "SMUX: frame version {} != session version {}, closing session",
+                    frame.ver,
+                    self.config.version
+                );
+                drop(codec);
+                self.close();
+                return Err(SessionError::InvalidFrame(format!(
+                    "frame version {} != session version {}",
+                    frame.ver, self.config.version
+                )));
+            }
             match frame.cmd {
                 Cmd::Syn => {
                     // Incoming stream request (Go cmdSYN = 0)
                     debug!("SMUX: received SYN for stream {}", frame.stream_id);
-                    self.accept_stream(frame.stream_id)?;
-                    if self.accept_enabled.load(Ordering::Acquire) {
+                    if self.accept_stream(frame.stream_id)?.is_some()
+                        && self.accept_enabled.load(Ordering::Acquire)
+                    {
                         self.accepted_streams.lock().push_back(frame.stream_id);
                         self.accept_notify.notify_one();
                     }
@@ -379,6 +462,7 @@ impl Session {
                     debug!("SMUX: received FIN for stream {}", frame.stream_id);
                     if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
                         if !frame.data.is_empty() {
+                            self.consume_tokens(frame.data.len());
                             if let Err(e) = stream.push_data_bytes(frame.data.clone()) {
                                 log::warn!(
                                     "push_data overflow FIN stream {}: {:?}",
@@ -393,13 +477,10 @@ impl Session {
                 }
                 Cmd::Psh => {
                     // Data push (Go cmdPSH = 2)
-                    if std::env::var("KCP_DBG").is_ok() {
-                        let exists = self.streams.lock().contains_key(&frame.stream_id);
-                        if !exists { eprintln!("DBG-LOST PSH sid={} len={}", frame.stream_id, frame.data.len()); }
-                    }
                     if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
                         // Use zero-copy push_data_bytes: the frame.data is a
                         // reference-counted Bytes slice from the codec buffer.
+                        self.consume_tokens(frame.data.len());
                         if let Err(e) = stream.push_data_bytes(frame.data.clone()) {
                             log::warn!(
                                 "push_data overflow DATA stream {}: {:?}",
@@ -431,8 +512,10 @@ impl Session {
                                 stream.apply_peer_update(consumed, window);
                             }
                         }
-                        // Session-level token bucket (receive side).
-                        self.return_tokens(window as usize);
+                        // NOTE: a UPD advertises the *peer's* receive window;
+                        // it says nothing about ours. Adding it to the local
+                        // token bucket (as this used to) inflated our own
+                        // receive window by 256 KiB on every window update.
                         debug!(
                             "SMUX: UPD stream {} consumed={} window={}",
                             frame.stream_id, consumed, window
@@ -449,16 +532,35 @@ impl Session {
     ///
     /// Call this periodically — it scans all streams for pending UPD flags
     /// and queues UpdFrame messages on the channel for the flush loop to send.
+    ///
+    /// No-op for `version = 1`, which has no UPD frame (Go v1 never sends
+    /// one, and a strict v1 peer treats an unexpected command as a protocol
+    /// error).
     pub fn check_upd(&self) {
+        if self.config.version < 2 {
+            return;
+        }
         let streams = self.streams.lock();
         for (&stream_id, stream) in streams.iter() {
             if let Some((consumed, window)) = stream.take_upd() {
                 // Enqueue UPD frame for sending
-                let _ = self.upd_tx.try_send(UpdFrame {
-                    stream_id,
-                    consumed,
-                    window,
-                });
+                if self
+                    .upd_tx
+                    .try_send(UpdFrame {
+                        stream_id,
+                        consumed,
+                        window,
+                    })
+                    .is_err()
+                {
+                    // `take_upd` already cleared the pending flag, so a
+                    // dropped frame would leave the peer looking at a stale
+                    // window until the reader consumes another
+                    // max_recv_buf/2 bytes — a per-stream deadlock once the
+                    // peer fills its window. Re-arm instead.
+                    stream.rearm_upd();
+                    continue;
+                }
                 debug!(
                     "SMUX: enqueued UPD frame stream={} consumed={} window={}",
                     stream_id, consumed, window
@@ -484,7 +586,13 @@ impl Session {
     pub fn remove_stream(&self, id: u32) -> bool {
         let mut streams = self.streams.lock();
         if let Some(stream) = streams.remove(&id) {
+            // Release this stream's share of the receive window before its
+            // buffers go away (Go's `recycleTokens`); otherwise every stream
+            // dropped with unread data shrinks the session window for good.
+            let recycled = stream.recycle_tokens();
             stream.close();
+            drop(streams);
+            self.return_tokens(recycled);
             true
         } else {
             false
@@ -525,14 +633,20 @@ impl Session {
             }
         }
 
+        let mut recycled = 0usize;
         for (id, wants_fin) in to_remove {
             if let Some(stream) = streams.remove(&id) {
                 if wants_fin {
                     need_fin.push(id);
                 }
+                recycled += stream.recycle_tokens();
                 stream.close();
             }
         }
+        drop(streams);
+        // Reaped streams give their receive-window share back (Go's
+        // `recycleTokens`).
+        self.return_tokens(recycled);
 
         need_fin
     }
@@ -640,6 +754,9 @@ impl Session {
         // prevents a circular stall where the peer cannot send more request
         // data until this update is delivered.
         self.check_upd();
+        // Give the receive window back for what the application has read
+        // since the last cycle (Go does this from `Stream.Read`).
+        self.reclaim_tokens();
         for upd in self.take_upd_frames() {
             Frame::encode_header_into(buf, ver, Cmd::Upd, upd.stream_id, 8);
             buf.extend_from_slice(&upd.consumed.to_le_bytes());
@@ -648,6 +765,19 @@ impl Session {
 
         {
             let streams = self.streams.lock();
+
+            // Per-stream share of this cycle's budget. Without it the first
+            // stream in iteration order drains until its queue empties, its
+            // window closes, or the *global* cap is gone — so a saturated
+            // bulk stream starved every stream after it of all bytes, not
+            // just of priority (Go interleaves frames with a shaper heap).
+            // HashMap order is arbitrary but stable for a given key set, so
+            // the victim stayed the victim.
+            let share = if streams.is_empty() {
+                max_bytes
+            } else {
+                (max_bytes / streams.len()).max(self.config.max_frame_size)
+            };
 
             // Drain data from streams (PSH frames), respecting per-stream peer window
             // and the overall max_bytes cap. Matches the previous manual Phase 1.
@@ -665,9 +795,13 @@ impl Session {
                         Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
                     }
                 }
+                let mut drained_this_stream = 0usize;
                 loop {
                     if drained_total >= max_bytes {
                         break 'outer;
+                    }
+                    if drained_this_stream >= share {
+                        break;
                     }
                     let header_pos = buf.len();
                     Frame::encode_header_into(buf, ver, Cmd::Psh, id, 0);
@@ -678,6 +812,7 @@ impl Session {
                     }
                     Frame::patch_header_length(buf, header_pos, n as u16);
                     drained_total += n;
+                    drained_this_stream += n;
                 }
             }
 
@@ -815,8 +950,8 @@ mod tests {
     #[test]
     fn session_server_stream_ids() {
         let session = Session::new_server(&DEFAULT_CONFIG).unwrap();
-        let s1 = session.accept_stream(0).unwrap();
-        let s2 = session.accept_stream(2).unwrap();
+        let s1 = session.accept_stream(0).unwrap().unwrap();
+        let s2 = session.accept_stream(2).unwrap().unwrap();
         assert_eq!(s1.id(), 0);
         assert_eq!(s2.id(), 2);
     }
@@ -834,7 +969,8 @@ mod tests {
     fn session_process_data() {
         let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
         // Create a data frame for stream 1
-        let frame = Frame::new(Cmd::Psh, 1, bytes::Bytes::from("test data"));
+        let frame =
+            Frame::new(Cmd::Psh, 1, bytes::Bytes::from("test data")).with_ver(session.version());
         let mut buf = Vec::new();
         frame.encode(&mut buf);
 
@@ -847,8 +983,14 @@ mod tests {
     #[test]
     fn session_accept_stream() {
         let session = Session::new_server(&DEFAULT_CONFIG).unwrap();
-        let stream = session.accept_stream(0).unwrap();
+        let stream = session.accept_stream(0).unwrap().unwrap();
         assert!(stream.is_ready());
+        // A duplicate SYN must not evict the live stream.
+        assert!(session.accept_stream(0).unwrap().is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            &stream,
+            session.streams().lock().get(&0).unwrap()
+        ));
     }
 
     #[test]
@@ -1065,7 +1207,12 @@ mod tests {
 
     #[test]
     fn session_prepare_outbound_includes_upd() {
-        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        // UPD is a v2-only frame (Go v1 never emits one).
+        let cfg = Config {
+            version: 2,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
         let s = session.open_stream().unwrap();
 
         // Push some inbound data and read enough to trigger a pending UPD (v2).
@@ -1087,5 +1234,110 @@ mod tests {
             }
         }
         assert!(saw_upd, "expected an UPD frame when reader advanced");
+    }
+
+    #[test]
+    fn receive_window_is_charged_on_push_and_reclaimed_on_read() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        let initial = session.token_bucket_value();
+
+        let frame = Frame::new(Cmd::Psh, s.id(), Bytes::from_static(b"0123456789"))
+            .with_ver(session.version());
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        session.process_data(&buf).unwrap();
+        assert_eq!(
+            session.token_bucket_value(),
+            initial - 10,
+            "buffered data must charge the receive window"
+        );
+
+        // Nothing is reclaimed until the application actually reads.
+        assert_eq!(session.reclaim_tokens(), 0);
+
+        let mut tmp = [0u8; 4];
+        assert_eq!(s.read(&mut tmp).unwrap().0, 4);
+        assert_eq!(session.reclaim_tokens(), 4);
+        assert_eq!(session.token_bucket_value(), initial - 6);
+    }
+
+    #[test]
+    fn receive_window_is_exhaustible_and_recycled_with_the_stream() {
+        let cfg = Config {
+            max_receive_buffer: 32,
+            max_stream_buffer: 32,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let s = session.open_stream().unwrap();
+        assert!(session.has_receive_capacity());
+
+        let frame = Frame::new(Cmd::Psh, s.id(), Bytes::from_static(&[7u8; 32]))
+            .with_ver(session.version());
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        session.process_data(&buf).unwrap();
+
+        // The window is now spent, so a read loop must stop pulling from the
+        // transport (Go's recvLoop blocks here). Without this the peer can
+        // make us buffer without bound — `max_receive_buffer` was previously
+        // never decremented at all.
+        assert!(!session.has_receive_capacity());
+
+        // Dropping the stream with its data unread must give the window
+        // back, or enough closed streams would stall the session for good.
+        assert!(session.remove_stream(s.id()));
+        assert_eq!(session.token_bucket_value(), 32);
+        assert!(session.has_receive_capacity());
+    }
+
+    #[test]
+    fn outbound_drain_gives_every_stream_a_share() {
+        let cfg = Config {
+            version: 2,
+            max_frame_size: 64,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        // Two saturated streams; the scheduler used to drain the first one
+        // in iteration order until the global cap was gone, leaving the
+        // other with zero bytes for as long as the first stayed busy.
+        let a = session.open_stream().unwrap();
+        let b = session.open_stream().unwrap();
+        for s in [&a, &b] {
+            s.write(&[1u8; 4096]).unwrap();
+        }
+
+        let mut buf = BytesMut::new();
+        let _ = session.prepare_outbound_into(&mut buf, 512, 2);
+
+        let mut codec = FrameCodec::new(4096);
+        codec.feed(&buf);
+        let mut per_stream = std::collections::HashMap::new();
+        while let Some(f) = codec.decode() {
+            if f.cmd == Cmd::Psh {
+                *per_stream.entry(f.stream_id).or_insert(0usize) += f.data.len();
+            }
+        }
+        assert!(
+            per_stream.get(&a.id()).copied().unwrap_or(0) > 0,
+            "first stream got nothing: {per_stream:?}"
+        );
+        assert!(
+            per_stream.get(&b.id()).copied().unwrap_or(0) > 0,
+            "second stream starved: {per_stream:?}"
+        );
+    }
+
+    #[test]
+    fn version_mismatch_closes_the_session() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        assert_eq!(session.version(), 1);
+        let frame = Frame::new(Cmd::Nop, 0, Bytes::new()).with_ver(2);
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        assert!(session.process_data(&buf).is_err());
+        assert!(session.is_closed());
     }
 }

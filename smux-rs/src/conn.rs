@@ -280,18 +280,32 @@ impl SmuxConn {
             }
 
             // ── Read from transport (with short timeout) ──
-            match knet::timeout(
-                Duration::from_millis(RUN_POLL_MS),
-                transport.read(&mut read_buf),
-            )
-            .await
-            {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => {
-                    self.session.process_data(&read_buf[..n])?;
+            // Skip the read while the receive window is exhausted, as Go's
+            // recvLoop does: the peer then hits transport backpressure
+            // instead of growing our buffers without bound.
+            if self.session.has_receive_capacity() {
+                match knet::timeout(
+                    Duration::from_millis(RUN_POLL_MS),
+                    transport.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => break, // EOF
+                    Ok(Ok(n)) => {
+                        if let Err(e) = self.session.process_data(&read_buf[..n]) {
+                            // Fall through to the shutdown path below so
+                            // streams get their close wakeups; returning here
+                            // left the session marked open and any
+                            // `accept()` waiting forever.
+                            log::warn!("SMUX: process_data failed: {e}");
+                            break;
+                        }
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => {} // timeout — fall through to flush
                 }
-                Ok(Err(_)) => break,
-                Err(_) => {} // timeout — fall through to flush
+            } else {
+                knet::sleep_ms(RUN_POLL_MS).await;
             }
 
             // ── Flush outbound (SYN + PSH + FIN + UPD) ──
@@ -672,7 +686,7 @@ mod tests {
         let server = SmuxConn::new(DEFAULT_CONFIG.clone(), false).unwrap();
 
         // Simulate a SYN frame arriving
-        let syn = Frame::new(Cmd::Syn, 0, bytes::Bytes::new());
+        let syn = Frame::new(Cmd::Syn, 0, bytes::Bytes::new()).with_ver(server.session().version());
         let mut buf = Vec::new();
         syn.encode(&mut buf);
         server.session().process_data(&buf).unwrap();
