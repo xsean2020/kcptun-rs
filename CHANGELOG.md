@@ -203,6 +203,61 @@ Gates: `cargo test -p smux-rs --all-features` 67 passed / 0 failed,
 `outbound_drain_gives_every_stream_a_share`,
 `version_mismatch_closes_the_session`, plus a duplicate-SYN assertion in
 `session_accept_stream`.
+### Security / Fixed — listener admission, session lifecycle, and multi-waiter `Notify`
+
+**`knet-rs` `Notify` is no longer single-waiter.** It kept exactly one
+`Option<Waker>`: a second `notified()` overwrote the first waiter's waker (which
+then never woke), and either future's `Drop` cleared whichever waker happened to
+be in the slot — unregistering a *live* waiter. Since `CancellationToken` is
+built on it, `cancel()` woke at most one of the tasks racing `cancelled()`, so
+`close()` left multi-worker reuseport listeners and concurrent read/write halves
+parked. `Notify` now keeps a FIFO waker list keyed by a per-future id:
+`notify_one()` wakes the longest-parked waiter, `notify_waiters()` wakes all of
+them, and `Drop` only ever removes its own slot. The permit fast path is
+unchanged (one atomic swap, no lock); the waiter/notifier hand-off is a Dekker
+pattern and its four accesses are `SeqCst` on purpose.
+
+**`kcp-rs` listener: one datagram no longer buys unbounded server state.**
+`KcpListener` created a full session — `KcpStream`, flush loop, accept-backlog
+entry, and whatever the application builds on top (for kcptun-server: a SMUX
+session and a task parked in `accept()` forever) — from a *single* inbound
+datagram, before anything was decrypted, with `max_sessions_per_worker`
+defaulting to unlimited and no idle reaping. A spoofed source address per packet
+was therefore a remote memory-exhaustion primitive.
+
+- `process_session` now runs a **pre-admission integrity gate**: it builds the
+  `PacketTransport` (crypto wrapper included) and decrypts the first burst
+  *before* `KcpStream::build()`. A peer that cannot produce a valid CRC32 (CFB)
+  or AEAD tag gets no state at all — counted as
+  `WorkerPoolStats::unauthenticated_drops`. With no crypto configured the
+  transport's `decrypt_packet_in_place` is the identity, so behavior there is
+  unchanged and the session cap is the bound.
+- **`WorkerPoolLimits` defaults are now bounded** (behavior change for library
+  users): `max_sessions_per_worker` 0 → `4096`, `building_timeout`
+  `ZERO` → `10s`, plus a new `idle_timeout` defaulting to `600s`.
+  `building_timeout` was previously declared but never enforced, so a peer whose
+  staged build was interrupted black-holed every later datagram from that
+  address.
+- **New `idle_timeout`.** KCP has no keepalive: a session with nothing queued
+  never exhausts its retransmission budget, so `is_dead()` never fires for a
+  peer that sends one datagram and vanishes and its slot was pinned for the life
+  of the process. `WorkerPoolStats` gains `idle_reaps`.
+- **The reaper closes what it removes.** `reaper_sweep` and
+  `KcpListener::remove_peer` previously dropped a non-owning clone
+  (`detach_owner`), so the flush-loop task kept running and anything blocked on
+  the stream stayed parked. Both now call `KcpStream::close()`, outside the
+  session-map lock.
+- **The sweep runs on a timer, not on RX wakeups.** It was gated on a
+  128-wakeup counter, so a shard that went completely silent stopped sweeping
+  exactly when reaping mattered. Each worker now runs a `SWEEP_PARK_MS` (1s)
+  sweeper task on its own current-thread runtime, cancelled with the listener.
+  The reader thread's counterpart was an empty stub and is gone.
+- `SharedIoState::mark_activity()` centralizes the liveness stamp and is now
+  called from `feed_batch` / `feed_single` as well as the input loop. Server
+  sessions run `background_input(false)` and have no input loop, so without this
+  the idle reaper would have killed live sessions.
+
+
 ### Refactored — `kcp-rs` conn module split: engine/facade layering (no behavior change)
 
 `kcp-rs/src/conn.rs` (3100+ lines mixing seven responsibilities) is split

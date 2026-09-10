@@ -167,6 +167,39 @@ mod tests {
     }
 
     #[test]
+    fn cancel_wakes_every_parked_waiter() {
+        // Several tasks race their own recv against the same token (one per
+        // reuseport worker / per connection half). A single-waiter `Notify`
+        // woke only the last one to register and left the rest parked
+        // forever, so `close()` never drained the pool.
+        const WAITERS: usize = 4;
+        let token = CancellationToken::new();
+        block_on(async move {
+            let done: Vec<Arc<AtomicBool>> = (0..WAITERS)
+                .map(|_| Arc::new(AtomicBool::new(false)))
+                .collect();
+            for flag in &done {
+                let t = token.clone();
+                let f = flag.clone();
+                drop(spawn_task(async move {
+                    match race(std::future::pending::<u32>(), t.cancelled()).await {
+                        RaceOutcome::First(_) => {}
+                        RaceOutcome::Second(_) => f.store(true, Ordering::Release),
+                    }
+                }));
+            }
+            // Let every waiter arm its waker before cancelling.
+            for _ in 0..64 {
+                yield_now().await;
+            }
+            token.cancel();
+            for flag in &done {
+                wait_done(flag).await;
+            }
+        });
+    }
+
+    #[test]
     fn race_returns_second_when_cancelled() {
         let token = CancellationToken::new();
         block_on(async move {
