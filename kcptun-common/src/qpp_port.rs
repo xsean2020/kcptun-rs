@@ -20,7 +20,7 @@ const PIPE_BUF_SIZE: usize = 65536;
 
 /// Shared pad table built once from `(key, count)`. Cheap to clone (Arc).
 #[derive(Clone)]
-struct SharedPads {
+pub struct SharedPads {
     pads: Arc<[u8]>,
     rpads: Arc<[u8]>,
     num_pads: u16,
@@ -106,6 +106,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
             read_buf: BytesMut::with_capacity(PIPE_BUF_SIZE),
             read_io_buf: vec![0u8; PIPE_BUF_SIZE],
             write_enc_buf: Vec::with_capacity(PIPE_BUF_SIZE),
+            write_pos: 0,
         }
     }
 
