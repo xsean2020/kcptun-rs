@@ -510,9 +510,12 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                     if pool_end <= burst_len {
                         break; // per-cycle budget reached
                     }
-                    for s in &mut burst[burst_len..pool_end] {
-                        s.resize(MAX_DATAGRAM, 0);
-                    }
+                    // Slots were truncated to their received length last
+                    // cycle. No need to re-zero: `try_recv_batch` / recvmmsg
+                    // handles buffer length internally (Linux: set_len;
+                    // non-Linux: resize in try_recv_batch). Removing the
+                    // per-slot resize(MAX_DATAGRAM, 0) avoids a ~32 KB
+                    // memset per cycle when 16 slots are re-zeroed.
                     match shared
                         .transport
                         .try_recv_batch(&mut burst[burst_len..pool_end])
